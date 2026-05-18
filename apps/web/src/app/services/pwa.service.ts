@@ -335,24 +335,20 @@ export class PwaService extends DataService {
                     createPortalDebugErrorEvent(context, response)
                 );
 
+                result = {
+                    type: ERROR,
+                    status: (response as any).status ?? 500,
+                    message: normalizedMessage,
+                };
+                window.postMessage(result);
+
                 if (isSilentAction) {
                     console.log(
                         `Background Xtream action failed (${action ?? 'unknown'}):`,
                         normalizedMessage
                     );
-                    return {
-                        type: ERROR,
-                        status: response.status ?? 500,
-                        message: normalizedMessage,
-                    };
+                    return result;
                 }
-
-                result = {
-                    type: ERROR,
-                    status: response.status ?? 500,
-                    message: normalizedMessage,
-                };
-                window.postMessage(result);
             } else {
                 result = {
                     type: XTREAM_RESPONSE,
@@ -374,32 +370,29 @@ export class PwaService extends DataService {
             const normalizedMessage = this.getReadableXtreamErrorMessage(error);
             const errorInfo = this.getErrorDetails(error);
 
-            // Log error to console
+            const result = {
+                type: ERROR,
+                status: errorInfo?.status ?? 500,
+                message: normalizedMessage,
+            };
+            window.postMessage(result);
+
             if (isSilentAction) {
                 console.log(
                     `Background Xtream action failed (${action ?? 'unknown'}):`,
                     normalizedMessage
                 );
-                return {
-                    type: ERROR,
-                    status: errorInfo?.status ?? 500,
-                    message: normalizedMessage,
-                };
+            } else {
+                console.error('Xtream request error:', normalizedMessage);
+                this.snackBar.open(
+                    `Xtream request failed: ${normalizedMessage}`,
+                    'Close',
+                    {
+                        duration: 5000,
+                    }
+                );
             }
-
-            console.error('Xtream request error:', normalizedMessage);
-            this.snackBar.open(
-                `Xtream request failed: ${normalizedMessage}`,
-                'Close',
-                {
-                    duration: 5000,
-                }
-            );
-            return {
-                type: ERROR,
-                status: errorInfo?.status ?? 500,
-                message: normalizedMessage,
-            };
+            return result;
         }
     }
 

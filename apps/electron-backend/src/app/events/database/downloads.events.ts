@@ -1,17 +1,21 @@
 /**
  * Downloads IPC event handlers
- * Uses electron-dl for download management with queue control and progress tracking
+ * Uses Electron net requests for download management with queue control and progress tracking
  */
 
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
-import { download, File as ElectronDlFile } from 'electron-dl';
-import { existsSync, unlinkSync } from 'fs';
+import { app, BrowserWindow, dialog, ipcMain, net, shell } from 'electron';
+import { createWriteStream, existsSync, mkdirSync, unlinkSync } from 'fs';
 import { basename, extname, join } from 'path';
 import { getDatabase } from '../../database/connection';
 import * as schema from '../../database/schema';
 
-type DownloadStatus = 'queued' | 'downloading' | 'completed' | 'failed' | 'canceled';
+type DownloadStatus =
+    | 'queued'
+    | 'downloading'
+    | 'completed'
+    | 'failed'
+    | 'canceled';
 
 interface DownloadTask {
     id: number;
@@ -19,7 +23,23 @@ interface DownloadTask {
     fileName: string;
     directory: string;
     headers?: Record<string, string>;
-    downloadItem?: ElectronDlFile;
+    request?: Electron.ClientRequest;
+    canceled?: boolean;
+}
+
+interface CompletedDownloadFile {
+    filename: string;
+    path: string;
+    fileSize: number;
+    mimeType: string;
+    url: string;
+}
+
+class DownloadCanceledError extends Error {
+    constructor() {
+        super('Download canceled');
+        this.name = 'DownloadCanceledError';
+    }
 }
 
 // Download queue management
@@ -64,6 +84,206 @@ function sanitizeFilename(name: string): string {
     return name.replace(/[<>:"/\\|?*]/g, '_').trim();
 }
 
+function buildRequestHeaders(headers?: {
+    userAgent?: string;
+    referer?: string;
+    origin?: string;
+}): Record<string, string> | undefined {
+    if (!headers) {
+        return undefined;
+    }
+
+    const requestHeaders: Record<string, string> = {};
+
+    if (headers.userAgent) {
+        requestHeaders['User-Agent'] = headers.userAgent;
+    }
+
+    if (headers.referer) {
+        requestHeaders.Referer = headers.referer;
+    }
+
+    if (headers.origin) {
+        requestHeaders.Origin = headers.origin;
+    }
+
+    return Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined;
+}
+
+async function getPlaylistRequestHeaders(
+    db: Awaited<ReturnType<typeof getDatabase>>,
+    playlistId: string
+): Promise<Record<string, string> | undefined> {
+    const playlist = await db
+        .select({
+            userAgent: schema.playlists.userAgent,
+            referrer: schema.playlists.referrer,
+            origin: schema.playlists.origin,
+        })
+        .from(schema.playlists)
+        .where(eq(schema.playlists.id, playlistId))
+        .limit(1);
+
+    if (playlist.length === 0) {
+        return undefined;
+    }
+
+    return buildRequestHeaders({
+        userAgent: playlist[0].userAgent || undefined,
+        referer: playlist[0].referrer || undefined,
+        origin: playlist[0].origin || undefined,
+    });
+}
+
+function getResponseHeader(
+    headers: Record<string, string | string[]>,
+    name: string
+): string | undefined {
+    const value = headers[name.toLowerCase()];
+    return Array.isArray(value) ? value[0] : value;
+}
+
+function deletePartialFile(filePath: string) {
+    if (!existsSync(filePath)) {
+        return;
+    }
+
+    try {
+        unlinkSync(filePath);
+    } catch (error) {
+        console.error('[Downloads] Failed to delete partial file:', error);
+    }
+}
+
+function downloadFile(
+    task: DownloadTask,
+    onProgress: (progress: {
+        transferredBytes: number;
+        totalBytes: number;
+    }) => void
+): Promise<CompletedDownloadFile> {
+    const filePath = join(task.directory, task.fileName);
+    mkdirSync(task.directory, { recursive: true });
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let fileStream: ReturnType<typeof createWriteStream> | null = null;
+
+        const settle = (callback: () => void) => {
+            if (settled) {
+                return;
+            }
+
+            settled = true;
+            task.request = undefined;
+            callback();
+        };
+
+        const fail = (error: Error) => {
+            fileStream?.destroy();
+            settle(() => reject(error));
+        };
+
+        const request = net.request({
+            method: 'GET',
+            url: task.url,
+        });
+
+        task.request = request;
+
+        for (const [name, value] of Object.entries(task.headers || {})) {
+            request.setHeader(name, value);
+        }
+
+        request.on('response', (response) => {
+            const responseStream = response as Electron.IncomingMessage & {
+                pause: () => void;
+                resume: () => void;
+            };
+            const statusCode = response.statusCode;
+            const statusMessage = response.statusMessage || '';
+
+            if (statusCode < 200 || statusCode >= 300) {
+                responseStream.resume();
+                response.once('error', fail);
+                response.once('end', () => {
+                    fail(
+                        new Error(
+                            `HTTP ${statusCode}${statusMessage ? ` ${statusMessage}` : ''}`
+                        )
+                    );
+                });
+                return;
+            }
+
+            const totalBytes =
+                Number.parseInt(
+                    getResponseHeader(response.headers, 'content-length') ||
+                        '0',
+                    10
+                ) || 0;
+            const mimeType =
+                getResponseHeader(response.headers, 'content-type') || '';
+            let bytesDownloaded = 0;
+
+            fileStream = createWriteStream(filePath);
+            fileStream.on('error', fail);
+            fileStream.on('drain', () => responseStream.resume());
+
+            response.on('data', (chunk: Buffer) => {
+                if (settled || !fileStream) {
+                    return;
+                }
+
+                bytesDownloaded += chunk.length;
+
+                if (!fileStream.write(chunk)) {
+                    responseStream.pause();
+                }
+
+                onProgress({
+                    transferredBytes: bytesDownloaded,
+                    totalBytes,
+                });
+            });
+
+            response.once('aborted', () => {
+                fail(
+                    task.canceled
+                        ? new DownloadCanceledError()
+                        : new Error('Response aborted')
+                );
+            });
+            response.once('error', fail);
+            response.once('end', () => {
+                if (settled) {
+                    return;
+                }
+
+                fileStream?.end(() => {
+                    settle(() =>
+                        resolve({
+                            filename: basename(filePath),
+                            path: filePath,
+                            fileSize: bytesDownloaded,
+                            mimeType,
+                            url: task.url,
+                        })
+                    );
+                });
+            });
+        });
+
+        request.once('abort', () => {
+            fail(new DownloadCanceledError());
+        });
+        request.once('error', (error) => {
+            fail(task.canceled ? new DownloadCanceledError() : error);
+        });
+        request.end();
+    });
+}
+
 /**
  * Process the download queue - starts next download if none active
  */
@@ -80,7 +300,7 @@ async function processQueue() {
 }
 
 /**
- * Start a download using electron-dl
+ * Start a download using Electron net
  */
 async function startDownload(task: DownloadTask) {
     const db = await getDatabase();
@@ -116,100 +336,70 @@ async function startDownload(task: DownloadTask) {
     const PROGRESS_THROTTLE_MS = 500;
 
     try {
-        const downloadOptions: Parameters<typeof download>[2] = {
-            directory: task.directory,
-            filename: task.fileName,
-            overwrite: true,
-            onStarted: (item) => {
-                console.log(`[Downloads] Started: ${task.fileName}`);
-                task.downloadItem = item as unknown as ElectronDlFile;
-            },
-            onProgress: async (progress) => {
-                const now = Date.now();
-                if (now - lastProgressUpdate < PROGRESS_THROTTLE_MS) {
-                    return;
-                }
-                lastProgressUpdate = now;
-
-                await db
-                    .update(schema.downloads)
-                    .set({
-                        bytesDownloaded: progress.transferredBytes,
-                        totalBytes: progress.totalBytes,
-                        updatedAt: sql`CURRENT_TIMESTAMP`,
-                    })
-                    .where(eq(schema.downloads.id, task.id));
-
-                broadcastUpdate();
-            },
-            onCompleted: async (file) => {
-                console.log(`[Downloads] Completed: ${task.fileName}`);
-                await db
-                    .update(schema.downloads)
-                    .set({
-                        status: 'completed',
-                        filePath: file.path,
-                        fileName: file.filename,
-                        bytesDownloaded: file.fileSize,
-                        totalBytes: file.fileSize,
-                        updatedAt: sql`CURRENT_TIMESTAMP`,
-                    })
-                    .where(eq(schema.downloads.id, task.id));
-
-                activeDownload = null;
-                broadcastUpdate();
-                processQueue();
-            },
-            onCancel: async () => {
-                console.log(`[Downloads] Canceled: ${task.fileName}`);
-                // Delete partial file if it exists
-                const partialPath = join(task.directory, task.fileName);
-                if (existsSync(partialPath)) {
-                    try {
-                        unlinkSync(partialPath);
-                    } catch (e) {
-                        console.error('[Downloads] Failed to delete partial file:', e);
-                    }
-                }
-
-                await db
-                    .update(schema.downloads)
-                    .set({
-                        status: 'canceled',
-                        updatedAt: sql`CURRENT_TIMESTAMP`,
-                    })
-                    .where(eq(schema.downloads.id, task.id));
-
-                activeDownload = null;
-                broadcastUpdate();
-                processQueue();
-            },
-        };
-
-        // Add headers if provided (user-agent, referer, origin)
-        if (task.headers) {
-            (downloadOptions as any).headers = task.headers;
-        }
-
-        await download(mainWindow, task.url, downloadOptions);
-    } catch (error) {
-        console.error(`[Downloads] Error downloading ${task.fileName}:`, error);
-
-        // Delete partial file if it exists
-        const partialPath = join(task.directory, task.fileName);
-        if (existsSync(partialPath)) {
-            try {
-                unlinkSync(partialPath);
-            } catch (e) {
-                console.error('[Downloads] Failed to delete partial file:', e);
+        console.log(`[Downloads] Started: ${task.fileName}`);
+        const file = await downloadFile(task, async (progress) => {
+            const now = Date.now();
+            if (now - lastProgressUpdate < PROGRESS_THROTTLE_MS) {
+                return;
             }
+            lastProgressUpdate = now;
+
+            await db
+                .update(schema.downloads)
+                .set({
+                    bytesDownloaded: progress.transferredBytes,
+                    totalBytes: progress.totalBytes,
+                    updatedAt: sql`CURRENT_TIMESTAMP`,
+                })
+                .where(eq(schema.downloads.id, task.id));
+
+            broadcastUpdate();
+        });
+
+        console.log(`[Downloads] Completed: ${task.fileName}`);
+        await db
+            .update(schema.downloads)
+            .set({
+                status: 'completed',
+                filePath: file.path,
+                fileName: file.filename,
+                bytesDownloaded: file.fileSize,
+                totalBytes: file.fileSize,
+                updatedAt: sql`CURRENT_TIMESTAMP`,
+            })
+            .where(eq(schema.downloads.id, task.id));
+
+        activeDownload = null;
+        broadcastUpdate();
+        processQueue();
+    } catch (error) {
+        const partialPath = join(task.directory, task.fileName);
+        deletePartialFile(partialPath);
+
+        if (error instanceof DownloadCanceledError) {
+            console.log(`[Downloads] Canceled: ${task.fileName}`);
+            await db
+                .update(schema.downloads)
+                .set({
+                    status: 'canceled',
+                    updatedAt: sql`CURRENT_TIMESTAMP`,
+                })
+                .where(eq(schema.downloads.id, task.id));
+
+            activeDownload = null;
+            broadcastUpdate();
+            processQueue();
+            return;
         }
+
+        console.error(`[Downloads] Error downloading ${task.fileName}:`, error);
 
         await db
             .update(schema.downloads)
             .set({
                 status: 'failed',
-                errorMessage: error instanceof Error ? error.message : String(error),
+                errorMessage:
+                    error instanceof Error ? error.message : String(error),
                 updatedAt: sql`CURRENT_TIMESTAMP`,
             })
             .where(eq(schema.downloads.id, task.id));
@@ -241,7 +431,12 @@ ipcMain.handle(
             episodeNumber?: number;
             // Playlist info for auto-creation if needed
             playlistName?: string;
-            playlistType?: 'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url';
+            playlistType?:
+                | 'xtream'
+                | 'stalker'
+                | 'm3u-file'
+                | 'm3u-text'
+                | 'm3u-url';
             serverUrl?: string;
             portalUrl?: string;
             macAddress?: string;
@@ -261,7 +456,10 @@ ipcMain.handle(
 
                 if (existingPlaylist.length === 0) {
                     // Create playlist entry for downloads to work
-                    console.log('[Downloads] Creating playlist entry for:', data.playlistId);
+                    console.log(
+                        '[Downloads] Creating playlist entry for:',
+                        data.playlistId
+                    );
                     await db.insert(schema.playlists).values({
                         id: data.playlistId,
                         name: data.playlistName || 'Unknown Playlist',
@@ -269,6 +467,9 @@ ipcMain.handle(
                         serverUrl: data.serverUrl,
                         macAddress: data.macAddress,
                         url: data.portalUrl,
+                        userAgent: data.headers?.userAgent,
+                        referrer: data.headers?.referer,
+                        origin: data.headers?.origin,
                     });
                 }
             } else {
@@ -312,13 +513,7 @@ ipcMain.handle(
                         url: data.url,
                         fileName,
                         directory: data.downloadFolder,
-                        headers: data.headers
-                            ? {
-                                  'User-Agent': data.headers.userAgent || '',
-                                  Referer: data.headers.referer || '',
-                                  Origin: data.headers.origin || '',
-                              }
-                            : undefined,
+                        headers: buildRequestHeaders(data.headers),
                     });
 
                     broadcastUpdate();
@@ -327,7 +522,11 @@ ipcMain.handle(
                 }
 
                 // Already queued or downloading
-                return { success: false, error: 'Download already in progress', id: item.id };
+                return {
+                    success: false,
+                    error: 'Download already in progress',
+                    id: item.id,
+                };
             }
 
             // Create new download entry
@@ -355,13 +554,7 @@ ipcMain.handle(
                 url: data.url,
                 fileName,
                 directory: data.downloadFolder,
-                headers: data.headers
-                    ? {
-                          'User-Agent': data.headers.userAgent || '',
-                          Referer: data.headers.referer || '',
-                          Origin: data.headers.origin || '',
-                      }
-                    : undefined,
+                headers: buildRequestHeaders(data.headers),
             });
 
             broadcastUpdate();
@@ -385,9 +578,8 @@ ipcMain.handle('DOWNLOADS_CANCEL', async (_event, downloadId: number) => {
 
         // Check if it's the active download
         if (activeDownload && activeDownload.id === downloadId) {
-            if (activeDownload.downloadItem) {
-                (activeDownload.downloadItem as any).cancel?.();
-            }
+            activeDownload.canceled = true;
+            activeDownload.request?.abort();
             return { success: true };
         }
 
@@ -436,7 +628,10 @@ ipcMain.handle(
 
             const item = existing[0];
             if (!['failed', 'canceled'].includes(item.status)) {
-                return { success: false, error: 'Can only retry failed or canceled downloads' };
+                return {
+                    success: false,
+                    error: 'Can only retry failed or canceled downloads',
+                };
             }
 
             await db
@@ -458,6 +653,7 @@ ipcMain.handle(
                 url: item.url,
                 fileName,
                 directory: downloadFolder,
+                headers: await getPlaylistRequestHeaders(db, item.playlistId),
             });
 
             broadcastUpdate();
@@ -481,9 +677,8 @@ ipcMain.handle('DOWNLOADS_REMOVE', async (_event, downloadId: number) => {
 
         // Cancel if active
         if (activeDownload && activeDownload.id === downloadId) {
-            if (activeDownload.downloadItem) {
-                (activeDownload.downloadItem as any).cancel?.();
-            }
+            activeDownload.canceled = true;
+            activeDownload.request?.abort();
         }
 
         // Remove from queue
@@ -493,7 +688,9 @@ ipcMain.handle('DOWNLOADS_REMOVE', async (_event, downloadId: number) => {
         }
 
         // Delete from database
-        await db.delete(schema.downloads).where(eq(schema.downloads.id, downloadId));
+        await db
+            .delete(schema.downloads)
+            .where(eq(schema.downloads.id, downloadId));
 
         broadcastUpdate();
         return { success: true };
@@ -597,34 +794,45 @@ ipcMain.handle('DOWNLOADS_PLAY_FILE', async (_event, filePath: string) => {
 /**
  * Clear all completed downloads
  */
-ipcMain.handle('DOWNLOADS_CLEAR_COMPLETED', async (_event, playlistId?: string) => {
-    try {
-        const db = await getDatabase();
+ipcMain.handle(
+    'DOWNLOADS_CLEAR_COMPLETED',
+    async (_event, playlistId?: string) => {
+        try {
+            const db = await getDatabase();
 
-        if (playlistId) {
-            await db
-                .delete(schema.downloads)
-                .where(
-                    and(
-                        eq(schema.downloads.playlistId, playlistId),
-                        inArray(schema.downloads.status, ['completed', 'failed', 'canceled'])
-                    )
-                );
-        } else {
-            await db
-                .delete(schema.downloads)
-                .where(
-                    inArray(schema.downloads.status, ['completed', 'failed', 'canceled'])
-                );
+            if (playlistId) {
+                await db
+                    .delete(schema.downloads)
+                    .where(
+                        and(
+                            eq(schema.downloads.playlistId, playlistId),
+                            inArray(schema.downloads.status, [
+                                'completed',
+                                'failed',
+                                'canceled',
+                            ])
+                        )
+                    );
+            } else {
+                await db
+                    .delete(schema.downloads)
+                    .where(
+                        inArray(schema.downloads.status, [
+                            'completed',
+                            'failed',
+                            'canceled',
+                        ])
+                    );
+            }
+
+            broadcastUpdate();
+            return { success: true };
+        } catch (error) {
+            console.error('[Downloads] Error clearing completed:', error);
+            throw error;
         }
-
-        broadcastUpdate();
-        return { success: true };
-    } catch (error) {
-        console.error('[Downloads] Error clearing completed:', error);
-        throw error;
     }
-});
+);
 
 /**
  * Reset stale downloads on startup (downloading -> failed)
@@ -639,9 +847,7 @@ export async function resetStaleDownloads() {
                 errorMessage: 'Download interrupted by application restart',
                 updatedAt: sql`CURRENT_TIMESTAMP`,
             })
-            .where(
-                inArray(schema.downloads.status, ['queued', 'downloading'])
-            );
+            .where(inArray(schema.downloads.status, ['queued', 'downloading']));
         console.log('[Downloads] Reset stale downloads');
     } catch (error) {
         console.error('[Downloads] Error resetting stale downloads:', error);
