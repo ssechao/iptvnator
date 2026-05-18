@@ -251,9 +251,13 @@ export default class App {
         });
     }
 
-    private static loadMainWindow() {
+    private static async loadMainWindow() {
         // load the index.html of the app.
         if (App.isDevelopmentMode()) {
+            await App.waitForDevServer(
+                `http://localhost:${rendererAppPort}`,
+                30000
+            );
             App.mainWindow.loadURL(`http://localhost:${rendererAppPort}`);
             if (App.shouldOpenDevTools()) {
                 App.mainWindow.webContents.openDevTools();
@@ -263,6 +267,32 @@ export default class App {
                 join(__dirname, '..', rendererAppName, 'index.html')
             );
         }
+    }
+
+    /**
+     * Wait for the dev server to be ready before loading the URL.
+     * Polls the server every second until it responds or the timeout is reached.
+     */
+    private static async waitForDevServer(
+        url: string,
+        timeout: number
+    ): Promise<void> {
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            try {
+                const { net } = await import('electron');
+                const response = await net.fetch(url, {
+                    method: 'HEAD',
+                });
+                if (response.ok) return;
+            } catch {
+                // Server not ready yet
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+        console.warn(
+            `Dev server did not become ready within ${timeout / 1000}s, loading anyway...`
+        );
     }
 
     static main(app: Electron.App, browserWindow: typeof BrowserWindow) {
