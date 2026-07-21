@@ -397,9 +397,6 @@ export class UnifiedLiveTabComponent {
                 // Keep playback/EPG visible even if history persistence fails.
             }
 
-            if (requestId === this.selectionRequestId && isAutoOpen) {
-                this.autoOpenHandled.emit();
-            }
         } catch {
             if (requestId === this.selectionRequestId) {
                 this.activeDetail.set(null);

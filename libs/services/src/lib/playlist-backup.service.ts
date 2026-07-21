@@ -203,6 +203,7 @@ export class PlaylistBackupService {
             exportedId: playlist._id,
             title: playlist.title,
             autoRefresh: Boolean(playlist.autoRefresh),
+            autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
             position: playlist.position,
             source: {
                 kind: this.resolveM3uSourceKind(playlist),
@@ -238,6 +239,7 @@ export class PlaylistBackupService {
                 exportedId: playlist._id,
                 title: playlist.title,
                 autoRefresh: Boolean(playlist.autoRefresh),
+                autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
                 position: playlist.position,
                 connection: {
                     serverUrl: playlist.serverUrl ?? '',
@@ -276,6 +278,7 @@ export class PlaylistBackupService {
             exportedId: playlist._id,
             title: playlist.title,
             autoRefresh: Boolean(playlist.autoRefresh),
+            autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
             position: playlist.position,
             connection: {
                 serverUrl: playlist.serverUrl ?? '',
@@ -314,6 +317,7 @@ export class PlaylistBackupService {
             exportedId: playlist._id,
             title: playlist.title,
             autoRefresh: Boolean(playlist.autoRefresh),
+            autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
             position: playlist.position,
             connection: {
                 portalUrl: playlist.portalUrl ?? playlist.url ?? '',
@@ -610,11 +614,12 @@ export class PlaylistBackupService {
         playlistId: string,
         existing: Playlist | null
     ): Promise<Playlist> {
-        const parsedPlaylist = await this.playlistsService.handlePlaylistParsing(
-            'TEXT',
-            entry.source.rawM3u,
-            entry.title
-        );
+        const parsedPlaylist =
+            await this.playlistsService.handlePlaylistParsing(
+                'TEXT',
+                entry.source.rawM3u,
+                entry.title
+            );
         const now = new Date().toISOString();
 
         return {
@@ -626,6 +631,7 @@ export class PlaylistBackupService {
             importDate: existing?.importDate ?? now,
             lastUsage: existing?.lastUsage ?? now,
             autoRefresh: entry.autoRefresh,
+            autoRefreshIntervalHours: entry.autoRefreshIntervalHours,
             position: entry.position,
             favorites: this.uniqueStrings(entry.userState.favorites),
             recentlyViewed: entry.userState.recentlyViewed.map((item) =>
@@ -666,6 +672,7 @@ export class PlaylistBackupService {
             importDate: existing?.importDate ?? now,
             lastUsage: existing?.lastUsage ?? now,
             autoRefresh: entry.autoRefresh,
+            autoRefreshIntervalHours: entry.autoRefreshIntervalHours,
             position: entry.position,
             serverUrl: entry.connection.serverUrl,
             username: entry.connection.username,
@@ -691,6 +698,7 @@ export class PlaylistBackupService {
             importDate: existing?.importDate ?? now,
             lastUsage: existing?.lastUsage ?? now,
             autoRefresh: entry.autoRefresh,
+            autoRefreshIntervalHours: entry.autoRefreshIntervalHours,
             position: entry.position,
             portalUrl: entry.connection.portalUrl,
             url: entry.connection.portalUrl,

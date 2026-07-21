@@ -23,4 +23,4 @@ if (!Element.prototype.animate) {
 setupZoneTestEnv({
   errorOnUnknownElements: true,
   errorOnUnknownProperties: true,
-});
+} as unknown as Parameters<typeof setupZoneTestEnv>[0]);

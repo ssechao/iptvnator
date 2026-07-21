@@ -38,5 +38,8 @@ export class WorkspaceShellRailComponent {
         PortalRailSection | string | null | undefined
     >(null);
     readonly railProviderClass = input('rail-context-region');
+    readonly isElectron = input(false);
+    readonly isDownloadsView = input(false);
+    readonly hasActiveDownloads = input(false);
     readonly isSettingsRoute = input(false);
 }

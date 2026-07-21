@@ -119,6 +119,9 @@ function buildPlaylistRow(
         referrer: getStringValue(playlist.referrer),
         filePath: getStringValue(playlist.filePath),
         autoRefresh: Boolean(playlist.autoRefresh),
+        autoRefreshIntervalHours: getNumericValue(
+            playlist.autoRefreshIntervalHours
+        ),
         macAddress: getStringValue(playlist.macAddress),
         url: type === PLAYLIST_TYPES.STALKER ? (portalUrl ?? url) : url,
         portalUrl,
@@ -139,7 +142,9 @@ function buildPlaylistRow(
     };
 }
 
-export function parseAppPlaylist(row: schema.Playlist): Record<string, unknown> {
+export function parseAppPlaylist(
+    row: schema.Playlist
+): Record<string, unknown> {
     const payload = parseJsonValue<Record<string, unknown> | null>(
         row.payload,
         null
@@ -150,8 +155,7 @@ export function parseAppPlaylist(row: schema.Playlist): Record<string, unknown> 
     const importDate =
         row.importDate ?? row.dateCreated ?? new Date().toISOString();
     const portalUrl =
-        row.portalUrl ??
-        (row.type === PLAYLIST_TYPES.STALKER ? row.url : null);
+        row.portalUrl ?? (row.type === PLAYLIST_TYPES.STALKER ? row.url : null);
     const updateDate =
         row.updateDate ??
         (row.lastUpdated ? new Date(row.lastUpdated).getTime() : undefined);
@@ -160,9 +164,7 @@ export function parseAppPlaylist(row: schema.Playlist): Record<string, unknown> 
         ...base,
         _id: row.id,
         title:
-            getStringValue(base.title) ??
-            getStringValue(base.name) ??
-            row.name,
+            getStringValue(base.title) ?? getStringValue(base.name) ?? row.name,
         count: row.count ?? getNumericValue(base.count) ?? 0,
         importDate: getStringValue(base.importDate) ?? importDate,
         lastUsage:
@@ -173,9 +175,12 @@ export function parseAppPlaylist(row: schema.Playlist): Record<string, unknown> 
         favorites,
         recentlyViewed,
         autoRefresh: row.autoRefresh ?? Boolean(base.autoRefresh),
+        autoRefreshIntervalHours:
+            row.autoRefreshIntervalHours ??
+            getNumericValue(base.autoRefreshIntervalHours),
         url:
             row.type === PLAYLIST_TYPES.M3U_URL
-                ? row.url ?? getStringValue(base.url)
+                ? (row.url ?? getStringValue(base.url))
                 : getStringValue(base.url),
         filePath: row.filePath ?? getStringValue(base.filePath),
         userAgent: row.userAgent ?? getStringValue(base.userAgent),
@@ -229,13 +234,10 @@ export async function upsertAppPlaylist(
         throw new Error('Playlist ID is required for upsert');
     }
 
-    await db
-        .insert(schema.playlists)
-        .values(row)
-        .onConflictDoUpdate({
-            target: schema.playlists.id,
-            set: row,
-        });
+    await db.insert(schema.playlists).values(row).onConflictDoUpdate({
+        target: schema.playlists.id,
+        set: row,
+    });
 
     return { success: true };
 }
@@ -258,8 +260,7 @@ export async function upsertAppPlaylists(
 
     await db.transaction((tx) => {
         for (const row of rows) {
-            tx
-                .insert(schema.playlists)
+            tx.insert(schema.playlists)
                 .values(row)
                 .onConflictDoUpdate({
                     target: schema.playlists.id,
@@ -306,6 +307,8 @@ export async function updatePlaylist(
         password?: string;
         serverUrl?: string;
         lastUpdated?: string;
+        autoRefresh?: boolean;
+        autoRefreshIntervalHours?: number;
     }
 ): Promise<{ success: boolean }> {
     await db
@@ -321,25 +324,29 @@ export async function deletePlaylist(
     playlistId: string,
     control?: OperationControl
 ): Promise<{ success: boolean }> {
-    const [favoriteRows, recentlyViewedRows, playbackPositionRows, downloadRows] =
-        await Promise.all([
-            db
-                .select({ id: schema.favorites.id })
-                .from(schema.favorites)
-                .where(eq(schema.favorites.playlistId, playlistId)),
-            db
-                .select({ id: schema.recentlyViewed.id })
-                .from(schema.recentlyViewed)
-                .where(eq(schema.recentlyViewed.playlistId, playlistId)),
-            db
-                .select({ id: schema.playbackPositions.id })
-                .from(schema.playbackPositions)
-                .where(eq(schema.playbackPositions.playlistId, playlistId)),
-            db
-                .select({ id: schema.downloads.id })
-                .from(schema.downloads)
-                .where(eq(schema.downloads.playlistId, playlistId)),
-        ]);
+    const [
+        favoriteRows,
+        recentlyViewedRows,
+        playbackPositionRows,
+        downloadRows,
+    ] = await Promise.all([
+        db
+            .select({ id: schema.favorites.id })
+            .from(schema.favorites)
+            .where(eq(schema.favorites.playlistId, playlistId)),
+        db
+            .select({ id: schema.recentlyViewed.id })
+            .from(schema.recentlyViewed)
+            .where(eq(schema.recentlyViewed.playlistId, playlistId)),
+        db
+            .select({ id: schema.playbackPositions.id })
+            .from(schema.playbackPositions)
+            .where(eq(schema.playbackPositions.playlistId, playlistId)),
+        db
+            .select({ id: schema.downloads.id })
+            .from(schema.downloads)
+            .where(eq(schema.downloads.playlistId, playlistId)),
+    ]);
 
     const categoryRows = await db
         .select({ id: schema.categories.id })
@@ -411,7 +418,9 @@ export async function deletePlaylist(
     }
 
     await checkpointOperation(control);
-    await db.delete(schema.playlists).where(eq(schema.playlists.id, playlistId));
+    await db
+        .delete(schema.playlists)
+        .where(eq(schema.playlists.id, playlistId));
     await reportOperationProgress(control, {
         phase: 'deleting-playlist',
         current: 1,

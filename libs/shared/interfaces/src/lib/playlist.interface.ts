@@ -34,6 +34,7 @@ export interface Playlist {
     origin?: string;
     filePath?: string;
     autoRefresh: boolean;
+    autoRefreshIntervalHours?: number;
     updateDate?: number;
     updateState?: PlaylistUpdateState;
     position?: number;

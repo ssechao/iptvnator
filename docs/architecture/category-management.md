@@ -30,6 +30,23 @@ ALTER TABLE categories ADD COLUMN hidden INTEGER DEFAULT 0
 - `hidden = 0` (false): Category is visible (default)
 - `hidden = 1` (true): Category is hidden
 
+The current category rows are import-cache data and can be deleted/recreated
+during Xtream refresh. Durable visibility preferences are therefore mirrored in
+the existing `app_state` key-value table under:
+
+```text
+xtream-category-visibility:{playlistId}:{type}
+```
+
+The value is JSON:
+
+```json
+{
+    "version": 1,
+    "hiddenXtreamIds": [101, 102]
+}
+```
+
 **Migration**: Uses a safe migration pattern in `connection.ts` that catches errors for already-applied migrations, ensuring existing users get the new column automatically.
 
 ### Backend (Electron)
@@ -40,7 +57,7 @@ ALTER TABLE categories ADD COLUMN hidden INTEGER DEFAULT 0
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `DB_GET_CATEGORIES`             | Returns visible categories only (`hidden = false`) in SQLite insertion order, preserving the Xtream server order by default |
 | `DB_GET_ALL_CATEGORIES`         | Returns all categories (for management dialog)                                                                              |
-| `DB_UPDATE_CATEGORY_VISIBILITY` | Batch updates `hidden` status for category IDs                                                                              |
+| `DB_UPDATE_CATEGORY_VISIBILITY` | Batch updates `hidden` status for category IDs and mirrors hidden Xtream IDs into durable `app_state` preferences           |
 
 ### Frontend Services
 
@@ -81,7 +98,7 @@ Added `reloadCategories()` method to refresh categories from database after visi
 
 ## Behavior Notes
 
-- **New categories**: When a playlist is refreshed, new categories from the remote API are added with `hidden = false` (visible by default)
+- **New categories**: When a playlist is refreshed, new categories from the remote API are added with `hidden = false` unless their Xtream category ID appears in the durable hidden-category preference
 - **Persistence**: Visibility settings survive playlist refresh (see below)
 - **Per-playlist, per-type**: Categories are managed per playlist and per content type (live/movies/series)
 - **No content deletion**: Hiding a category only affects sidebar visibility; the category and its content remain in the database
@@ -97,11 +114,12 @@ Added `reloadCategories()` method to refresh categories from database after visi
 
 When a user refreshes an Xtream playlist, hidden category preferences are preserved through the following mechanism:
 
-1. **Before deletion**: The `DB_DELETE_XTREAM_CONTENT` handler extracts and returns the `hidden` status of all categories (keyed by `xtreamId` and `type`)
-2. **Temporary storage**: The hidden categories are stored in `localStorage` under key `xtream-restore-{playlistId}` along with favorites and recently viewed data
-3. **During re-import**: When categories are saved via `DB_SAVE_CATEGORIES`, the data source checks `localStorage` for saved hidden category xtreamIds
-4. **Restoration**: Categories matching the saved xtreamIds are inserted with `hidden = true`, preserving the user's visibility preferences
-5. **ID normalization**: Xtream category IDs arrive from the API as strings, while SQLite stores `categories.xtream_id` as an integer. Restoration must normalize incoming `category_id` values before matching them against saved hidden-category xtreamIds.
+1. **On dialog save**: `DB_UPDATE_CATEGORY_VISIBILITY` updates current category rows and stores hidden Xtream category IDs in `app_state`, keyed by playlist ID and type (`live`, `movies`, or `series`).
+2. **Before deletion**: Category-deletion paths (`DB_DELETE_XTREAM_CONTENT` and `DB_CLEAR_XTREAM_IMPORT_CACHE`) mirror the current hidden state into the same durable preference before removing category rows.
+3. **Temporary restore state**: Xtream refresh still stores hidden categories in `localStorage` under `xtream-restore-{playlistId}` along with favorites and recently viewed data. This remains a refresh/backup restore companion path.
+4. **During re-import**: `DB_SAVE_CATEGORIES` reads the durable `app_state` preference and combines it with any pending refresh restore data from `localStorage`.
+5. **Restoration**: Categories matching the stored hidden Xtream IDs are inserted with `hidden = true`, preserving the user's visibility preferences even though the category rows were recreated.
+6. **ID normalization**: Xtream category IDs arrive from the API as strings, while SQLite stores `categories.xtream_id` as an integer. Restoration must normalize incoming `category_id` values before matching them against saved hidden-category Xtream IDs.
 
 This ensures that users don't lose their category visibility customizations when refreshing playlists to get updated content.
 
@@ -126,6 +144,9 @@ libs/shared/database/src/lib/
 └── connection.ts                # Added migration for existing databases
 
 apps/electron-backend/src/app/
+├── database/operations/category.operations.ts # Hidden-category persistence and restore
+├── database/operations/content.operations.ts  # Persists hidden categories before import-cache deletion
+├── database/operations/xtream.operations.ts   # Persists/returns hidden categories during refresh deletion
 ├── events/database/category.events.ts  # IPC handlers (including hidden category restoration)
 ├── events/database/xtream.events.ts    # Returns hidden categories during content deletion
 └── api/main.preload.ts                 # Exposed new IPC methods (with hidden category params)

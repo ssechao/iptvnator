@@ -218,6 +218,26 @@ export function buildExternalPlayerSpawnSpec(
     };
 }
 
+function quoteExternalPlayerCommandPart(value: string): string {
+    if (value === '') {
+        return "''";
+    }
+
+    if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) {
+        return value;
+    }
+
+    return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export function formatExternalPlayerCommand(
+    spawnSpec: Pick<ExternalPlayerSpawnSpec, 'command' | 'args'>
+): string {
+    return [spawnSpec.command, ...spawnSpec.args]
+        .map(quoteExternalPlayerCommandPart)
+        .join(' ');
+}
+
 export { parseExternalPlayerArguments };
 
 export function buildPlayerArgsWithCustomArguments(
@@ -935,6 +955,10 @@ ipcMain.handle(
                 const spawnSpec = buildExternalPlayerSpawnSpec(
                     mpvLaunchContext,
                     buildPlayerArgsWithCustomArguments(customMpvArguments, args)
+                );
+                console.info(
+                    '[MPV command]:',
+                    formatExternalPlayerCommand(spawnSpec)
                 );
                 const proc = spawn(spawnSpec.command, spawnSpec.args, {
                     shell: false,

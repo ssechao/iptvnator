@@ -152,10 +152,30 @@
                 }
             </mat-form-field>
         }
-        @if (isDesktop && (playlist.url || playlist.filePath)) {
+        @if (canAutoRefresh) {
             <mat-checkbox class="w-full" formControlName="autoRefresh">
                 {{ 'HOME.PLAYLISTS.INFO_DIALOG.AUTO_UPDATE' | translate }}
             </mat-checkbox>
+            @if (isAutoRefreshEnabled) {
+                <mat-form-field class="w-full">
+                    <mat-label>
+                        {{
+                            'HOME.PLAYLISTS.INFO_DIALOG.AUTO_UPDATE_INTERVAL'
+                                | translate
+                        }}
+                    </mat-label>
+                    <mat-select formControlName="autoRefreshIntervalHours">
+                        @for (hours of autoRefreshIntervals; track hours) {
+                            <mat-option [value]="hours">
+                                {{
+                                    getAutoRefreshIntervalLabelKey(hours)
+                                        | translate
+                                }}
+                            </mat-option>
+                        }
+                    </mat-select>
+                </mat-form-field>
+            }
             <p>
                 {{
                     'HOME.PLAYLISTS.INFO_DIALOG.AUTO_UPDATE_DESCRIPTION'

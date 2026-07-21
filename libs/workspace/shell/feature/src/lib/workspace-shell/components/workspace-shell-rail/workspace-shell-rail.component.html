@@ -37,6 +37,28 @@
     }
 
     <div class="rail-footer">
+        @if (isElectron()) {
+            <span class="rail-download-wrap">
+                @if (hasActiveDownloads()) {
+                    <span class="download-activity-bar" aria-hidden="true">
+                        <span class="download-activity-bar__fill"></span>
+                    </span>
+                }
+                <a
+                    class="rail-shortcut nav-item rail-download-shortcut"
+                    routerLink="/workspace/downloads"
+                    [class.is-active]="isDownloadsView()"
+                    [class.has-activity]="hasActiveDownloads()"
+                    [matTooltip]="'WORKSPACE.SHELL.RAIL_DOWNLOADS' | translate"
+                    [matTooltipPosition]="'right'"
+                    [attr.aria-label]="
+                        'WORKSPACE.SHELL.OPEN_DOWNLOADS' | translate
+                    "
+                >
+                    <mat-icon>download</mat-icon>
+                </a>
+            </span>
+        }
         <a
             class="rail-shortcut nav-item"
             routerLink="/workspace/settings"

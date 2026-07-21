@@ -10,7 +10,10 @@ import {
     requestWorkerWithEvents,
 } from './worker-events.utils';
 
-handleWorkerRequest('DB_CREATE_PLAYLIST', (playlist: Record<string, unknown>) => playlist);
+handleWorkerRequest(
+    'DB_CREATE_PLAYLIST',
+    (playlist: Record<string, unknown>) => playlist
+);
 handleWorkerRequest(
     'DB_UPSERT_APP_PLAYLIST',
     (playlist: Record<string, unknown>) => playlist
@@ -20,8 +23,12 @@ handleWorkerRequest(
     (playlists: Record<string, unknown>[]) => playlists
 );
 handleWorkerRequest('DB_GET_APP_PLAYLISTS', () => ({}));
-handleWorkerRequest('DB_GET_APP_PLAYLIST', (playlistId: string) => ({ playlistId }));
-handleWorkerRequest('DB_GET_PLAYLIST', (playlistId: string) => ({ playlistId }));
+handleWorkerRequest('DB_GET_APP_PLAYLIST', (playlistId: string) => ({
+    playlistId,
+}));
+handleWorkerRequest('DB_GET_PLAYLIST', (playlistId: string) => ({
+    playlistId,
+}));
 handleWorkerRequest(
     'DB_UPDATE_PLAYLIST',
     (
@@ -32,6 +39,8 @@ handleWorkerRequest(
             password?: string;
             serverUrl?: string;
             lastUpdated?: string;
+            autoRefresh?: boolean;
+            autoRefreshIntervalHours?: number;
         }
     ) => ({
         playlistId,
@@ -46,20 +55,12 @@ handleWorkerRequest('DB_SET_APP_STATE', (key: string, value: string) => ({
 
 ipcMain.handle(
     'DB_DELETE_PLAYLIST',
-    async (
-        event,
-        playlistId: string,
-        operationId?: string
-    ) => {
+    async (event, playlistId: string, operationId?: string) => {
         try {
-            return await requestWorkerWithEvents(
-                event,
-                'DB_DELETE_PLAYLIST',
-                {
-                    playlistId,
-                    operationId,
-                }
-            );
+            return await requestWorkerWithEvents(event, 'DB_DELETE_PLAYLIST', {
+                playlistId,
+                operationId,
+            });
         } catch (error) {
             console.error('Error handling DB_DELETE_PLAYLIST:', error);
             throw error;

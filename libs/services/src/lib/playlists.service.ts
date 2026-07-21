@@ -21,6 +21,7 @@ import {
     Channel,
     DbStores,
     extractStalkerItemId,
+    isPlaylistAutoRefreshDue,
     isM3uRecentlyViewedItem,
     M3uRecentlyViewedItem,
     Playlist,
@@ -190,6 +191,7 @@ export class PlaylistsService {
             favorites: playlist.favorites ?? [],
             recentlyViewed: playlist.recentlyViewed ?? [],
             autoRefresh: Boolean(playlist.autoRefresh),
+            autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
             playlist: playlist.playlist,
             url: playlist.url,
             filePath: playlist.filePath,
@@ -439,6 +441,9 @@ export class PlaylistsService {
                     autoRefresh:
                         currentPlaylist.autoRefresh ??
                         updatedPlaylist.autoRefresh,
+                    autoRefreshIntervalHours:
+                        currentPlaylist.autoRefreshIntervalHours ??
+                        updatedPlaylist.autoRefreshIntervalHours,
                 };
 
                 if (this.isElectronStorageAvailable) {
@@ -483,6 +488,12 @@ export class PlaylistsService {
                         : {}),
                     ...(updatedPlaylist.autoRefresh != null
                         ? { autoRefresh: updatedPlaylist.autoRefresh }
+                        : {}),
+                    ...(updatedPlaylist.autoRefreshIntervalHours !== undefined
+                        ? {
+                              autoRefreshIntervalHours:
+                                  updatedPlaylist.autoRefreshIntervalHours,
+                          }
                         : {}),
                     ...(updatedPlaylist.userAgent != null
                         ? { userAgent: updatedPlaylist.userAgent }
@@ -830,7 +841,7 @@ export class PlaylistsService {
         return this.getAllData().pipe(
             map((playlists: Playlist[]) => {
                 return playlists
-                    .filter((item) => item.autoRefresh)
+                    .filter((item) => isPlaylistAutoRefreshDue(item))
                     .map(
                         ({
                             playlist,

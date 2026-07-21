@@ -19,6 +19,7 @@ export interface PlaylistBackupBaseEntry {
     exportedId: string;
     title: string;
     autoRefresh: boolean;
+    autoRefreshIntervalHours?: number;
     position?: number;
 }
 

@@ -520,6 +520,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     password?: string;
                     serverUrl?: string;
                     lastUpdated?: string;
+                    autoRefresh?: boolean;
+                    autoRefreshIntervalHours?: number;
                 };
             };
             return updatePlaylist(db, payload.playlistId, payload.updates);

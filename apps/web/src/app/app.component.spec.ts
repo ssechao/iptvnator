@@ -7,7 +7,7 @@ import { TranslateService } from '@ngx-translate/core';
 import { EpgService } from '@iptvnator/epg/data-access';
 import { WORKSPACE_SHELL_ACTIONS } from '@iptvnator/workspace/shell/util';
 import { MockProvider } from 'ng-mocks';
-import { EMPTY, of } from 'rxjs';
+import { of, Subject } from 'rxjs';
 import { DataService } from '@iptvnator/services';
 import {
     Language,
@@ -18,7 +18,8 @@ import {
     Theme,
     VideoPlayer,
 } from '@iptvnator/shared/interfaces';
-import { PlaylistActions } from '@iptvnator/m3u-state';
+import { PlaylistActions, selectAllPlaylistsMeta } from '@iptvnator/m3u-state';
+import { PlaylistRefreshActionService } from '@iptvnator/playlist/shared/util';
 import { AppComponent } from './app.component';
 import { ElectronServiceStub } from './services/electron.service.stub';
 import { SettingsService } from './services/settings.service';
@@ -64,16 +65,20 @@ describe('AppComponent', () => {
     let snackBar: MatSnackBar;
     let store: MockStore;
     let translateService: TranslateService;
+    let actionsSubject: Subject<any>;
+    let playlistRefreshAction: PlaylistRefreshActionService;
     const originalElectron = window.electron;
 
     beforeEach(waitForAsync(() => {
+        actionsSubject = new Subject<any>();
+
         TestBed.configureTestingModule({
             imports: [AppComponent],
             providers: [
                 provideMockStore(),
                 {
                     provide: Actions,
-                    useValue: new Actions(EMPTY),
+                    useFactory: () => new Actions(actionsSubject),
                 },
                 {
                     provide: DataService,
@@ -91,6 +96,10 @@ describe('AppComponent', () => {
                 }),
                 MockProvider(MatSnackBar, {
                     open: jest.fn(),
+                }),
+                MockProvider(PlaylistRefreshActionService, {
+                    canRefresh: jest.fn().mockReturnValue(true),
+                    refreshNow: jest.fn().mockResolvedValue(true),
                 }),
                 MockProvider(TranslateService, {
                     instant: jest.fn((key: string) => key),
@@ -133,10 +142,13 @@ describe('AppComponent', () => {
         snackBar = TestBed.inject(MatSnackBar);
         store = TestBed.inject(MockStore);
         translateService = TestBed.inject(TranslateService);
+        playlistRefreshAction = TestBed.inject(PlaylistRefreshActionService);
         component = fixture.componentInstance;
     });
 
     afterEach(() => {
+        fixture.destroy();
+        actionsSubject.complete();
         window.electron = originalElectron;
     });
 
@@ -211,5 +223,83 @@ describe('AppComponent', () => {
         expect(checkEpgFreshness).toHaveBeenCalledWith(settings.epgUrl, 12);
         expect(epgService.fetchEpg).toHaveBeenCalledWith(settings.epgUrl);
         expect(snackBar.open).not.toHaveBeenCalled();
+    });
+
+    it('refreshes due auto-refresh playlists after playlists load', async () => {
+        const duePlaylist = {
+            _id: 'playlist-1',
+            title: 'Auto Xtream',
+            count: 0,
+            importDate: '2026-06-09T00:00:00.000Z',
+            autoRefresh: true,
+            autoRefreshIntervalHours: 12,
+            serverUrl: 'http://localhost:8080',
+        };
+        const dateNowSpy = jest
+            .spyOn(Date, 'now')
+            .mockReturnValue(Date.parse('2026-06-10T13:00:00.000Z'));
+        store.overrideSelector(selectAllPlaylistsMeta, [duePlaylist] as any);
+
+        try {
+            component.ngOnInit();
+            actionsSubject.next(
+                PlaylistActions.loadPlaylistsSuccess({ playlists: [] })
+            );
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(playlistRefreshAction.refreshNow).toHaveBeenCalledWith(
+                duePlaylist,
+                {
+                    confirm: false,
+                    navigateToPlaylist: true,
+                    notify: true,
+                }
+            );
+        } finally {
+            dateNowSpy.mockRestore();
+        }
+    });
+
+    it('checks due auto-refresh playlists hourly after startup', async () => {
+        jest.useFakeTimers();
+        const duePlaylist = {
+            _id: 'playlist-1',
+            title: 'Auto Xtream',
+            count: 0,
+            importDate: '2026-06-09T00:00:00.000Z',
+            autoRefresh: true,
+            autoRefreshIntervalHours: 12,
+            serverUrl: 'http://localhost:8080',
+        };
+        const dateNowSpy = jest
+            .spyOn(Date, 'now')
+            .mockReturnValue(Date.parse('2026-06-10T13:00:00.000Z'));
+        store.overrideSelector(selectAllPlaylistsMeta, [duePlaylist] as any);
+
+        try {
+            component.ngOnInit();
+            actionsSubject.next(
+                PlaylistActions.loadPlaylistsSuccess({ playlists: [] })
+            );
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(playlistRefreshAction.refreshNow).toHaveBeenCalledTimes(1);
+
+            (
+                playlistRefreshAction.refreshNow as jest.Mock
+            ).mockClear();
+            jest.advanceTimersByTime(59 * 60 * 1000);
+            await Promise.resolve();
+            expect(playlistRefreshAction.refreshNow).not.toHaveBeenCalled();
+
+            jest.advanceTimersByTime(60 * 1000);
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(playlistRefreshAction.refreshNow).toHaveBeenCalledTimes(1);
+        } finally {
+            dateNowSpy.mockRestore();
+            jest.useRealTimers();
+        }
     });
 });

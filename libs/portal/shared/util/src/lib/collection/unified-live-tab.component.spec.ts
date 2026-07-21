@@ -278,11 +278,11 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('items', [item]);
         fixture.componentRef.setInput('mode', 'recent');
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(recentData.recordLivePlayback).toHaveBeenCalledWith(item);
         expect(streamResolver.loadM3uProgramsForItem).toHaveBeenCalledWith(
@@ -309,7 +309,7 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('mode', 'recent');
         fixture.componentRef.setInput('favoriteUids', favoriteUids);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         const list = fixture.debugElement.query(
             By.directive(StubGlobalFavoritesListComponent)
@@ -334,7 +334,7 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('items', [item]);
         fixture.componentRef.setInput('mode', 'recent');
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         const list = fixture.debugElement.query(
             By.directive(StubGlobalFavoritesListComponent)
@@ -384,11 +384,11 @@ describe('UnifiedLiveTabComponent', () => {
 
         fixture.componentRef.setInput('items', [item]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         const panel = fixture.debugElement.query(
             By.directive(StubLiveEpgPanelComponent)
@@ -430,11 +430,11 @@ describe('UnifiedLiveTabComponent', () => {
 
         fixture.componentRef.setInput('items', [item]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         const panel = fixture.debugElement.query(
             By.directive(StubLiveEpgPanelComponent)
@@ -493,11 +493,11 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('items', [item]);
         fixture.componentRef.setInput('mode', 'recent');
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(portalPlayer.openResolvedPlayback).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -508,7 +508,7 @@ describe('UnifiedLiveTabComponent', () => {
         expect(streamResolver.loadM3uProgramsForItem).toHaveBeenCalled();
 
         pendingPrograms.resolve([buildProgram('M3U Show')]);
-        await fixture.whenStable();
+        await flushAsyncWork();
     });
 
     it('renders inline audio for M3U radio items and skips external playback', async () => {
@@ -549,11 +549,11 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('items', [item]);
         fixture.componentRef.setInput('mode', 'recent');
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(recentData.recordLivePlayback).toHaveBeenCalledWith(item);
         expect(portalPlayer.openResolvedPlayback).not.toHaveBeenCalled();
@@ -603,11 +603,11 @@ describe('UnifiedLiveTabComponent', () => {
         fixture.componentRef.setInput('items', [item]);
         fixture.componentRef.setInput('mode', 'recent');
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(recentData.recordLivePlayback).toHaveBeenCalledWith(item);
         expect(portalPlayer.openResolvedPlayback).not.toHaveBeenCalled();
@@ -642,11 +642,11 @@ describe('UnifiedLiveTabComponent', () => {
 
         fixture.componentRef.setInput('items', [item]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(recentData.recordLivePlayback).toHaveBeenCalledWith(item);
         expect(
@@ -672,11 +672,11 @@ describe('UnifiedLiveTabComponent', () => {
 
         fixture.componentRef.setInput('items', [item]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         await component.onChannelSelected(component.channelsForList()[0]);
         fixture.detectChanges();
-        await fixture.whenStable();
+        await flushAsyncWork();
 
         expect(recentData.recordLivePlayback).toHaveBeenCalledWith(item);
         expect(
@@ -734,7 +734,7 @@ describe('UnifiedLiveTabComponent', () => {
             },
             epgItems: [buildEpgItem('Xtream Show')],
         });
-        await fixture.whenStable();
+        await flushAsyncWork();
         fixture.detectChanges();
 
         expect(component.activeDetail()).toEqual(
@@ -747,6 +747,11 @@ describe('UnifiedLiveTabComponent', () => {
         expect(autoOpenHandledSpy).toHaveBeenCalledTimes(1);
     });
 });
+
+async function flushAsyncWork(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+}
 
 function buildLiveItem(
     sourceType: 'm3u' | 'xtream' | 'stalker'

@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
 import type { AppDatabase } from '../database.types';
+import { storeHiddenCategoryXtreamIds } from './category.operations';
 import {
     checkpointOperation,
     chunkValues,
@@ -183,16 +184,16 @@ type XtreamContentSource = Record<string, unknown> & {
     last_modified?: string;
     added?: string;
     stream_icon?: string;
-        poster?: string;
-        cover?: string;
-        name?: string;
-        title?: string;
-        epg_channel_id?: string;
-        tv_archive?: string | number;
-        tv_archive_duration?: string | number;
-        direct_source?: string;
-        series_id?: string | number;
-        stream_id?: string | number;
+    poster?: string;
+    cover?: string;
+    name?: string;
+    title?: string;
+    epg_channel_id?: string;
+    tv_archive?: string | number;
+    tv_archive_duration?: string | number;
+    direct_source?: string;
+    series_id?: string | number;
+    stream_id?: string | number;
 };
 
 function toXtreamContentValue(
@@ -300,10 +301,9 @@ export async function saveContent(
             )
         );
 
-    const categoryMap = new Map(categories.map((category) => [
-        category.xtreamId,
-        category.id,
-    ]));
+    const categoryMap = new Map(
+        categories.map((category) => [category.xtreamId, category.id])
+    );
 
     const values = streams
         .map((stream) => toXtreamContentValue(stream, type, categoryMap))
@@ -317,8 +317,7 @@ export async function saveContent(
         await checkpointOperation(control);
         const chunk = values.slice(index, index + chunkSize);
         await db.transaction((tx) => {
-            tx
-                .insert(schema.content)
+            tx.insert(schema.content)
                 .values(chunk)
                 .onConflictDoNothing({
                     target: [
@@ -350,7 +349,11 @@ export async function clearXtreamImportCache(
         type === 'series' ? 'series' : type === 'movie' ? 'movies' : 'live';
 
     const categoryRows = await db
-        .select({ id: schema.categories.id })
+        .select({
+            id: schema.categories.id,
+            xtreamId: schema.categories.xtreamId,
+            hidden: schema.categories.hidden,
+        })
         .from(schema.categories)
         .where(
             and(
@@ -358,6 +361,15 @@ export async function clearXtreamImportCache(
                 eq(schema.categories.type, dbType)
             )
         );
+
+    await storeHiddenCategoryXtreamIds(
+        db,
+        playlistId,
+        dbType,
+        categoryRows
+            .filter((category) => category.hidden)
+            .map((category) => category.xtreamId)
+    );
 
     const categoryIds = categoryRows.map((category) => category.id);
     if (categoryIds.length === 0) {
@@ -374,8 +386,7 @@ export async function clearXtreamImportCache(
         100
     )) {
         await db.transaction((tx) => {
-            tx
-                .delete(schema.content)
+            tx.delete(schema.content)
                 .where(inArray(schema.content.id, chunk))
                 .run();
         });
@@ -383,8 +394,7 @@ export async function clearXtreamImportCache(
 
     for (const chunk of chunkValues(categoryIds, 100)) {
         await db.transaction((tx) => {
-            tx
-                .delete(schema.categories)
+            tx.delete(schema.categories)
                 .where(inArray(schema.categories.id, chunk))
                 .run();
         });
@@ -440,7 +450,10 @@ export async function searchContent(
 
     const conditions = [
         eq(schema.categories.playlistId, playlistId),
-        inArray(schema.content.type, types as Array<'live' | 'movie' | 'series'>),
+        inArray(
+            schema.content.type,
+            types as Array<'live' | 'movie' | 'series'>
+        ),
         or(...likeConditions),
     ];
 
@@ -482,7 +495,10 @@ export async function globalSearch(
     );
 
     const conditions = [
-        inArray(schema.content.type, types as Array<'live' | 'movie' | 'series'>),
+        inArray(
+            schema.content.type,
+            types as Array<'live' | 'movie' | 'series'>
+        ),
         or(...likeConditions),
     ];
 

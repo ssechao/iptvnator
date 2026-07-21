@@ -1,4 +1,11 @@
-import { Component, effect, HostBinding, inject, OnInit } from '@angular/core';
+import {
+    Component,
+    effect,
+    HostBinding,
+    inject,
+    OnDestroy,
+    OnInit,
+} from '@angular/core';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { Router, RouterOutlet } from '@angular/router';
 import { Actions, ofType } from '@ngrx/effects';
@@ -8,27 +15,30 @@ import { EpgService } from '@iptvnator/epg/data-access';
 import { WORKSPACE_SHELL_ACTIONS } from '@iptvnator/workspace/shell/util';
 import { EpgProgressPanelComponent } from '@iptvnator/ui/epg/progress-panel';
 import { PlaylistActions, selectAllPlaylistsMeta } from '@iptvnator/m3u-state';
-import { filter, take } from 'rxjs';
+import { take } from 'rxjs';
 import { DataService, SettingsStore } from '@iptvnator/services';
 import {
-    AUTO_UPDATE_PLAYLISTS,
+    isPlaylistAutoRefreshDue,
     Language,
     OPEN_FILE,
+    PlaylistMeta,
     Settings,
     STORE_KEY,
     Theme,
     createDevLogger,
 } from '@iptvnator/shared/interfaces';
+import { PlaylistRefreshActionService } from '@iptvnator/playlist/shared/util';
 import { SettingsService } from './services/settings.service';
 
 const debugAppComponent = createDevLogger('AppComponent');
+const AUTO_REFRESH_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 @Component({
     selector: 'app-root',
     templateUrl: './app.component.html',
     imports: [EpgProgressPanelComponent, RouterOutlet],
 })
-export class AppComponent implements OnInit {
+export class AppComponent implements OnInit, OnDestroy {
     @HostBinding('class.macos-platform') get isMacOS() {
         return (
             window.electron && navigator.platform.toLowerCase().includes('mac')
@@ -44,6 +54,11 @@ export class AppComponent implements OnInit {
     private settingsService = inject(SettingsService);
     private settingsStore = inject(SettingsStore);
     private readonly workspaceShellActions = inject(WORKSPACE_SHELL_ACTIONS);
+    private readonly playlistRefreshAction = inject(
+        PlaylistRefreshActionService
+    );
+    private readonly autoRefreshInFlightPlaylistIds = new Set<string>();
+    private autoRefreshTimerId: ReturnType<typeof setInterval> | null = null;
 
     /** Default language as fallback */
     private readonly DEFAULT_LANG = Language.ENGLISH;
@@ -94,6 +109,13 @@ export class AppComponent implements OnInit {
 
         this.initSettings();
         this.triggerAutoUpdatePlaylists();
+    }
+
+    ngOnDestroy(): void {
+        if (this.autoRefreshTimerId) {
+            clearInterval(this.autoRefreshTimerId);
+            this.autoRefreshTimerId = null;
+        }
     }
 
     /**
@@ -195,40 +217,54 @@ export class AppComponent implements OnInit {
     }
 
     /**
-     * Triggers auto-update for playlists that have autoRefresh enabled
+     * Triggers automatic playlist refreshes when their configured interval is due.
      */
     private triggerAutoUpdatePlaylists(): void {
         // Wait for playlists to be loaded successfully
         this.actions$
-            .pipe(
-                ofType(PlaylistActions.loadPlaylistsSuccess),
-                take(1) // Only trigger once on app startup
-            )
+            .pipe(ofType(PlaylistActions.loadPlaylistsSuccess), take(1))
             .subscribe(() => {
-                // Get all playlists from store
-                this.store
-                    .select(selectAllPlaylistsMeta)
-                    .pipe(
-                        take(1),
-                        filter((playlists) => playlists.length > 0)
-                    )
-                    .subscribe((playlists) => {
-                        // Filter playlists with autoRefresh enabled
-                        const playlistsToUpdate = playlists.filter(
-                            (playlist) => playlist.autoRefresh === true
-                        );
-
-                        // Trigger auto-update if there are playlists to update
-                        if (playlistsToUpdate.length > 0) {
-                            debugAppComponent(
-                                `Auto-updating ${playlistsToUpdate.length} playlist(s) on startup`
-                            );
-                            this.dataService.sendIpcEvent(
-                                AUTO_UPDATE_PLAYLISTS,
-                                playlistsToUpdate
-                            );
-                        }
-                    });
+                void this.refreshDuePlaylists();
+                this.autoRefreshTimerId = setInterval(() => {
+                    void this.refreshDuePlaylists();
+                }, AUTO_REFRESH_CHECK_INTERVAL_MS);
             });
+    }
+
+    private async refreshDuePlaylists(): Promise<void> {
+        const playlists = await new Promise<PlaylistMeta[]>((resolve) => {
+            this.store
+                .select(selectAllPlaylistsMeta)
+                .pipe(take(1))
+                .subscribe((items) => resolve(items));
+        });
+        const now = Date.now();
+        const playlistsToRefresh = playlists.filter(
+            (playlist) =>
+                isPlaylistAutoRefreshDue(playlist, now) &&
+                this.playlistRefreshAction.canRefresh(playlist) &&
+                !this.autoRefreshInFlightPlaylistIds.has(playlist._id)
+        );
+
+        if (playlistsToRefresh.length === 0) {
+            return;
+        }
+
+        debugAppComponent(
+            `Auto-refreshing ${playlistsToRefresh.length} playlist(s)`
+        );
+
+        for (const playlist of playlistsToRefresh) {
+            this.autoRefreshInFlightPlaylistIds.add(playlist._id);
+            try {
+                await this.playlistRefreshAction.refreshNow(playlist, {
+                    confirm: false,
+                    navigateToPlaylist: true,
+                    notify: true,
+                });
+            } finally {
+                this.autoRefreshInFlightPlaylistIds.delete(playlist._id);
+            }
+        }
     }
 }

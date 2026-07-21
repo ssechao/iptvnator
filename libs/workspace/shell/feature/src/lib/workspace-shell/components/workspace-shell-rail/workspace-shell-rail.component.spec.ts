@@ -77,6 +77,9 @@ describe('WorkspaceShellRailComponent', () => {
             'railProviderClass',
             'rail-context-region rail-context-region--xtreams'
         );
+        fixture.componentRef.setInput('isElectron', true);
+        fixture.componentRef.setInput('isDownloadsView', true);
+        fixture.componentRef.setInput('hasActiveDownloads', true);
         fixture.componentRef.setInput('isSettingsRoute', true);
         fixture.detectChanges();
 
@@ -85,6 +88,17 @@ describe('WorkspaceShellRailComponent', () => {
         ).not.toBeNull();
         expect(
             fixture.nativeElement.querySelector('.rail-shortcut.is-active')
+        ).not.toBeNull();
+        expect(
+            fixture.nativeElement.querySelector('.rail-download-shortcut')
+        ).not.toBeNull();
+        expect(
+            fixture.nativeElement
+                .querySelector('.rail-download-shortcut')
+                ?.getAttribute('href')
+        ).toContain('/workspace/downloads');
+        expect(
+            fixture.nativeElement.querySelector('.download-activity-bar')
         ).not.toBeNull();
         expect(
             fixture.nativeElement

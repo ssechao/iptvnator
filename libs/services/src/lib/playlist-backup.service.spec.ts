@@ -231,6 +231,7 @@ describe('PlaylistBackupService', () => {
                     exportedId: 'backup-playlist-id',
                     title: 'Imported Title',
                     autoRefresh: true,
+                    autoRefreshIntervalHours: 48,
                     position: 3,
                     source: {
                         kind: 'url',
@@ -267,6 +268,7 @@ describe('PlaylistBackupService', () => {
                 _id: 'existing-playlist-id',
                 title: 'Imported Title',
                 autoRefresh: true,
+                autoRefreshIntervalHours: 48,
                 position: 3,
                 url: 'https://example.com/playlist.m3u/',
                 userAgent: 'BackupAgent/1.0',

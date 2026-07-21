@@ -32,6 +32,9 @@ class MockWorkspaceShellRailComponent {
     readonly secondaryContextLinks = input<unknown[]>([]);
     readonly selectedSection = input<string | null>(null);
     readonly railProviderClass = input('');
+    readonly isElectron = input(false);
+    readonly isDownloadsView = input(false);
+    readonly hasActiveDownloads = input(false);
     readonly isSettingsRoute = input(false);
 }
 

@@ -205,6 +205,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
         ],
         recordingFolder: '',
         coverSize: 'medium' as CoverSize,
+        tmdbApiKey: '',
         ...(this.isDesktop ? { preferUploadedEpgOverXtream: false } : {}),
     });
 

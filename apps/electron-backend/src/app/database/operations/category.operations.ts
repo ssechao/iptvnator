@@ -2,10 +2,26 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
 import type { AppDatabase } from '../database.types';
 
+type DbCategoryType = 'live' | 'movies' | 'series';
+
 type XtreamCategoryInput = {
     category_name: string;
     category_id: string | number;
 };
+
+type CategoryVisibilityPreference = {
+    version: 1;
+    hiddenXtreamIds: number[];
+};
+
+const CATEGORY_VISIBILITY_STATE_PREFIX = 'xtream-category-visibility';
+
+export function getCategoryVisibilityStateKey(
+    playlistId: string,
+    type: DbCategoryType
+): string {
+    return `${CATEGORY_VISIBILITY_STATE_PREFIX}:${playlistId}:${type}`;
+}
 
 function normalizeXtreamCategoryId(
     rawCategoryId: string | number
@@ -15,10 +31,137 @@ function normalizeXtreamCategoryId(
     return Number.isNaN(xtreamId) ? null : xtreamId;
 }
 
+function normalizeHiddenCategoryXtreamIds(values: unknown[]): number[] {
+    return Array.from(
+        new Set(
+            values
+                .map((value) => {
+                    if (typeof value === 'number') {
+                        return value;
+                    }
+
+                    if (typeof value === 'string') {
+                        return Number.parseInt(value, 10);
+                    }
+
+                    return Number.NaN;
+                })
+                .filter((value) => Number.isInteger(value) && value >= 0)
+        )
+    ).sort((a, b) => a - b);
+}
+
+function parseStoredHiddenCategoryXtreamIds(value: string | null): number[] {
+    if (!value) {
+        return [];
+    }
+
+    try {
+        const parsed = JSON.parse(value) as unknown;
+
+        if (Array.isArray(parsed)) {
+            return normalizeHiddenCategoryXtreamIds(parsed);
+        }
+
+        if (
+            parsed &&
+            typeof parsed === 'object' &&
+            Array.isArray(
+                (parsed as Partial<CategoryVisibilityPreference>)
+                    .hiddenXtreamIds
+            )
+        ) {
+            return normalizeHiddenCategoryXtreamIds(
+                (parsed as Partial<CategoryVisibilityPreference>)
+                    .hiddenXtreamIds ?? []
+            );
+        }
+    } catch {
+        return [];
+    }
+
+    return [];
+}
+
+export async function getStoredHiddenCategoryXtreamIds(
+    db: AppDatabase,
+    playlistId: string,
+    type: DbCategoryType
+): Promise<number[]> {
+    const rows = await db
+        .select({ value: schema.appState.value })
+        .from(schema.appState)
+        .where(
+            eq(
+                schema.appState.key,
+                getCategoryVisibilityStateKey(playlistId, type)
+            )
+        )
+        .limit(1);
+
+    return parseStoredHiddenCategoryXtreamIds(rows[0]?.value ?? null);
+}
+
+export async function storeHiddenCategoryXtreamIds(
+    db: AppDatabase,
+    playlistId: string,
+    type: DbCategoryType,
+    hiddenXtreamIds: unknown[]
+): Promise<void> {
+    const normalizedHiddenXtreamIds =
+        normalizeHiddenCategoryXtreamIds(hiddenXtreamIds);
+    const updatedAt = new Date().toISOString();
+
+    await db
+        .insert(schema.appState)
+        .values({
+            key: getCategoryVisibilityStateKey(playlistId, type),
+            value: JSON.stringify({
+                version: 1,
+                hiddenXtreamIds: normalizedHiddenXtreamIds,
+            } satisfies CategoryVisibilityPreference),
+            updatedAt,
+        })
+        .onConflictDoUpdate({
+            target: schema.appState.key,
+            set: {
+                value: JSON.stringify({
+                    version: 1,
+                    hiddenXtreamIds: normalizedHiddenXtreamIds,
+                } satisfies CategoryVisibilityPreference),
+                updatedAt,
+            },
+        });
+}
+
+export async function persistCurrentCategoryVisibilityPreference(
+    db: AppDatabase,
+    playlistId: string,
+    type: DbCategoryType
+): Promise<void> {
+    const hiddenCategories = await db
+        .select({ xtreamId: schema.categories.xtreamId })
+        .from(schema.categories)
+        .where(
+            and(
+                eq(schema.categories.playlistId, playlistId),
+                eq(schema.categories.type, type),
+                eq(schema.categories.hidden, true)
+            )
+        );
+
+    await storeHiddenCategoryXtreamIds(
+        db,
+        playlistId,
+        type,
+        hiddenCategories.map((category) => category.xtreamId)
+    );
+}
+
 export async function hasCategories(
     db: AppDatabase,
     playlistId: string,
-    type: 'live' | 'movies' | 'series'
+    type: DbCategoryType
 ): Promise<boolean> {
     const result = await db
         .select({ count: sql<number>`count(*)` })
@@ -36,7 +179,7 @@ export async function hasCategories(
 export async function getCategories(
     db: AppDatabase,
     playlistId: string,
-    type: 'live' | 'movies' | 'series'
+    type: DbCategoryType
 ) {
     // Xtream categories are inserted once in provider order and existing
     // xtream IDs are preserved, so row id order represents server order.
@@ -59,7 +202,7 @@ export async function saveCategories(
     db: AppDatabase,
     playlistId: string,
     categories: XtreamCategoryInput[],
-    type: 'live' | 'movies' | 'series',
+    type: DbCategoryType,
     hiddenCategoryXtreamIds?: number[]
 ): Promise<{ success: boolean }> {
     if (!categories || categories.length === 0) {
@@ -80,7 +223,12 @@ export async function saveCategories(
         return { success: true };
     }
 
-    const hiddenSet = new Set(hiddenCategoryXtreamIds || []);
+    const persistedHiddenCategoryXtreamIds =
+        await getStoredHiddenCategoryXtreamIds(db, playlistId, type);
+    const hiddenSet = new Set([
+        ...persistedHiddenCategoryXtreamIds,
+        ...(hiddenCategoryXtreamIds || []),
+    ]);
     const values = categories.flatMap((category) => {
         const xtreamId = normalizeXtreamCategoryId(category.category_id);
 
@@ -114,13 +262,25 @@ export async function saveCategories(
             ],
         });
 
+    if (
+        hiddenCategoryXtreamIds !== undefined ||
+        persistedHiddenCategoryXtreamIds.length > 0
+    ) {
+        await storeHiddenCategoryXtreamIds(
+            db,
+            playlistId,
+            type,
+            Array.from(hiddenSet)
+        );
+    }
+
     return { success: true };
 }
 
 export async function getAllCategories(
     db: AppDatabase,
     playlistId: string,
-    type: 'live' | 'movies' | 'series'
+    type: DbCategoryType
 ) {
     return db
         .select()
@@ -143,10 +303,38 @@ export async function updateCategoryVisibility(
         return { success: true };
     }
 
+    const affectedCategories = await db
+        .select({
+            playlistId: schema.categories.playlistId,
+            type: schema.categories.type,
+        })
+        .from(schema.categories)
+        .where(inArray(schema.categories.id, categoryIds));
+
     await db
         .update(schema.categories)
         .set({ hidden })
         .where(inArray(schema.categories.id, categoryIds));
+
+    const affectedScopes = Array.from(
+        new Map(
+            affectedCategories.map((category) => [
+                `${category.playlistId}:${category.type}`,
+                {
+                    playlistId: category.playlistId,
+                    type: category.type,
+                },
+            ])
+        ).values()
+    );
+
+    for (const scope of affectedScopes) {
+        await persistCurrentCategoryVisibilityPreference(
+            db,
+            scope.playlistId,
+            scope.type
+        );
+    }
 
     return { success: true };
 }

@@ -10,7 +10,8 @@ import {
     Output,
     SimpleChanges,
 } from '@angular/core';
-import Artplayer from 'artplayer';
+import type ArtplayerDefault from 'artplayer';
+import * as ArtplayerModule from 'artplayer';
 import Hls, { type ErrorData, type ManifestParsedData } from 'hls.js';
 import mpegts from 'mpegts.js';
 import { Channel } from '@iptvnator/shared/interfaces';
@@ -29,6 +30,14 @@ type AudioTrackSelector = {
     html: string | HTMLElement;
     default?: boolean;
 };
+
+type ArtplayerConstructor = typeof ArtplayerDefault;
+type ArtplayerInstance = InstanceType<ArtplayerConstructor>;
+
+const Artplayer = (
+    (ArtplayerModule as unknown as { default?: ArtplayerConstructor })
+        .default ?? (ArtplayerModule as unknown as ArtplayerConstructor)
+) as ArtplayerConstructor;
 
 Artplayer.AUTO_PLAYBACK_TIMEOUT = 10000;
 
@@ -61,7 +70,7 @@ export class ArtPlayerComponent implements OnInit, OnDestroy, OnChanges {
     }>();
     @Output() playbackIssue = new EventEmitter<PlaybackDiagnostic | null>();
 
-    private player!: Artplayer;
+    private player!: ArtplayerInstance;
     private hls: Hls | null = null;
     private mpegtsPlayer: mpegts.Player | null = null;
 
@@ -310,7 +319,10 @@ export class ArtPlayerComponent implements OnInit, OnDestroy, OnChanges {
                     html: track.name || track.lang || `Track ${index + 1}`,
                     default: index === hls.audioTrack,
                 })),
-                onSelect: function (this: Artplayer, item: AudioTrackSelector) {
+                onSelect: function (
+                    this: ArtplayerInstance,
+                    item: AudioTrackSelector
+                ) {
                     const selectedLabel =
                         typeof item.html === 'string'
                             ? item.html

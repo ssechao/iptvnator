@@ -64,6 +64,15 @@
                     [matTooltip]="'Portal status: ' + portalStatus"
                     [attr.aria-label]="'Portal status: ' + portalStatus"
                 ></span>
+                @if (item.autoRefresh) {
+                    <mat-icon
+                        class="auto-refresh-indicator"
+                        [matTooltip]="
+                            'HOME.PLAYLISTS.AUTO_REFRESH_ENABLED' | translate
+                        "
+                        >autorenew</mat-icon
+                    >
+                }
             </div>
         }
         @if (item.macAddress) {
@@ -83,7 +92,10 @@
                 {{ 'HOME.PLAYLISTS.CHANNELS' | translate }}: {{ item.count }}
                 @if (item.importDate.length > 3) {
                     | {{ 'HOME.PLAYLISTS.ADDED' | translate }}:
-                    {{ item.importDate | date: undefined : undefined : currentLocale() }}
+                    {{
+                        item.importDate
+                            | date: undefined : undefined : currentLocale()
+                    }}
                 }
                 @if (item.updateDate) {
                     | {{ 'HOME.PLAYLISTS.UPDATED' | translate }}:
@@ -113,7 +125,10 @@
                 }
                 @if (item.importDate.length > 3) {
                     | {{ 'HOME.PLAYLISTS.ADDED' | translate }}:
-                    {{ item.importDate | date: undefined : undefined : currentLocale() }}
+                    {{
+                        item.importDate
+                            | date: undefined : undefined : currentLocale()
+                    }}
                 }
                 @if (item.updateDate) {
                     | {{ 'HOME.PLAYLISTS.UPDATED' | translate }}:

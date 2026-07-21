@@ -1,5 +1,10 @@
 import { firstValueFrom, of } from 'rxjs';
-import { DbStores, Playlist, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    DbStores,
+    Playlist,
+    PlaylistMeta,
+    PlaylistUpdateState,
+} from '@iptvnator/shared/interfaces';
 import { PlaylistsService, resolvePlaylistParser } from './playlists.service';
 
 const SQLITE_PLAYLIST_MIGRATION_FLAG = 'm3u-playlists-indexeddb-to-sqlite-v1';
@@ -17,7 +22,9 @@ describe('PlaylistsService', () => {
     });
 
     function createService(overrides: Record<string, unknown> = {}) {
-        const service = Object.create(PlaylistsService.prototype) as PlaylistsService;
+        const service = Object.create(
+            PlaylistsService.prototype
+        ) as PlaylistsService;
 
         Object.assign(service as object, {
             dbService: {
@@ -88,7 +95,9 @@ describe('PlaylistsService', () => {
 
         const service = createService();
 
-        await expect(firstValueFrom(service.getAllPlaylists())).resolves.toEqual([
+        await expect(
+            firstValueFrom(service.getAllPlaylists())
+        ).resolves.toEqual([
             expect.objectContaining({
                 _id: 'stalker-1',
                 isFullStalkerPortal: true,
@@ -101,7 +110,9 @@ describe('PlaylistsService', () => {
                 isFullStalkerPortal: true,
             }),
         ]);
-        expect(appState.get(STALKER_PLAYLIST_METADATA_MIGRATION_FLAG)).toBe('1');
+        expect(appState.get(STALKER_PLAYLIST_METADATA_MIGRATION_FLAG)).toBe(
+            '1'
+        );
     });
 
     it('does not rerun the SQLite Stalker metadata migration after the flag is set', async () => {
@@ -180,7 +191,7 @@ describe('PlaylistsService', () => {
         ).toBe('1');
     });
 
-    it('persists hiddenGroupTitles in playlist meta updates', async () => {
+    it('persists hiddenGroupTitles and auto-refresh interval in playlist meta updates', async () => {
         const existingPlaylist: Playlist = {
             _id: 'playlist-1',
             title: 'Playlist One',
@@ -188,6 +199,7 @@ describe('PlaylistsService', () => {
             importDate: new Date('2026-04-11T00:00:00.000Z').toISOString(),
             lastUsage: new Date('2026-04-11T00:00:00.000Z').toISOString(),
             autoRefresh: false,
+            autoRefreshIntervalHours: 24,
             hiddenGroupTitles: ['News'],
         } as Playlist;
         const dbService = {
@@ -204,6 +216,8 @@ describe('PlaylistsService', () => {
         await firstValueFrom(
             service.updatePlaylistMeta({
                 _id: 'playlist-1',
+                autoRefresh: true,
+                autoRefreshIntervalHours: 48,
                 hiddenGroupTitles: ['Movies', 'Sports'],
             } as PlaylistMeta)
         );
@@ -212,9 +226,65 @@ describe('PlaylistsService', () => {
             DbStores.Playlists,
             expect.objectContaining({
                 _id: 'playlist-1',
+                autoRefresh: true,
+                autoRefreshIntervalHours: 48,
                 hiddenGroupTitles: ['Movies', 'Sports'],
             })
         );
+    });
+
+    it('persists updateDate when an M3U playlist is refreshed in SQLite', async () => {
+        const updateDate = Date.parse('2026-06-10T13:00:00.000Z');
+        const dateNowSpy = jest.spyOn(Date, 'now').mockReturnValue(updateDate);
+        const existingPlaylist: Playlist = {
+            _id: 'playlist-1',
+            title: 'Playlist One',
+            count: 1,
+            importDate: new Date('2026-06-09T00:00:00.000Z').toISOString(),
+            lastUsage: new Date('2026-06-09T00:00:00.000Z').toISOString(),
+            autoRefresh: true,
+            autoRefreshIntervalHours: 12,
+            favorites: ['favorite-channel'],
+            playlist: {
+                header: { raw: '#EXTM3U' },
+                items: [{ name: 'Old Channel' }],
+            },
+        } as Playlist;
+        const refreshedPlaylist: Playlist = {
+            ...existingPlaylist,
+            playlist: {
+                header: { raw: '#EXTM3U' },
+                items: [{ name: 'New Channel' }, { name: 'Another Channel' }],
+            },
+        } as Playlist;
+        const electron = {
+            dbGetAppPlaylist: jest.fn(async () => existingPlaylist),
+            dbGetAppPlaylists: jest.fn(async () => []),
+            dbGetAppState: jest.fn(async () => '1'),
+            dbSetAppState: jest.fn(),
+            dbUpsertAppPlaylist: jest.fn(),
+            dbUpsertAppPlaylists: jest.fn(),
+        };
+        testWindow.electron = electron;
+
+        const service = createService();
+
+        await firstValueFrom(
+            service.updatePlaylist('playlist-1', refreshedPlaylist)
+        );
+
+        expect(electron.dbUpsertAppPlaylist).toHaveBeenCalledWith(
+            expect.objectContaining({
+                _id: 'playlist-1',
+                count: 2,
+                updateDate,
+                updateState: PlaylistUpdateState.UPDATED,
+                favorites: ['favorite-channel'],
+                autoRefresh: true,
+                autoRefreshIntervalHours: 12,
+            })
+        );
+        dateNowSpy.mockRestore();
     });
 
     it('removes multiple recently-viewed identities in a single PWA write', async () => {
@@ -420,6 +490,7 @@ describe('PlaylistsService', () => {
             importDate: new Date('2026-04-12T00:00:00.000Z').toISOString(),
             lastUsage: new Date('2026-04-12T00:00:00.000Z').toISOString(),
             autoRefresh: true,
+            autoRefreshIntervalHours: 48,
             playlist: {
                 items: [{ id: 'channel-1' }],
             },
@@ -439,6 +510,7 @@ describe('PlaylistsService', () => {
             service.updatePlaylist('playlist-3', {
                 _id: 'playlist-3',
                 autoRefresh: false,
+                autoRefreshIntervalHours: 12,
                 playlist: {
                     items: [],
                 },
@@ -450,6 +522,7 @@ describe('PlaylistsService', () => {
             expect.objectContaining({
                 _id: 'playlist-3',
                 autoRefresh: true,
+                autoRefreshIntervalHours: 48,
                 count: 0,
             })
         );

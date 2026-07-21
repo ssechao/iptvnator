@@ -33,6 +33,7 @@ export const playlists = sqliteTable('playlists', {
     referrer: text('referrer'),
     filePath: text('filePath'),
     autoRefresh: integer('autoRefresh', { mode: 'boolean' }).default(false),
+    autoRefreshIntervalHours: integer('auto_refresh_interval_hours'),
     macAddress: text('macAddress'),
     url: text('url'),
     portalUrl: text('portal_url'),
@@ -256,9 +257,10 @@ export const playbackPositions = sqliteTable(
             table.seriesXtreamId
         ),
         updatedIdx: index('playback_positions_updated_idx').on(table.updatedAt),
-        playlistUpdatedIdx: index(
-            'playback_positions_playlist_updated_idx'
-        ).on(table.playlistId, sql`${table.updatedAt} DESC`),
+        playlistUpdatedIdx: index('playback_positions_playlist_updated_idx').on(
+            table.playlistId,
+            sql`${table.updatedAt} DESC`
+        ),
     })
 );
 

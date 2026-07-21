@@ -12,6 +12,7 @@ describe('playlist.operations', () => {
             lastUpdated: '2026-04-03T11:15:00.000Z',
             type: 'xtream',
             autoRefresh: false,
+            autoRefreshIntervalHours: 48,
             count: 0,
             importDate: '2026-04-03T08:00:00.000Z',
             payload: JSON.stringify({
@@ -30,6 +31,7 @@ describe('playlist.operations', () => {
             expect.objectContaining({
                 _id: 'playlist-1',
                 updateDate: new Date('2026-04-03T11:15:00.000Z').getTime(),
+                autoRefreshIntervalHours: 48,
             })
         );
     });

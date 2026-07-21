@@ -2,10 +2,12 @@ import { and, eq, inArray } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
 import type {
     XtreamBackupFavoriteItem,
+    XtreamBackupCategoryType,
     XtreamBackupHiddenCategory,
     XtreamBackupRecentlyViewedItem,
 } from '@iptvnator/shared/interfaces';
 import type { AppDatabase } from '../database.types';
+import { storeHiddenCategoryXtreamIds } from './category.operations';
 import {
     checkpointOperation,
     chunkValues,
@@ -19,6 +21,11 @@ type ContentIdentity = {
     id: number;
     xtreamId: number;
     contentType: XtreamBackupFavoriteItem['contentType'];
+};
+
+type CategoryVisibilityScope = {
+    type: XtreamBackupCategoryType;
+    hiddenXtreamIds: number[];
 };
 
 function toContentIdentityKey(
@@ -55,6 +62,32 @@ export async function deleteXtreamContent(
             xtreamId: category.xtreamId,
             categoryType: category.type,
         }));
+    const visibilityScopes = new Map<
+        XtreamBackupCategoryType,
+        CategoryVisibilityScope
+    >();
+
+    for (const category of categories) {
+        const scope = visibilityScopes.get(category.type) ?? {
+            type: category.type,
+            hiddenXtreamIds: [],
+        };
+
+        if (category.hidden) {
+            scope.hiddenXtreamIds.push(category.xtreamId);
+        }
+
+        visibilityScopes.set(category.type, scope);
+    }
+
+    for (const scope of visibilityScopes.values()) {
+        await storeHiddenCategoryXtreamIds(
+            db,
+            playlistId,
+            scope.type,
+            scope.hiddenXtreamIds
+        );
+    }
 
     let favorites: XtreamBackupFavoriteItem[] = [];
     let recentlyViewed: XtreamBackupRecentlyViewedItem[] = [];
@@ -124,8 +157,7 @@ export async function deleteXtreamContent(
         )) {
             await checkpointOperation(control);
             await db.transaction((tx) => {
-                tx
-                    .delete(schema.content)
+                tx.delete(schema.content)
                     .where(inArray(schema.content.id, chunk))
                     .run();
             });
@@ -145,8 +177,7 @@ export async function deleteXtreamContent(
     for (const chunk of chunkValues(categoryIds, DEFAULT_BATCH_SIZE)) {
         await checkpointOperation(control);
         await db.transaction((tx) => {
-            tx
-                .delete(schema.categories)
+            tx.delete(schema.categories)
                 .where(inArray(schema.categories.id, chunk))
                 .run();
         });

@@ -209,6 +209,29 @@ channel-list-container/
   hidden by separating "playlist has no groups" from "no visible/search-matching
   groups" empty states.
 
+### Automatic Refresh
+
+- `autoRefresh` is a per-playlist preference. `autoRefreshIntervalHours`
+  controls the cadence and currently supports `12`, `24`, `48`, and `168`
+  hours.
+- The playlist info dialog exposes the interval next to the auto-update toggle
+  for refreshable desktop playlists: M3U URL/file playlists and Xtream
+  playlists.
+- `AppComponent` checks for due playlists after `loadPlaylistsSuccess`, so a
+  restarted app catches missed refresh windows, and then checks again every
+  hour. A playlist is due when the persisted `updateDate` (or `importDate` when
+  never refreshed) is older than the configured interval.
+- M3U refreshes use the playlist refresh worker. Xtream refreshes reuse the
+  Xtream refresh action without the manual confirmation dialog, preserving the
+  existing restore flow for favorites, recent items, hidden categories, and
+  playback positions.
+- Successful refreshes update the persisted last-refresh timestamp:
+  `PlaylistsService.updatePlaylist` writes `updateDate` for M3U playlists, and
+  Xtream refresh writes `lastUpdated`/`updateDate` through the Electron database
+  playlist metadata update.
+- Refresh/update flows preserve both `autoRefresh` and
+  `autoRefreshIntervalHours` when refreshed playlist payloads omit them.
+
 ### Channel Sorting
 
 - `AllChannelsViewComponent` owns sorting for the all-channels list and

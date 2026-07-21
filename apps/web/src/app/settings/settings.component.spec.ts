@@ -1,5 +1,11 @@
 import { HttpClientTestingModule } from '@angular/common/http/testing';
-import { ComponentFixture, TestBed, waitForAsync } from '@angular/core/testing';
+import {
+    ComponentFixture,
+    fakeAsync,
+    TestBed,
+    tick,
+    waitForAsync,
+} from '@angular/core/testing';
 import {
     FormsModule,
     ReactiveFormsModule,
@@ -86,6 +92,7 @@ const DEFAULT_SETTINGS = {
     epgUrl: [],
     recordingFolder: '',
     coverSize: 'medium',
+    tmdbApiKey: '',
     preferUploadedEpgOverXtream: false,
 };
 
@@ -333,76 +340,70 @@ describe('SettingsComponent', () => {
         ).not.toBeNull();
     });
 
-    it('should scroll the selected navigation target within the workspace viewport', async () => {
+    it('should scroll the selected navigation target within the workspace viewport', fakeAsync(() => {
         fixture.destroy();
-        jest.useFakeTimers();
+        const scrollFixture = TestBed.createComponent(SettingsComponent);
+        const scrollComponent = scrollFixture.componentInstance;
+        const settingsContext = TestBed.inject(SettingsContextService);
+        const originalGetElementById =
+            document.getElementById.bind(document);
+        const scrollTo = jest.fn();
+        const scrollRoot = {
+            scrollTop: 96,
+            clientHeight: 885,
+            scrollHeight: 2469,
+            getBoundingClientRect: () =>
+                ({
+                    top: 56,
+                }) as DOMRect,
+            scrollTo,
+        } as unknown as HTMLElement;
 
-        try {
-            const scrollFixture = TestBed.createComponent(SettingsComponent);
-            const scrollComponent = scrollFixture.componentInstance;
-            const settingsContext = TestBed.inject(SettingsContextService);
-            const originalGetElementById =
-                document.getElementById.bind(document);
-            const scrollTo = jest.fn();
-            const scrollRoot = {
-                scrollTop: 96,
-                clientHeight: 885,
-                scrollHeight: 2469,
-                getBoundingClientRect: () =>
-                    ({
-                        top: 56,
-                    }) as DOMRect,
-                scrollTo,
-            } as unknown as HTMLElement;
+        scrollComponent.checkAppVersion = jest.fn();
+        scrollComponent.fetchLocalIpAddresses = jest
+            .fn()
+            .mockResolvedValue(undefined);
+        scrollFixture.detectChanges();
+        tick(16);
+        const scrollDirective = scrollFixture.debugElement
+            .query(By.directive(SettingsSectionScrollDirective))
+            .injector.get(SettingsSectionScrollDirective);
+        jest.spyOn(
+            scrollDirective as unknown as SettingsSectionScrollDirectiveTestApi,
+            'getScrollRoot'
+        ).mockReturnValue(scrollRoot);
 
-            scrollComponent.checkAppVersion = jest.fn();
-            scrollComponent.fetchLocalIpAddresses = jest
-                .fn()
-                .mockResolvedValue(undefined);
-            scrollFixture.detectChanges();
-            const scrollDirective = scrollFixture.debugElement
-                .query(By.directive(SettingsSectionScrollDirective))
-                .injector.get(SettingsSectionScrollDirective);
-            jest.spyOn(
-                scrollDirective as unknown as SettingsSectionScrollDirectiveTestApi,
-                'getScrollRoot'
-            ).mockReturnValue(scrollRoot);
+        const getElementByIdSpy = jest
+            .spyOn(document, 'getElementById')
+            .mockImplementation((id: string) => {
+                if (id === 'about') {
+                    return {
+                        getBoundingClientRect: () =>
+                            ({
+                                top: 2050,
+                                height: 159,
+                            }) as DOMRect,
+                    } as HTMLElement;
+                }
 
-            const getElementByIdSpy = jest
-                .spyOn(document, 'getElementById')
-                .mockImplementation((id: string) => {
-                    if (id === 'about') {
-                        return {
-                            getBoundingClientRect: () =>
-                                ({
-                                    top: 2050,
-                                    height: 159,
-                                }) as DOMRect,
-                        } as HTMLElement;
-                    }
-
-                    return originalGetElementById(id);
-                });
-
-            await scrollFixture.whenStable();
-            scrollFixture.detectChanges();
-            settingsContext.navigateToSection('about');
-            scrollFixture.detectChanges();
-
-            expect(getElementByIdSpy).toHaveBeenCalledWith('about');
-            expect(scrollTo).toHaveBeenCalledWith({
-                behavior: 'smooth',
-                top: 1488,
+                return originalGetElementById(id);
             });
-            expect(settingsContext.pendingScrollTarget()).toBe('about');
 
-            jest.advanceTimersByTime(600);
+        scrollFixture.detectChanges();
+        settingsContext.navigateToSection('about');
+        scrollFixture.detectChanges();
 
-            expect(settingsContext.pendingScrollTarget()).toBeNull();
-        } finally {
-            jest.useRealTimers();
-        }
-    });
+        expect(getElementByIdSpy).toHaveBeenCalledWith('about');
+        expect(scrollTo).toHaveBeenCalledWith({
+            behavior: 'smooth',
+            top: 1488,
+        });
+        expect(settingsContext.pendingScrollTarget()).toBe('about');
+
+        tick(600);
+
+        expect(settingsContext.pendingScrollTarget()).toBeNull();
+    }));
 
     describe('Get and set settings on component init', () => {
         const settings = {
@@ -494,7 +495,8 @@ describe('SettingsComponent', () => {
                     .some((player) => player.id === VideoPlayer.EmbeddedMpv)
             ).toBe(false);
 
-            resolveSupport!({
+            expect(resolveSupport).toBeDefined();
+            resolveSupport?.({
                 supported: true,
                 platform: 'darwin',
             });

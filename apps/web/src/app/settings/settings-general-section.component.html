@@ -171,4 +171,25 @@
             <mat-checkbox formControlName="showCaptions"></mat-checkbox>
         </div>
     </div>
+
+    <div class="setting-item">
+        <div class="setting-item__meta">
+            <h4>{{ 'SETTINGS.TMDB_API_KEY' | translate }}</h4>
+            <p>
+                {{ 'SETTINGS.TMDB_API_KEY_DESCRIPTION' | translate }}
+            </p>
+        </div>
+        <div class="setting-item__control">
+            <mat-form-field appearance="outline" subscriptSizing="dynamic">
+                <mat-label>{{ 'SETTINGS.TMDB_API_KEY' | translate }}</mat-label>
+                <input
+                    matInput
+                    type="password"
+                    autocomplete="off"
+                    formControlName="tmdbApiKey"
+                    data-test-id="tmdb-api-key"
+                />
+            </mat-form-field>
+        </div>
+    </div>
 </section>

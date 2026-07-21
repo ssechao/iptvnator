@@ -8,13 +8,14 @@ import { Channel, Playlist, PlaylistMeta } from '@iptvnator/shared/interfaces';
 const reducer = createReducer(initialState, ...playlistReducers);
 
 describe('playlistReducers', () => {
-    it('persists updateDate and hiddenGroupTitles when playlist meta is updated', () => {
+    it('persists updateDate, hiddenGroupTitles, and auto-refresh interval when playlist meta is updated', () => {
         const existingPlaylist: PlaylistMeta = {
             _id: 'playlist-1',
             title: 'Xtream Playlist',
             count: 0,
             importDate: '2026-03-28T00:00:00.000Z',
             autoRefresh: false,
+            autoRefreshIntervalHours: 24,
             serverUrl: 'http://localhost:8080',
             username: 'demo',
             password: 'secret',
@@ -33,6 +34,7 @@ describe('playlistReducers', () => {
                 playlist: {
                     ...existingPlaylist,
                     hiddenGroupTitles: ['Movies', 'News'],
+                    autoRefreshIntervalHours: 48,
                     updateDate: 1712145600000,
                 },
             })
@@ -44,6 +46,9 @@ describe('playlistReducers', () => {
         expect(
             nextState.playlists.entities['playlist-1']?.hiddenGroupTitles
         ).toEqual(['Movies', 'News']);
+        expect(
+            nextState.playlists.entities['playlist-1']?.autoRefreshIntervalHours
+        ).toBe(48);
     });
 
     it('updates the active playlist channel cache and clears loading on playlist refresh', () => {
@@ -135,6 +140,7 @@ describe('playlistReducers', () => {
         const existingPlaylist: PlaylistMeta = {
             _id: 'playlist-1',
             autoRefresh: true,
+            autoRefreshIntervalHours: 48,
             count: 1,
             importDate: '2026-03-28T00:00:00.000Z',
             title: 'Playlist One',
@@ -152,6 +158,7 @@ describe('playlistReducers', () => {
             PlaylistActions.updatePlaylist({
                 playlist: {
                     autoRefresh: false,
+                    autoRefreshIntervalHours: 12,
                     playlist: {
                         items: [],
                     },
@@ -160,9 +167,12 @@ describe('playlistReducers', () => {
             })
         );
 
+        expect(nextState.playlists.entities['playlist-1']?.autoRefresh).toBe(
+            true
+        );
         expect(
-            nextState.playlists.entities['playlist-1']?.autoRefresh
-        ).toBe(true);
+            nextState.playlists.entities['playlist-1']?.autoRefreshIntervalHours
+        ).toBe(48);
     });
 
     it('keeps autoRefresh disabled on playlist refresh when the existing playlist has it disabled', () => {
@@ -194,8 +204,8 @@ describe('playlistReducers', () => {
             })
         );
 
-        expect(
-            nextState.playlists.entities['playlist-1']?.autoRefresh
-        ).toBe(false);
+        expect(nextState.playlists.entities['playlist-1']?.autoRefresh).toBe(
+            false
+        );
     });
 });

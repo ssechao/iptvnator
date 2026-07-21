@@ -196,15 +196,19 @@ describe('DashboardDataService', () => {
                 count: 1,
                 importDate: '2026-01-01T00:00:00.000Z',
                 autoRefresh: false,
-                favorites: [],
+                favorites: ['channel-1'],
                 recentlyViewed: [],
             },
         ]);
 
         await service.reloadGlobalRecentItems();
-        expect(service.dashboardReady()).toBe(false);
+        expect(service.dashboardReady()).toBe(true);
+        expect(playlistsServiceMock.getPlaylistById).not.toHaveBeenCalled();
 
         await service.reloadGlobalFavorites();
+        expect(playlistsServiceMock.getPlaylistById).toHaveBeenCalledWith(
+            'm3u-1'
+        );
         expect(service.dashboardReady()).toBe(true);
     });
 

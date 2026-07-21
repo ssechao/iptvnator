@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS: Settings = {
     downloadFolder: '',
     recordingFolder: '',
     coverSize: 'medium',
+    tmdbApiKey: '',
     preferUploadedEpgOverXtream: false,
 };
 
@@ -149,6 +150,7 @@ export const SettingsStore = signalStore(
                 downloadFolder: store.downloadFolder!(),
                 recordingFolder: store.recordingFolder!(),
                 coverSize: store.coverSize!(),
+                tmdbApiKey: store.tmdbApiKey!(),
                 preferUploadedEpgOverXtream:
                     store.preferUploadedEpgOverXtream!(),
             };

@@ -28,6 +28,7 @@ Xtream category and search details are represented by canonical routes.
 Examples:
 
 - `/xtreams/:id/vod/:categoryId/:vodId`
+- `/xtreams/:id/vod/person/:role/:name`
 - `/xtreams/:id/series/:categoryId/:serialId`
 
 Implication:
@@ -36,6 +37,26 @@ Implication:
   route and item route.
 - This keeps the URL, browser history, and detail rendering model aligned with
   normal Xtream browsing.
+- Xtream VOD detail recommendations also navigate through canonical VOD routes
+  instead of opening inline state. When a TMDb credential is configured in
+  Settings > General, the recommendation rail first enriches the current movie
+  with TMDb cast, crew, production company, and genres, discovers related movies
+  by shared actors, directors, producers, writers, studios, and genres, then
+  maps those results back to movies that already exist in the local Xtream
+  catalog. Recommendation reason chips should include the matching person,
+  studio, or genre name when it is known, for example `Same actor: Name`.
+  Clickable cast, crew, studio, and genre names route to
+  `/workspace/xtreams/:id/vod/person/:role/:name`, which shows the movies for
+  that entity that are available in the current Xtream VOD catalog. That page
+  uses TMDb discover/search for actor, director, producer, writer, studio, and
+  genre roles, then maps the online results back to local streams; when TMDb
+  has no match, it can still fall back to local Xtream metadata for actor,
+  director, and genre.
+  If TMDb is unavailable or no catalog matches are found, the rail falls back to
+  local metadata scoring from already-loaded director, cast, and genre, with
+  latest `added` timestamp ties. Xtream category names must not populate the
+  VOD recommendation rail on their own because provider categories are often
+  broad buckets rather than real film metadata.
 
 Current code paths:
 

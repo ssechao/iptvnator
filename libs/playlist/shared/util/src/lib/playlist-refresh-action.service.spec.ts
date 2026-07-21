@@ -290,6 +290,41 @@ describe('PlaylistRefreshActionService', () => {
         dateNowSpy.mockRestore();
     });
 
+    it('refreshes Xtream playlists programmatically without opening the confirm dialog', async () => {
+        const item = createPlaylistMeta();
+        jest.spyOn(Date, 'now').mockReturnValue(1712217600000);
+
+        const result = await service.refreshNow(item, {
+            confirm: false,
+            navigateToPlaylist: false,
+            notify: false,
+        });
+
+        expect(result).toBe(true);
+        expect(dialogService.openConfirmDialog).not.toHaveBeenCalled();
+        expect(
+            databaseService.deleteXtreamPlaylistContent
+        ).toHaveBeenCalledWith(
+            item._id,
+            expect.objectContaining({
+                operationId: 'xtream-refresh-op',
+            })
+        );
+        expect(databaseService.updateXtreamPlaylistDetails).toHaveBeenCalledWith(
+            {
+                id: item._id,
+                updateDate: 1712217600000,
+            }
+        );
+        expect(router.navigate).not.toHaveBeenCalled();
+        expect(snackBar.open).not.toHaveBeenCalled();
+        expect(store.dispatch).toHaveBeenCalledWith(
+            PlaylistActions.updatePlaylistMeta({
+                playlist: { ...item, updateDate: 1712217600000 },
+            })
+        );
+    });
+
     it('sets refresh-preparation state immediately after Xtream refresh confirmation', async () => {
         const item = createPlaylistMeta();
         const refresh = createDeferred<{

@@ -37,6 +37,7 @@ import {
     buildExternalPlayerSpawnSpec,
     buildPlayerArgsWithCustomArguments,
     buildVlcEnqueueCommands,
+    formatExternalPlayerCommand,
     isRunningInFlatpak,
     parseExternalPlayerArguments,
     parseVlcRcPlaybackState,
@@ -239,6 +240,44 @@ describe('player.events Flatpak launch helpers', () => {
             '--force-media-title=News',
             'https://example.com/stream.m3u8',
         ]);
+    });
+
+    it('formats simple external player commands without unnecessary quotes', () => {
+        expect(
+            formatExternalPlayerCommand({
+                command: '/usr/local/bin/mpv',
+                args: ['--ytdl=no', 'https://example.com/stream.m3u8'],
+            })
+        ).toBe('/usr/local/bin/mpv --ytdl=no https://example.com/stream.m3u8');
+    });
+
+    it('quotes macOS paths and preserves full stream URLs with shell metacharacters', () => {
+        expect(
+            formatExternalPlayerCommand({
+                command: '/Applications/mpv copy.app/Contents/MacOS/mpv',
+                args: [
+                    '--force-media-title=News Channel',
+                    'https://portal.example/play/live.ts?username=bob&password=secret&stream=123',
+                ],
+            })
+        ).toBe(
+            "'/Applications/mpv copy.app/Contents/MacOS/mpv' '--force-media-title=News Channel' 'https://portal.example/play/live.ts?username=bob&password=secret&stream=123'"
+        );
+    });
+
+    it('escapes single quotes and complex headers in formatted commands', () => {
+        expect(
+            formatExternalPlayerCommand({
+                command: '/opt/mpv/bin/mpv',
+                args: [
+                    "--force-media-title=Bob's News",
+                    "--http-header-fields=User-Agent: IPTVnator's Test,Referer: https://example.com/a?b=1&c=2",
+                    'https://stream.example/live.ts',
+                ],
+            })
+        ).toBe(
+            "/opt/mpv/bin/mpv '--force-media-title=Bob'\\''s News' '--http-header-fields=User-Agent: IPTVnator'\\''s Test,Referer: https://example.com/a?b=1&c=2' https://stream.example/live.ts"
+        );
     });
 
     it('disables MPV reuse and socket bridging only in Flatpak', () => {

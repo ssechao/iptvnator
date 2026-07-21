@@ -44,6 +44,11 @@ const loadVodDetailsRouteComponent: ComponentLoader = () =>
         (c) => c.VodDetailsRouteComponent
     );
 
+const loadPersonVodResultsComponent: ComponentLoader = () =>
+    import('./person-vod-results/person-vod-results.component').then(
+        (c) => c.PersonVodResultsComponent
+    );
+
 const loadSerialDetailsComponent: ComponentLoader = () =>
     import('./serial-details/serial-details.component').then(
         (c) => c.SerialDetailsComponent
@@ -78,11 +83,18 @@ export function createXtreamRoutes(): Route[] {
                             children: [
                                 {
                                     path: '',
-                                    loadComponent: loadCategoryContentViewComponent,
+                                    loadComponent:
+                                        loadCategoryContentViewComponent,
+                                },
+                                {
+                                    path: 'person/:role/:name',
+                                    loadComponent:
+                                        loadPersonVodResultsComponent,
                                 },
                                 {
                                     path: ':categoryId',
-                                    loadComponent: loadCategoryContentViewComponent,
+                                    loadComponent:
+                                        loadCategoryContentViewComponent,
                                 },
                                 {
                                     path: ':categoryId/:vodId',
@@ -96,11 +108,13 @@ export function createXtreamRoutes(): Route[] {
                             children: [
                                 {
                                     path: '',
-                                    loadComponent: loadCategoryContentViewComponent,
+                                    loadComponent:
+                                        loadCategoryContentViewComponent,
                                 },
                                 {
                                     path: ':categoryId',
-                                    loadComponent: loadCategoryContentViewComponent,
+                                    loadComponent:
+                                        loadCategoryContentViewComponent,
                                 },
                                 {
                                     path: ':categoryId/:serialId',

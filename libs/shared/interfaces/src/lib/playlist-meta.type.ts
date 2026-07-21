@@ -16,6 +16,7 @@ export type PlaylistMeta = Pick<
     | 'updateState'
     | 'position'
     | 'autoRefresh'
+    | 'autoRefreshIntervalHours'
     | 'favorites'
     | 'serverUrl'
     | 'username'

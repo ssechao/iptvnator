@@ -56,6 +56,9 @@ Xtream backups export only connection metadata plus portable user state.
     - `serverUrl`
     - `username`
     - `password`
+- Playlist metadata:
+    - `autoRefresh`
+    - `autoRefreshIntervalHours`
 - User state:
     - hidden categories by `{ categoryType, xtreamId }`
     - favorites by `{ contentType, xtreamId, addedAt?, position? }`

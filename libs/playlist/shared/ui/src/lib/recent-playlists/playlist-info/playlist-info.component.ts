@@ -13,6 +13,7 @@ import { MatCheckboxModule } from '@angular/material/checkbox';
 import { MAT_DIALOG_DATA, MatDialogModule } from '@angular/material/dialog';
 import { MatIcon } from '@angular/material/icon';
 import { MatInputModule } from '@angular/material/input';
+import { MatSelectModule } from '@angular/material/select';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatTooltip } from '@angular/material/tooltip';
 import { Store } from '@ngrx/store';
@@ -20,7 +21,12 @@ import { TranslatePipe, TranslateService } from '@ngx-translate/core';
 import { PlaylistActions } from '@iptvnator/m3u-state';
 import { firstValueFrom } from 'rxjs';
 import { DatabaseService, PlaylistsService } from '@iptvnator/services';
-import { Playlist, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    DEFAULT_PLAYLIST_AUTO_REFRESH_INTERVAL_HOURS,
+    PLAYLIST_AUTO_REFRESH_INTERVAL_OPTIONS,
+    Playlist,
+    PlaylistMeta,
+} from '@iptvnator/shared/interfaces';
 
 @Component({
     selector: 'app-playlist-info',
@@ -66,6 +72,7 @@ import { Playlist, PlaylistMeta } from '@iptvnator/shared/interfaces';
         MatIcon,
         MatIconButton,
         MatInputModule,
+        MatSelectModule,
         MatTooltip,
         ReactiveFormsModule,
         TranslatePipe,
@@ -83,6 +90,7 @@ export class PlaylistInfoComponent {
     public playlistData = inject<Playlist & { id: string }>(MAT_DIALOG_DATA);
 
     readonly isDesktop = !!window.electron;
+    readonly autoRefreshIntervals = PLAYLIST_AUTO_REFRESH_INTERVAL_OPTIONS;
 
     /** Playlist object */
     playlist: Playlist & { id: string };
@@ -124,6 +132,10 @@ export class PlaylistInfoComponent {
                 disabled: true,
             }),
             autoRefresh: new FormControl(this.playlist.autoRefresh),
+            autoRefreshIntervalHours: new FormControl(
+                this.playlist.autoRefreshIntervalHours ??
+                    DEFAULT_PLAYLIST_AUTO_REFRESH_INTERVAL_HOURS
+            ),
             serverUrl: new FormControl(this.playlist.serverUrl),
             username: new FormControl(this.playlist.username),
             password: new FormControl(this.playlist.password),
@@ -137,6 +149,24 @@ export class PlaylistInfoComponent {
             stalkerSignature1: new FormControl(this.playlist.stalkerSignature1),
             stalkerSignature2: new FormControl(this.playlist.stalkerSignature2),
         });
+    }
+
+    get canAutoRefresh(): boolean {
+        return Boolean(
+            this.isDesktop &&
+            (this.playlist.serverUrl ||
+                (!this.playlist.macAddress &&
+                    !this.playlist.portalUrl &&
+                    (this.playlist.url || this.playlist.filePath)))
+        );
+    }
+
+    get isAutoRefreshEnabled(): boolean {
+        return Boolean(this.playlistDetails.get('autoRefresh')?.value);
+    }
+
+    getAutoRefreshIntervalLabelKey(hours: number): string {
+        return `HOME.PLAYLISTS.INFO_DIALOG.AUTO_UPDATE_INTERVAL_OPTION_${hours}`;
     }
 
     async saveChanges(playlist: PlaylistMeta): Promise<void> {
@@ -182,6 +212,8 @@ export class PlaylistInfoComponent {
             username: playlist.username,
             password: playlist.password,
             serverUrl: playlist.serverUrl,
+            autoRefresh: playlist.autoRefresh,
+            autoRefreshIntervalHours: playlist.autoRefreshIntervalHours,
         });
 
         if (!success) {

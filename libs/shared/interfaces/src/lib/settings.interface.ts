@@ -58,6 +58,8 @@ export interface Settings {
     recordingFolder?: string;
     /** Cover/poster sizing preset applied across grids and rails */
     coverSize?: CoverSize;
+    /** Optional TMDb API key or read access token used for movie metadata enrichment */
+    tmdbApiKey?: string;
     /**
      * When true, the locally-parsed XMLTV programs (loaded from `epgUrl`)
      * take precedence over the Xtream provider's EPG for live TV channels.

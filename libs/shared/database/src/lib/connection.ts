@@ -79,6 +79,7 @@ const CREATE_TABLE_STATEMENTS = [
       referrer TEXT,
       filePath TEXT,
       autoRefresh INTEGER DEFAULT 0,
+      auto_refresh_interval_hours INTEGER,
       macAddress TEXT,
       url TEXT,
       portal_url TEXT,
@@ -284,6 +285,8 @@ const COLUMN_MIGRATION_STATEMENTS = [
     `ALTER TABLE content ADD COLUMN direct_source TEXT`,
     // v1.5.0 -> v1.6.0: Cinematic backdrop persisted on first detail fetch
     `ALTER TABLE content ADD COLUMN backdrop_url TEXT`,
+    // v1.7.0 -> v1.8.0: Per-playlist automatic refresh cadence
+    `ALTER TABLE playlists ADD COLUMN auto_refresh_interval_hours INTEGER`,
 ];
 
 const INDEX_MIGRATION_STATEMENTS = [
@@ -437,7 +440,9 @@ function deduplicateXtreamCache(sqliteDb: Database.Database): void {
         const deleteRecentlyViewed = sqliteDb.prepare(
             `DELETE FROM recently_viewed WHERE content_id = ?`
         );
-        const deleteContent = sqliteDb.prepare(`DELETE FROM content WHERE id = ?`);
+        const deleteContent = sqliteDb.prepare(
+            `DELETE FROM content WHERE id = ?`
+        );
 
         for (const group of duplicateContentGroups) {
             const candidates = selectContentCandidates.all(

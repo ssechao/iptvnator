@@ -1,4 +1,4 @@
-import { Location, SlicePipe } from '@angular/common';
+import { Location, NgTemplateOutlet, SlicePipe } from '@angular/common';
 import {
     ChangeDetectionStrategy,
     Component,
@@ -11,7 +11,7 @@ import {
 } from '@angular/core';
 import { MatIcon } from '@angular/material/icon';
 import { MatSnackBar } from '@angular/material/snack-bar';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { TranslateModule, TranslateService } from '@ngx-translate/core';
 import { ContentHeroComponent } from '@iptvnator/ui/components';
 import { SafePipe } from '@iptvnator/pipes';
@@ -21,8 +21,13 @@ import {
     PORTAL_PLAYER,
     createLogger,
     getPortalPlaybackProgressPercent,
+    routeParamSignal,
 } from '@iptvnator/portal/shared/util';
-import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
+import {
+    TmdbCatalogEntityRole,
+    TmdbMovieMetadataService,
+    XtreamStore,
+} from '@iptvnator/portal/xtream/data-access';
 import {
     type PlaybackFallbackRequest,
     PortalInlinePlayerComponent,
@@ -41,6 +46,11 @@ import {
     buildXtreamVodFallbackViewModel,
     hasUsableXtreamVodMetadata,
 } from './vod-details-fallback.util';
+import {
+    SimilarVodReason,
+    SimilarVodRecommendation,
+    buildSimilarVodRecommendations,
+} from './vod-similar-recommendations.util';
 
 @Component({
     templateUrl: './vod-details-route.component.html',
@@ -52,6 +62,7 @@ import {
     imports: [
         ContentHeroComponent,
         MatIcon,
+        NgTemplateOutlet,
         SafePipe,
         SlicePipe,
         TranslateModule,
@@ -60,7 +71,9 @@ import {
 })
 export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     private readonly location = inject(Location);
+    private readonly router = inject(Router);
     private readonly settingsStore = inject(SettingsStore);
+    private readonly tmdbMetadata = inject(TmdbMovieMetadataService);
     private readonly route = inject(ActivatedRoute);
     private readonly xtreamStore = inject(XtreamStore);
     private readonly playbackPositions = inject(PORTAL_PLAYBACK_POSITIONS);
@@ -70,10 +83,22 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     private readonly snackBar = inject(MatSnackBar);
     private readonly translateService = inject(TranslateService);
     private readonly logger = createLogger('VodDetailsRoute');
-    private readonly detailsInitDone = signal(false);
+    private readonly detailsInitKey = signal<string | null>(null);
     private readonly backdropBackfillKey = signal<string | null>(null);
+    private readonly tmdbSimilarMoviesKey = signal<string | null>(null);
+    private readonly tmdbSimilarMovies = signal<SimilarVodRecommendation[]>([]);
     readonly inlinePlayback = signal<ResolvedPortalPlayback | null>(null);
     readonly vodPlaybackPosition = signal<PlaybackPositionData | null>(null);
+    readonly selectedVodId = routeParamSignal<number>(
+        this.route,
+        'vodId',
+        (value) => Number(value)
+    );
+    readonly selectedCategoryId = routeParamSignal<string>(
+        this.route,
+        'categoryId',
+        (value) => value ?? ''
+    );
 
     readonly theme = this.settingsStore.theme;
     readonly isElectron = this.downloadsService.isAvailable;
@@ -83,11 +108,8 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         () =>
             this.xtreamStore.selectedItem() as unknown as XtreamVodDetails | null
     );
-    readonly selectedVodId = computed(() =>
-        Number(this.route.snapshot.params.vodId)
-    );
     readonly selectedCategory = computed<Partial<XtreamCategory> | null>(() => {
-        const categoryId = this.route.snapshot.params.categoryId;
+        const categoryId = this.selectedCategoryId();
         if (!categoryId) {
             return null;
         }
@@ -98,21 +120,28 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
                 .find(
                     (category) =>
                         String(
-                            (category as XtreamCategory & { id?: string | number })
-                                .category_id ??
-                                (category as XtreamCategory & { id?: string | number })
-                                    .id
+                            (
+                                category as XtreamCategory & {
+                                    id?: string | number;
+                                }
+                            ).category_id ??
+                                (
+                                    category as XtreamCategory & {
+                                        id?: string | number;
+                                    }
+                                ).id
                         ) === String(categoryId)
                 ) ?? null
         );
     });
     readonly selectedCatalogItem = computed<
-        (Partial<XtreamVodStream> & {
-            id?: string | number;
-            poster_url?: string;
-            title?: string;
-            xtream_id?: string | number;
-        }) | null
+        | (Partial<XtreamVodStream> & {
+              id?: string | number;
+              poster_url?: string;
+              title?: string;
+              xtream_id?: string | number;
+          })
+        | null
     >(() => {
         const vodId = this.selectedVodId();
         if (!Number.isFinite(vodId) || vodId <= 0) {
@@ -120,29 +149,27 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         }
 
         return (
-            this.xtreamStore
-                .vodStreams()
-                .find(
-                    (item) =>
-                        Number(
+            this.xtreamStore.vodStreams().find(
+                (item) =>
+                    Number(
+                        (
+                            item as XtreamVodStream & {
+                                id?: string | number;
+                                xtream_id?: string | number;
+                            }
+                        ).xtream_id ??
                             (
                                 item as XtreamVodStream & {
                                     id?: string | number;
-                                    xtream_id?: string | number;
                                 }
-                            ).xtream_id ??
-                                (
-                                    item as XtreamVodStream & {
-                                        id?: string | number;
-                                    }
-                                ).stream_id ??
-                                (
-                                    item as XtreamVodStream & {
-                                        id?: string | number;
-                                    }
-                                ).id
-                        ) === vodId
-                ) ?? null
+                            ).stream_id ??
+                            (
+                                item as XtreamVodStream & {
+                                    id?: string | number;
+                                }
+                            ).id
+                    ) === vodId
+            ) ?? null
         );
     });
     readonly selectedVodInfo = computed(() => {
@@ -170,7 +197,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     private unsubscribePositionUpdates: (() => void) | null = null;
     readonly matchedExternalPlayback = computed(() => {
         const session = this.externalPlayback.activeSession();
-        const vodId = Number(this.route.snapshot.params.vodId);
+        const vodId = this.selectedVodId();
         const playlistId = this.xtreamStore.currentPlaylist()?.id;
 
         if (
@@ -239,19 +266,35 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     readonly vodPlaybackProgress = computed(() =>
         getPortalPlaybackProgressPercent(this.vodPlaybackPosition())
     );
+    readonly similarMovies = computed(() => {
+        const enrichedMovies = this.tmdbSimilarMovies();
+        if (enrichedMovies.length > 0) {
+            return enrichedMovies;
+        }
+
+        return buildSimilarVodRecommendations({
+            currentVodId: this.selectedVodId(),
+            currentDetails: this.selectedItem() as
+                | (XtreamVodDetails & Partial<XtreamVodStream>)
+                | null,
+            currentCatalogItem: this.selectedCatalogItem(),
+            currentCategoryId: this.selectedCategoryId(),
+            candidates: this.xtreamStore.vodStreams(),
+        });
+    });
 
     readonly hasPlaybackPosition = computed(() => {
         const inProgress =
             this.vodPlaybackProgress() > 0 && this.vodPlaybackProgress() < 90;
         this.logger.debug('hasPlaybackPosition check', {
-            vodId: this.route.snapshot.params.vodId,
+            vodId: this.selectedVodId(),
             inProgress,
         });
         return inProgress;
     });
 
     readonly isDownloaded = computed(() => {
-        const vodId = Number(this.route.snapshot.params.vodId);
+        const vodId = this.selectedVodId();
         const playlistId = this.xtreamStore.currentPlaylist()?.id;
         if (!playlistId) return false;
         this.downloadsService.downloads();
@@ -259,7 +302,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     });
 
     readonly isDownloading = computed(() => {
-        const vodId = Number(this.route.snapshot.params.vodId);
+        const vodId = this.selectedVodId();
         const playlistId = this.xtreamStore.currentPlaylist()?.id;
         if (!playlistId) return false;
         this.downloadsService.downloads();
@@ -269,18 +312,72 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     constructor() {
         effect(() => {
             const playlistId = this.xtreamStore.currentPlaylist()?.id;
-            const vodId = Number(this.route.snapshot.params.vodId);
-            if (!playlistId || this.detailsInitDone()) return;
-            this.initializeVodDetails(playlistId, vodId);
-            this.detailsInitDone.set(true);
+            const vodId = this.selectedVodId();
+            this.initializeVodDetailsIfNeeded(playlistId, vodId);
+        });
+
+        effect(() => {
+            const settings = this.settingsStore.getSettings();
+            const tmdbCredential = settings.tmdbApiKey?.trim() ?? '';
+            const playlistId = this.xtreamStore.currentPlaylist()?.id ?? '';
+            const vodId = this.selectedVodId();
+            const currentDetails = this.selectedItem() as
+                | (XtreamVodDetails & Partial<XtreamVodStream>)
+                | null;
+            const currentCatalogItem = this.selectedCatalogItem();
+            const candidates = this.xtreamStore.vodStreams();
+
+            if (
+                !tmdbCredential ||
+                !currentDetails ||
+                !Number.isFinite(vodId) ||
+                vodId <= 0 ||
+                candidates.length === 0
+            ) {
+                this.tmdbSimilarMoviesKey.set(null);
+                this.tmdbSimilarMovies.set([]);
+                return;
+            }
+
+            const info = getXtreamVodInfo(currentDetails);
+            const tmdbKey = [
+                playlistId,
+                vodId,
+                settings.language,
+                hashMetadataCredential(tmdbCredential),
+                info?.tmdb_id ?? '',
+                info?.name ?? currentDetails.movie_data?.name ?? '',
+                candidates.length,
+            ].join(':');
+
+            if (this.tmdbSimilarMoviesKey() === tmdbKey) {
+                return;
+            }
+
+            this.tmdbSimilarMoviesKey.set(tmdbKey);
+            this.tmdbSimilarMovies.set([]);
+            void this.loadTmdbSimilarMovies({
+                key: tmdbKey,
+                vodId,
+                currentDetails,
+                currentCatalogItem,
+                candidates,
+                language: settings.language,
+            });
         });
 
         effect(() => {
             const playlistId = this.xtreamStore.currentPlaylist()?.id;
-            const vodId = Number(this.route.snapshot.params.vodId);
-            const backdropUrl = this.selectedVodInfo()?.backdrop_path?.[0]?.trim();
+            const vodId = this.selectedVodId();
+            const backdropUrl =
+                this.selectedVodInfo()?.backdrop_path?.[0]?.trim();
 
-            if (!playlistId || !Number.isFinite(vodId) || vodId <= 0 || !backdropUrl) {
+            if (
+                !playlistId ||
+                !Number.isFinite(vodId) ||
+                vodId <= 0 ||
+                !backdropUrl
+            ) {
                 return;
             }
 
@@ -302,8 +399,9 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
             this.unsubscribePositionUpdates =
                 window.electron.onPlaybackPositionUpdate(
                     (data: PlaybackPositionData) => {
-                        const playlistId = this.xtreamStore.currentPlaylist()?.id;
-                        const vodId = Number(this.route.snapshot.params.vodId);
+                        const playlistId =
+                            this.xtreamStore.currentPlaylist()?.id;
+                        const vodId = this.selectedVodId();
 
                         if (
                             data.contentType !== 'vod' ||
@@ -325,8 +423,10 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
             this.logger.warn('Deferring VOD details init: playlist not ready');
             return;
         }
-        this.initializeVodDetails(currentPlaylist.id, Number(this.route.snapshot.params.vodId));
-        this.detailsInitDone.set(true);
+        this.initializeVodDetailsIfNeeded(
+            currentPlaylist.id,
+            this.selectedVodId()
+        );
     }
 
     ngOnDestroy(): void {
@@ -339,13 +439,14 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         const info = getXtreamVodInfo(vodItem);
         this.addToRecentlyViewed();
         const streamUrl = this.xtreamStore.constructVodStreamUrl(vodItem);
-        const routeVodId = this.route.snapshot.params.vodId;
-        const id = routeVodId
-            ? Number(routeVodId)
-            : Number(
-                  vodItem.movie_data?.stream_id ||
-                      (vodItem as { stream_id?: number }).stream_id
-              );
+        const routeVodId = this.selectedVodId();
+        const id =
+            Number.isFinite(routeVodId) && routeVodId > 0
+                ? routeVodId
+                : Number(
+                      vodItem.movie_data?.stream_id ||
+                          (vodItem as { stream_id?: number }).stream_id
+                  );
 
         this.logger.debug('playVod resolved ID', { id, vodItem });
 
@@ -367,7 +468,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     resumeVod(vodItem: XtreamVodDetails): void {
         const info = getXtreamVodInfo(vodItem);
         this.addToRecentlyViewed();
-        const vodId = Number(this.route.snapshot.params.vodId);
+        const vodId = this.selectedVodId();
         const position = this.vodPlaybackPosition();
         const streamUrl = this.xtreamStore.constructVodStreamUrl(vodItem);
 
@@ -402,7 +503,9 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     }
 
     async stopExternalPlayback(): Promise<void> {
-        await this.externalPlayback.closeSession(this.matchedExternalPlayback());
+        await this.externalPlayback.closeSession(
+            this.matchedExternalPlayback()
+        );
     }
 
     formatPosition(): string {
@@ -412,14 +515,12 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         const date = new Date(0);
         date.setSeconds(position.positionSeconds);
         const timeString = date.toISOString().substr(11, 8);
-        return timeString.startsWith('00:')
-            ? timeString.substr(3)
-            : timeString;
+        return timeString.startsWith('00:') ? timeString.substr(3) : timeString;
     }
 
     toggleFavorite(): void {
         this.xtreamStore.toggleFavorite(
-            this.route.snapshot.params.vodId,
+            this.selectedVodId(),
             this.xtreamStore.currentPlaylist().id,
             'movie',
             this.selectedVodInfo()?.backdrop_path?.[0]
@@ -476,16 +577,134 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         );
     }
 
+    getSimilarReasonLabelKey(
+        reason: SimilarVodReason,
+        item?: Pick<SimilarVodRecommendation, 'reasonNames'>
+    ): string {
+        const suffix = this.getSimilarReasonName(reason, item) ? '_NAMED' : '';
+        return `XTREAM.SIMILAR_REASON_${reason.toUpperCase()}${suffix}`;
+    }
+
+    getSimilarReasonLabelParams(
+        reason: SimilarVodReason,
+        item: Pick<SimilarVodRecommendation, 'reasonNames'>
+    ): { name: string } {
+        return {
+            name: this.getSimilarReasonName(reason, item) ?? '',
+        };
+    }
+
+    getPersonNames(value: string | null | undefined): string[] {
+        return splitPersonNames(value);
+    }
+
+    getSimilarReasonName(
+        reason: SimilarVodReason,
+        item?: Pick<SimilarVodRecommendation, 'reasonNames'>
+    ): string | null {
+        const names = item?.reasonNames?.[reason]
+            ?.map((name) => name.trim())
+            .filter(Boolean);
+        if (!names || names.length === 0) {
+            return null;
+        }
+
+        return names.slice(0, 2).join(', ');
+    }
+
+    isCatalogEntityReason(
+        reason: SimilarVodReason
+    ): reason is TmdbCatalogEntityRole {
+        return (
+            reason === 'actor' ||
+            reason === 'director' ||
+            reason === 'producer' ||
+            reason === 'writer' ||
+            reason === 'company' ||
+            reason === 'genre'
+        );
+    }
+
+    openPersonMovies(
+        role: TmdbCatalogEntityRole,
+        name: string,
+        event?: Event
+    ): void {
+        event?.preventDefault();
+        event?.stopPropagation();
+
+        const playlistId = this.xtreamStore.currentPlaylist()?.id;
+        const trimmedName = name.trim();
+        if (!playlistId || !trimmedName) {
+            return;
+        }
+
+        void this.router.navigate([
+            '/workspace',
+            'xtreams',
+            playlistId,
+            'vod',
+            'person',
+            role,
+            trimmedName,
+        ]);
+    }
+
+    openSimilarReason(
+        event: Event,
+        reason: SimilarVodReason,
+        item: Pick<SimilarVodRecommendation, 'reasonNames'>
+    ): void {
+        const name = this.getSimilarReasonName(reason, item)
+            ?.split(',')[0]
+            ?.trim();
+        if (!name || !this.isCatalogEntityReason(reason)) {
+            return;
+        }
+
+        this.openPersonMovies(reason, name, event);
+    }
+
+    openRecommendation(item: { streamId: number; categoryId: string }): void {
+        const playlistId = this.xtreamStore.currentPlaylist()?.id;
+        const categoryId = item.categoryId || this.selectedCategoryId();
+        if (!playlistId || !categoryId) {
+            return;
+        }
+
+        void this.router.navigate([
+            '/workspace',
+            'xtreams',
+            playlistId,
+            'vod',
+            categoryId,
+            item.streamId,
+        ]);
+    }
+
+    handleRecommendationKeydown(
+        event: KeyboardEvent,
+        item: { streamId: number; categoryId: string }
+    ): void {
+        if (event.key !== 'Enter' && event.key !== ' ') {
+            return;
+        }
+
+        event.preventDefault();
+        this.openRecommendation(item);
+    }
+
     async downloadVod(vodItem: XtreamVodDetails): Promise<void> {
         const info = getXtreamVodInfo(vodItem);
         const streamUrl = this.xtreamStore.constructVodStreamUrl(vodItem);
-        const routeVodId = this.route.snapshot.params.vodId;
-        const id = routeVodId
-            ? Number(routeVodId)
-            : Number(
-                  vodItem.movie_data?.stream_id ||
-                      (vodItem as { stream_id?: number }).stream_id
-              );
+        const routeVodId = this.selectedVodId();
+        const id =
+            Number.isFinite(routeVodId) && routeVodId > 0
+                ? routeVodId
+                : Number(
+                      vodItem.movie_data?.stream_id ||
+                          (vodItem as { stream_id?: number }).stream_id
+                  );
 
         const playlist = this.xtreamStore.currentPlaylist();
 
@@ -505,7 +724,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     }
 
     async playFromLocal(): Promise<void> {
-        const vodId = Number(this.route.snapshot.params.vodId);
+        const vodId = this.selectedVodId();
         const playlistId = this.xtreamStore.currentPlaylist()?.id;
         if (!playlistId) return;
 
@@ -522,7 +741,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
 
     private addToRecentlyViewed(): void {
         this.xtreamStore.addRecentItem({
-            xtreamId: Number(this.route.snapshot.params.vodId),
+            xtreamId: this.selectedVodId(),
             contentType: 'movie',
             playlist: this.xtreamStore.currentPlaylist,
             backdropUrl: this.selectedVodInfo()?.backdrop_path?.[0],
@@ -530,13 +749,31 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     }
 
     private initializeVodDetails(playlistId: string, vodId: number): void {
-        const { categoryId } = this.route.snapshot.params;
+        const categoryId = this.selectedCategoryId();
+        this.xtreamStore.setSelectedItem(null);
         this.xtreamStore.fetchVodDetailsWithMetadata({
             vodId: String(vodId),
-            categoryId,
+            categoryId: Number(categoryId),
         });
         this.xtreamStore.checkFavoriteStatus(vodId, playlistId, 'movie');
         void this.loadVodPlaybackPosition(playlistId, vodId);
+    }
+
+    private initializeVodDetailsIfNeeded(
+        playlistId: string | undefined,
+        vodId: number
+    ): void {
+        if (!playlistId || !Number.isFinite(vodId) || vodId <= 0) {
+            return;
+        }
+
+        const initKey = `${playlistId}:${vodId}`;
+        if (this.detailsInitKey() === initKey) {
+            return;
+        }
+
+        this.initializeVodDetails(playlistId, vodId);
+        this.detailsInitKey.set(initKey);
     }
 
     private startPlayback(playback: ResolvedPortalPlayback): void {
@@ -561,4 +798,68 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
         );
         this.vodPlaybackPosition.set(position);
     }
+
+    private async loadTmdbSimilarMovies({
+        key,
+        vodId,
+        currentDetails,
+        currentCatalogItem,
+        candidates,
+        language,
+    }: {
+        key: string;
+        vodId: number;
+        currentDetails: XtreamVodDetails & Partial<XtreamVodStream>;
+        currentCatalogItem:
+            | (Partial<XtreamVodStream> & {
+                  id?: string | number;
+                  poster_url?: string;
+                  title?: string;
+                  xtream_id?: string | number;
+              })
+            | null;
+        candidates: XtreamVodStream[];
+        language: string;
+    }): Promise<void> {
+        try {
+            const recommendations =
+                await this.tmdbMetadata.getSimilarMoviesForCatalog({
+                    currentVodId: vodId,
+                    currentDetails,
+                    currentCatalogItem,
+                    candidates,
+                    language,
+                });
+
+            if (this.tmdbSimilarMoviesKey() === key) {
+                this.tmdbSimilarMovies.set(recommendations);
+            }
+        } catch (error) {
+            this.logger.warn(
+                'TMDb enrichment failed; using local VOD metadata',
+                {
+                    error,
+                }
+            );
+            if (this.tmdbSimilarMoviesKey() === key) {
+                this.tmdbSimilarMovies.set([]);
+            }
+        }
+    }
+}
+
+function hashMetadataCredential(value: string): string {
+    let hash = 0;
+    for (let index = 0; index < value.length; index++) {
+        hash = (hash * 31 + value.charCodeAt(index)) | 0;
+    }
+
+    return `${value.length}:${hash.toString(36)}`;
+}
+
+function splitPersonNames(value: string | null | undefined): string[] {
+    return (value ?? '')
+        .split(/[,;/|]+/)
+        .map((name) => name.trim())
+        .filter(Boolean);
 }

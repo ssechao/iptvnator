@@ -55,6 +55,8 @@ type XtreamDatabasePlaylistUpdate = {
     password?: string;
     serverUrl?: string;
     lastUpdated?: string;
+    autoRefresh?: boolean;
+    autoRefreshIntervalHours?: number;
 };
 
 type XtreamContentStream =
@@ -352,6 +354,8 @@ export class DatabaseService {
         password?: string;
         serverUrl?: string;
         updateDate?: number;
+        autoRefresh?: boolean;
+        autoRefreshIntervalHours?: number;
     }): Promise<boolean> {
         try {
             const updates: XtreamDatabasePlaylistUpdate = {};
@@ -359,6 +363,11 @@ export class DatabaseService {
             if (playlist.username) updates.username = playlist.username;
             if (playlist.password) updates.password = playlist.password;
             if (playlist.serverUrl) updates.serverUrl = playlist.serverUrl;
+            if (playlist.autoRefresh !== undefined)
+                updates.autoRefresh = playlist.autoRefresh;
+            if (playlist.autoRefreshIntervalHours !== undefined)
+                updates.autoRefreshIntervalHours =
+                    playlist.autoRefreshIntervalHours;
             if (playlist.updateDate !== undefined)
                 updates.lastUpdated = new Date(
                     playlist.updateDate

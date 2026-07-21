@@ -20,7 +20,12 @@ jest.mock('drizzle-orm', () => ({
 
 import * as schema from '@iptvnator/shared/database/schema';
 import type { AppDatabase } from '../database.types';
-import { getContentByXtreamId, saveContent } from './content.operations';
+import { getCategoryVisibilityStateKey } from './category.operations';
+import {
+    clearXtreamImportCache,
+    getContentByXtreamId,
+    saveContent,
+} from './content.operations';
 
 function createDbMock(result: unknown[] = []) {
     const limit = jest.fn().mockResolvedValue(result);
@@ -93,7 +98,9 @@ describe('content.operations', () => {
     });
 
     it('uses a synchronous better-sqlite transaction callback when saving content', async () => {
-        const existingContentWhere = jest.fn().mockResolvedValue([{ count: 0 }]);
+        const existingContentWhere = jest
+            .fn()
+            .mockResolvedValue([{ count: 0 }]);
         const existingContentInnerJoin = jest
             .fn()
             .mockReturnValue({ where: existingContentWhere });
@@ -165,5 +172,58 @@ describe('content.operations', () => {
             }),
         ]);
         expect(run).toHaveBeenCalled();
+    });
+
+    it('persists category visibility preferences before clearing import cache', async () => {
+        const categoryWhere = jest.fn().mockResolvedValue([
+            {
+                id: 1,
+                xtreamId: 201,
+                hidden: true,
+            },
+            {
+                id: 2,
+                xtreamId: 202,
+                hidden: false,
+            },
+        ]);
+        const categoryFrom = jest
+            .fn()
+            .mockReturnValue({ where: categoryWhere });
+        const contentWhere = jest.fn().mockResolvedValue([]);
+        const contentFrom = jest.fn().mockReturnValue({ where: contentWhere });
+        const select = jest
+            .fn()
+            .mockReturnValueOnce({ from: categoryFrom })
+            .mockReturnValueOnce({ from: contentFrom });
+        const onConflictDoUpdate = jest.fn().mockResolvedValue(undefined);
+        const appStateValues = jest
+            .fn()
+            .mockReturnValue({ onConflictDoUpdate });
+        const insert = jest.fn().mockReturnValue({ values: appStateValues });
+        const run = jest.fn();
+        const deleteWhere = jest.fn().mockReturnValue({ run });
+        const deleteFrom = jest.fn().mockReturnValue({ where: deleteWhere });
+        const transaction = jest.fn((callback: (tx: unknown) => unknown) =>
+            callback({ delete: deleteFrom })
+        );
+        const db = {
+            insert,
+            select,
+            transaction,
+        } as unknown as AppDatabase;
+
+        await clearXtreamImportCache(db, 'playlist-1', 'movie');
+
+        expect(appStateValues).toHaveBeenCalledWith(
+            expect.objectContaining({
+                key: getCategoryVisibilityStateKey('playlist-1', 'movies'),
+                value: JSON.stringify({
+                    version: 1,
+                    hiddenXtreamIds: [201],
+                }),
+            })
+        );
+        expect(deleteFrom).toHaveBeenCalledWith(schema.categories);
     });
 });

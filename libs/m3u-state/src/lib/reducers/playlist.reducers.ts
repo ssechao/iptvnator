@@ -49,11 +49,13 @@ export const playlistReducers = [
                         updateDate: Date.now(),
                         count: action.playlist.playlist.items.length,
                         userAgent: action.playlist.userAgent,
-                        favorites:
-                            currentPlaylist?.favorites ?? [],
+                        favorites: currentPlaylist?.favorites ?? [],
                         autoRefresh:
                             currentPlaylist?.autoRefresh ??
                             action.playlist.autoRefresh,
+                        autoRefreshIntervalHours:
+                            currentPlaylist?.autoRefreshIntervalHours ??
+                            action.playlist.autoRefreshIntervalHours,
                     },
                 },
                 state.playlists
@@ -110,6 +112,12 @@ export const playlistReducers = [
                         ...(p.title != null ? { title: p.title } : {}),
                         ...(p.autoRefresh != null
                             ? { autoRefresh: p.autoRefresh }
+                            : {}),
+                        ...(p.autoRefreshIntervalHours !== undefined
+                            ? {
+                                  autoRefreshIntervalHours:
+                                      p.autoRefreshIntervalHours,
+                              }
                             : {}),
                         ...(p.userAgent != null
                             ? { userAgent: p.userAgent }

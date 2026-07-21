@@ -24,6 +24,20 @@ export interface XtreamRefreshPreparationState {
     total?: number;
 }
 
+export interface PlaylistRefreshActionOptions {
+    confirm?: boolean;
+    navigateToPlaylist?: boolean;
+    notify?: boolean;
+}
+
+function isRefreshableM3uPlaylist(playlist: PlaylistMeta): boolean {
+    return Boolean(
+        !playlist.macAddress &&
+        !playlist.portalUrl &&
+        (playlist.url || playlist.filePath)
+    );
+}
+
 @Injectable({ providedIn: 'root' })
 export class PlaylistRefreshActionService {
     private readonly router = inject(Router);
@@ -50,118 +64,147 @@ export class PlaylistRefreshActionService {
             return false;
         }
 
-        return Boolean(playlist.serverUrl || playlist.url || playlist.filePath);
+        return Boolean(
+            playlist.serverUrl || isRefreshableM3uPlaylist(playlist)
+        );
     }
 
     refresh(playlist: PlaylistMeta): void {
-        if (this.isRefreshing()) {
-            return;
-        }
-
-        if (playlist.serverUrl) {
-            this.refreshXtream(playlist);
-        } else if (playlist.url || playlist.filePath) {
-            void this.refreshM3u(playlist);
-        }
-    }
-
-    private refreshXtream(item: PlaylistMeta): void {
-        this.dialogService.openConfirmDialog({
-            title: this.translate.instant(
-                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.TITLE'
-            ),
-            message: this.translate.instant(
-                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.MESSAGE'
-            ),
-            width: '400px',
-            onConfirm: async () => {
-                if (this.isRefreshing()) {
-                    return;
-                }
-
-                this.isRefreshing.set(true);
-                const operationId =
-                    this.databaseService.createOperationId('xtream-refresh');
-                this.refreshPreparationState.set({
-                    playlistId: item._id,
-                    operationId,
-                    phase: 'collecting-user-data',
-                });
-
-                try {
-                    this.snackBar.open(
-                        this.translate.instant(
-                            'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.STARTED'
-                        ),
-                        undefined,
-                        { duration: 2000 }
-                    );
-                    await this.waitForRefreshPreparationPaint();
-
-                    const updateDate = Date.now();
-                    const [restoreState, playbackPositions] = await Promise.all(
-                        [
-                            this.databaseService.deleteXtreamPlaylistContent(
-                                item._id,
-                                {
-                                    operationId,
-                                    onEvent: (event) =>
-                                        this.updateRefreshPreparationFromEvent(
-                                            item._id,
-                                            operationId,
-                                            event
-                                        ),
-                                }
-                            ),
-                            this.playbackPositionService.getAllPlaybackPositions(
-                                item._id
-                            ),
-                            this.databaseService.updateXtreamPlaylistDetails({
-                                id: item._id,
-                                updateDate,
-                            }),
-                        ]
-                    );
-
-                    this.pendingRestoreService.set(item._id, {
-                        ...restoreState,
-                        playbackPositions,
-                    });
-
-                    this.store.dispatch(
-                        PlaylistActions.updatePlaylistMeta({
-                            playlist: { ...item, updateDate },
-                        })
-                    );
-
-                    await this.router.navigate([
-                        '/workspace',
-                        'xtreams',
-                        item._id,
-                    ]);
-                } catch (error) {
-                    if (!isDbAbortError(error)) {
-                        console.error(
-                            'Error refreshing Xtream playlist:',
-                            error
-                        );
-                        this.snackBar.open(
-                            this.translate.instant(
-                                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.ERROR'
-                            ),
-                            undefined,
-                            { duration: 3000 }
-                        );
-                    }
-                } finally {
-                    this.clearRefreshPreparation(operationId);
-                    this.isRefreshing.set(false);
-                }
-            },
+        void this.refreshNow(playlist, {
+            confirm: true,
+            navigateToPlaylist: true,
+            notify: true,
         });
     }
 
-    private async refreshM3u(item: PlaylistMeta): Promise<void> {
+    async refreshNow(
+        playlist: PlaylistMeta,
+        options: PlaylistRefreshActionOptions = {}
+    ): Promise<boolean> {
+        if (this.isRefreshing()) {
+            return false;
+        }
+
+        if (playlist.serverUrl) {
+            return this.refreshXtream(playlist, options);
+        }
+
+        if (isRefreshableM3uPlaylist(playlist)) {
+            return this.refreshM3u(playlist, options);
+        }
+
+        return false;
+    }
+
+    private async refreshXtream(
+        item: PlaylistMeta,
+        options: PlaylistRefreshActionOptions
+    ): Promise<boolean> {
+        if (options.confirm !== false) {
+            this.dialogService.openConfirmDialog({
+                title: this.translate.instant(
+                    'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.TITLE'
+                ),
+                message: this.translate.instant(
+                    'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.MESSAGE'
+                ),
+                width: '400px',
+                onConfirm: () => this.executeXtreamRefresh(item, options),
+            });
+            return true;
+        }
+
+        return this.executeXtreamRefresh(item, options);
+    }
+
+    private async executeXtreamRefresh(
+        item: PlaylistMeta,
+        options: PlaylistRefreshActionOptions
+    ): Promise<boolean> {
+        if (this.isRefreshing()) {
+            return false;
+        }
+
+        this.isRefreshing.set(true);
+        const operationId =
+            this.databaseService.createOperationId('xtream-refresh');
+        this.refreshPreparationState.set({
+            playlistId: item._id,
+            operationId,
+            phase: 'collecting-user-data',
+        });
+
+        try {
+            if (options.notify !== false) {
+                this.snackBar.open(
+                    this.translate.instant(
+                        'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.STARTED'
+                    ),
+                    undefined,
+                    { duration: 2000 }
+                );
+            }
+            await this.waitForRefreshPreparationPaint();
+
+            const updateDate = Date.now();
+            const [restoreState, playbackPositions] = await Promise.all([
+                this.databaseService.deleteXtreamPlaylistContent(item._id, {
+                    operationId,
+                    onEvent: (event) =>
+                        this.updateRefreshPreparationFromEvent(
+                            item._id,
+                            operationId,
+                            event
+                        ),
+                }),
+                this.playbackPositionService.getAllPlaybackPositions(item._id),
+                this.databaseService.updateXtreamPlaylistDetails({
+                    id: item._id,
+                    updateDate,
+                }),
+            ]);
+
+            this.pendingRestoreService.set(item._id, {
+                ...restoreState,
+                playbackPositions,
+            });
+
+            this.store.dispatch(
+                PlaylistActions.updatePlaylistMeta({
+                    playlist: { ...item, updateDate },
+                })
+            );
+
+            if (options.navigateToPlaylist !== false) {
+                await this.router.navigate(['/workspace', 'xtreams', item._id]);
+            }
+
+            return true;
+        } catch (error) {
+            if (!isDbAbortError(error)) {
+                console.error('Error refreshing Xtream playlist:', error);
+                if (options.notify !== false) {
+                    this.snackBar.open(
+                        this.translate.instant(
+                            'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.ERROR'
+                        ),
+                        undefined,
+                        { duration: 3000 }
+                    );
+                }
+            }
+
+            return false;
+        } finally {
+            this.clearRefreshPreparation(operationId);
+            this.isRefreshing.set(false);
+        }
+    }
+
+    private async refreshM3u(
+        item: PlaylistMeta,
+        options: PlaylistRefreshActionOptions
+    ): Promise<boolean> {
         const isActiveM3uRoute =
             this.playlistContext.routeProvider() === 'playlists' &&
             this.playlistContext.resolvedPlaylistId() === item._id;
@@ -196,21 +239,27 @@ export class PlaylistRefreshActionService {
                 })
             );
 
-            this.snackBar.open(
-                this.translate.instant(
-                    'HOME.PLAYLISTS.PLAYLIST_UPDATE_SUCCESS'
-                ),
-                undefined,
-                { duration: 2000 }
-            );
+            if (options.notify !== false) {
+                this.snackBar.open(
+                    this.translate.instant(
+                        'HOME.PLAYLISTS.PLAYLIST_UPDATE_SUCCESS'
+                    ),
+                    undefined,
+                    { duration: 2000 }
+                );
+            }
+
+            return true;
         } catch (error) {
             if (!isDbAbortError(error)) {
                 console.error('Error refreshing playlist:', error);
-                this.snackBar.open(
-                    this.getRefreshErrorMessage(error, item),
-                    this.translate.instant('CLOSE'),
-                    { duration: 5000 }
-                );
+                if (options.notify !== false) {
+                    this.snackBar.open(
+                        this.getRefreshErrorMessage(error, item),
+                        this.translate.instant('CLOSE'),
+                        { duration: 5000 }
+                    );
+                }
             }
 
             if (isActiveM3uRoute) {
@@ -218,6 +267,8 @@ export class PlaylistRefreshActionService {
                     ChannelActions.setChannelsLoading({ loading: false })
                 );
             }
+
+            return false;
         } finally {
             this.isRefreshing.set(false);
         }

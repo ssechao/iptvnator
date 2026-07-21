@@ -4,6 +4,7 @@ import { FormGroup, ReactiveFormsModule } from '@angular/forms';
 import { MatCheckboxModule } from '@angular/material/checkbox';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
+import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { TranslateModule } from '@ngx-translate/core';
 import { CoverSize, Language, Theme } from '@iptvnator/shared/interfaces';
@@ -20,6 +21,7 @@ import {
         MatCheckboxModule,
         MatFormFieldModule,
         MatIconModule,
+        MatInputModule,
         MatSelectModule,
         ReactiveFormsModule,
         TranslateModule,
