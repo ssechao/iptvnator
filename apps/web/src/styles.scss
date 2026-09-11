@@ -96,11 +96,28 @@ app-root.macos-platform .current-playlist {
     padding-top: 30px;
 }
 
-app-root.macos-platform app-navigation .portal-status-container {
-    padding-top: 30px;
+// Windows/Linux frameless title bar: reserve room in top-aligned drag
+// regions for the renderer-drawn window controls (3 × 46px buttons).
+// Body-level class so it also reaches cdk-overlay content (dialogs, menus).
+body.frameless-platform .workspace-header {
+    padding-right: 150px;
 }
 
 // ─── Base ─────────────────────────────────────────────────────────────────────
+// Native UI (scrollbars, form controls, popups) must follow the app theme,
+// not the OS preference. Chromium colors unstyled/native scrollbars from the
+// element's color-scheme, so declare it explicitly for both themes.
+html {
+    color-scheme: light;
+}
+
+// The root scroller (html) sits outside body.dark-theme, so flip it via
+// :has(); the color-scheme declaration in .dark-theme below keeps the body
+// subtree covered in engines without :has() support.
+html:has(> body.dark-theme) {
+    color-scheme: dark;
+}
+
 body,
 html {
     user-select: none;
@@ -148,6 +165,7 @@ textarea,
 // ─── Dark Theme ───────────────────────────────────────────────────────────────
 .dark-theme {
     background: var(--mat-sys-surface) !important;
+    color-scheme: dark;
 
     // Refined scrollbar for dark mode
     ::-webkit-scrollbar {
@@ -160,11 +178,15 @@ textarea,
     }
 
     ::-webkit-scrollbar-thumb {
-        background-color: var(--mat-sys-outline-variant);
+        background-color: color-mix(
+            in srgb,
+            var(--app-muted-color) 70%,
+            transparent
+        );
         border-radius: 999px;
 
         &:hover {
-            background-color: var(--mat-sys-outline);
+            background-color: var(--app-muted-color);
         }
     }
 }
@@ -182,13 +204,6 @@ textarea,
     backdrop-filter: blur(4px);
 }
 
-// Full-screen overlay dialogs (global search/recent) must stay interactive in Electron.
-.global-search-overlay,
-.global-search-overlay .mat-mdc-dialog-surface,
-.global-search-overlay .mat-mdc-dialog-container {
-    app-region: no-drag;
-}
-
 // Command palette dialog — the palette-shell renders its own background, border,
 // radius and shadow, so strip MDC's dialog surface chrome to avoid a darker
 // halo peeking out behind the rounded corners.
@@ -200,6 +215,50 @@ textarea,
     overflow: visible;
 }
 
+.workspace-shortcuts-overlay,
+.workspace-shortcuts-overlay .mat-mdc-dialog-surface,
+.workspace-shortcuts-overlay .mat-mdc-dialog-container {
+    app-region: no-drag;
+}
+
+.workspace-shortcuts-overlay .mat-mdc-dialog-surface {
+    background: transparent;
+    box-shadow: none;
+    border-radius: 14px;
+    padding: 0;
+    overflow: visible;
+}
+
 .mat-mdc-snack-bar-container.settings-snackbar {
     margin-bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+}
+
+// Failures (settings could not be saved/loaded) must not read as the usual
+// neutral confirmation toast.
+.mat-mdc-snack-bar-container.settings-snackbar--error {
+    --mdc-snackbar-container-color: var(--mat-sys-error-container);
+    --mdc-snackbar-supporting-text-color: var(--mat-sys-on-error-container);
+    --mat-snack-bar-button-color: var(--mat-sys-on-error-container);
+}
+
+// WCAG-friendly visually-hidden helper — content stays in the
+// accessibility tree and DOM query results but occupies no layout box.
+// Used where a visible heading would duplicate adjacent navigation
+// context (e.g. Settings page title that the left rail already
+// announces).
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.channel-scroll-focus:focus-visible {
+    outline: 2px solid var(--app-selection-color);
+    outline-offset: -2px;
 }

@@ -20,7 +20,6 @@ import { Router } from '@angular/router';
 import { Store } from '@ngrx/store';
 import { TranslateService } from '@ngx-translate/core';
 import { PlaylistContextFacade } from '@iptvnator/playlist/shared/util';
-import type { WorkspacePlaylistType } from '@iptvnator/workspace/shell/util';
 import {
     PlaylistActions,
     selectActiveTypeFilters,
@@ -34,19 +33,28 @@ import {
     DataService,
     DbOperationEvent,
     isDbAbortError,
-    PlaybackPositionService,
+    PlaylistDeleteActionService,
     PlaylistRefreshService,
+    RuntimeCapabilitiesService,
     SortBy,
     SortService,
-    XtreamPendingRestoreService,
 } from '@iptvnator/services';
 import {
     PLAYLIST_UPDATE,
     PlaylistMeta,
     PlaylistRefreshEvent,
 } from '@iptvnator/shared/interfaces';
+import {
+    measureRendererPerformancePhase,
+    RENDERER_PERFORMANCE_PHASE,
+} from '@iptvnator/shared/logging';
 
+import {
+    XtreamRefreshFlowService,
+    type XtreamRefreshProgressReporter,
+} from '../xtream-refresh-flow.service';
 import { EmptyStateComponent } from './empty-state/empty-state.component';
+import type { PlaylistType } from '../add-playlist-menu/playlist-type';
 import { PlaylistInfoComponent } from './playlist-info/playlist-info.component';
 import { PlaylistItemComponent } from './playlist-item/playlist-item.component';
 
@@ -76,24 +84,33 @@ export class RecentPlaylistsComponent {
     private readonly dialog = inject(MatDialog);
     private readonly dialogService = inject(DialogService);
     private readonly dataService = inject(DataService);
-    private readonly playbackPositionService = inject(PlaybackPositionService);
     private readonly playlistRefreshService = inject(PlaylistRefreshService);
     private readonly router = inject(Router);
     private readonly snackBar = inject(MatSnackBar);
     private readonly sortService = inject(SortService);
     private readonly store = inject(Store);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
     private readonly translate = inject(TranslateService);
     private readonly playlistContext = inject(PlaylistContextFacade);
-    private readonly pendingRestoreService = inject(
-        XtreamPendingRestoreService
-    );
+    private readonly playlistDeleteAction = inject(PlaylistDeleteActionService);
+    private readonly xtreamRefreshFlow = inject(XtreamRefreshFlowService);
 
     readonly sidebarMode = input(false);
     readonly searchQueryInput = input<string>('');
     readonly playlistClicked = output<string>();
-    readonly addPlaylistClicked = output<WorkspacePlaylistType | undefined>();
+    readonly addPlaylistClicked = output<PlaylistType | undefined>();
 
-    readonly isElectron = !!window.electron;
+    get isElectron(): boolean {
+        return this.runtime.isElectron;
+    }
+
+    get supportsPlaylistRefresh(): boolean {
+        return this.runtime.supportsPlaylistRefresh;
+    }
+
+    get supportsXtreamSqliteDataSource(): boolean {
+        return this.runtime.supportsXtreamSqliteDataSource;
+    }
 
     readonly allPlaylistsLoaded = this.store.selectSignal(
         selectPlaylistsLoadingFlag
@@ -203,7 +220,7 @@ export class RecentPlaylistsComponent {
         );
     }
 
-    onAddPlaylist(type?: WorkspacePlaylistType) {
+    onAddPlaylist(type?: PlaylistType) {
         this.addPlaylistClicked.emit(type);
     }
 
@@ -248,25 +265,33 @@ export class RecentPlaylistsComponent {
         }
 
         this.setPendingDeletion(item._id, true);
-        const operationId = item.serverUrl
-            ? this.databaseService.createOperationId('playlist-delete')
-            : undefined;
-
         try {
-            const deleted = await this.databaseService.deletePlaylist(
-                item._id,
-                operationId
-                    ? {
-                          operationId,
-                          onEvent: (event) =>
-                              this.updateBusyOperation(item._id, event),
-                      }
-                    : undefined
+            const deleted = await this.playlistDeleteAction.deletePlaylist(
+                item,
+                {
+                    onEvent: (event) =>
+                        this.updateBusyOperation(item._id, event),
+                }
             );
             if (deleted) {
-                this.store.dispatch(
-                    PlaylistActions.removePlaylist({ playlistId: item._id })
-                );
+                if (item.serverUrl) {
+                    measureRendererPerformancePhase(
+                        RENDERER_PERFORMANCE_PHASE.XTREAM_DELETE_ROW,
+                        () =>
+                            this.store.dispatch(
+                                PlaylistActions.removePlaylist({
+                                    playlistId: item._id,
+                                })
+                            ),
+                        () => ({ items: 1 })
+                    );
+                } else {
+                    this.store.dispatch(
+                        PlaylistActions.removePlaylist({
+                            playlistId: item._id,
+                        })
+                    );
+                }
                 this.snackBar.open(
                     this.translate.instant(
                         'HOME.PLAYLISTS.REMOVE_DIALOG.SUCCESS'
@@ -292,17 +317,21 @@ export class RecentPlaylistsComponent {
             return;
         }
 
-        if (item.serverUrl) {
+        if (item.serverUrl && this.supportsXtreamSqliteDataSource) {
             // For Xtream playlists, delete and re-import
             this.refreshXtreamPlaylist(item);
-        } else if (window.electron && (item.url || item.filePath)) {
+        } else if (
+            this.supportsPlaylistRefresh &&
+            (item.url || item.filePath)
+        ) {
             void this.refreshM3uPlaylist(item);
-        } else {
-            // For M3U playlists, use existing refresh logic
+        } else if (item.url) {
+            // Browser/PWA URL refresh uses the PWA data service path.
             this.dataService.sendIpcEvent(PLAYLIST_UPDATE, {
                 id: item._id,
                 title: item.title,
-                ...(item.url ? { url: item.url } : { filePath: item.filePath }),
+                url: item.url,
+                ...(item.userAgent ? { userAgent: item.userAgent } : {}),
             });
         }
     }
@@ -311,103 +340,34 @@ export class RecentPlaylistsComponent {
      * Refresh Xtream playlist by deleting all data and re-importing from remote
      * @param item Xtream playlist to refresh
      */
-    async refreshXtreamPlaylist(item: PlaylistMeta) {
+    refreshXtreamPlaylist(item: PlaylistMeta): void {
         if (this.isDeletePending(item._id) || this.isRefreshPending(item._id)) {
             return;
         }
 
-        this.dialogService.openConfirmDialog({
-            title: this.translate.instant(
-                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.TITLE'
-            ),
-            message: this.translate.instant(
-                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.MESSAGE'
-            ),
-            width: '400px',
-            onConfirm: async () => {
-                if (
-                    this.isDeletePending(item._id) ||
-                    this.isRefreshPending(item._id)
-                ) {
-                    return;
-                }
-
-                this.setPendingRefresh(item._id, true);
-                const operationId =
-                    this.databaseService.createOperationId('xtream-refresh');
-
-                try {
-                    // Show immediate feedback — deletion can take several seconds
-                    // for large playlists.
-                    this.snackBar.open(
-                        this.translate.instant(
-                            'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.STARTED'
-                        ),
-                        undefined,
-                        { duration: 2000 }
-                    );
-
-                    // Delete content/categories and update the timestamp in
-                    // parallel — both operations are fully independent.
-                    const updateDate = Date.now();
-                    const [restoreState, playbackPositions] = await Promise.all(
-                        [
-                            this.databaseService.deleteXtreamPlaylistContent(
-                                item._id,
-                                {
-                                    operationId,
-                                    onEvent: (workerEvent) =>
-                                        this.updateBusyOperation(
-                                            item._id,
-                                            workerEvent
-                                        ),
-                                }
-                            ),
-                            this.playbackPositionService.getAllPlaybackPositions(
-                                item._id
-                            ),
-                            this.databaseService.updateXtreamPlaylistDetails({
-                                id: item._id,
-                                updateDate,
-                            }),
-                        ]
-                    );
-
-                    this.pendingRestoreService.set(item._id, {
-                        ...restoreState,
-                        playbackPositions,
-                    });
-
-                    // Update the timestamp in NgRx / IndexedDB
-                    this.store.dispatch(
-                        PlaylistActions.updatePlaylistMeta({
-                            playlist: { ...item, updateDate },
-                        })
-                    );
-
-                    // Navigate to the playlist to trigger re-import
-                    this.router.navigate(['/workspace', 'xtreams', item._id]);
-                } catch (error) {
-                    if (!isDbAbortError(error)) {
-                        console.error(
-                            'Error refreshing Xtream playlist:',
-                            error
-                        );
-                        this.snackBar.open(
-                            this.translate.instant(
-                                'HOME.PLAYLISTS.REFRESH_XTREAM_DIALOG.ERROR'
-                            ),
-                            undefined,
-                            { duration: 3000 }
-                        );
-                    }
-                } finally {
-                    this.clearBusyOperation(item._id);
-                    this.setPendingRefresh(item._id, false);
-                }
-            },
-        });
+        this.xtreamRefreshFlow.confirmAndRefresh(
+            item,
+            this.xtreamRefreshReporter
+        );
     }
+
+    /**
+     * Reports the shared destructive refresh into this page's per-row busy
+     * indicators, which are keyed by playlist and shared with deletion — hence
+     * the same `updateBusyOperation`/`clearBusyOperation` pair used there.
+     */
+    private readonly xtreamRefreshReporter: XtreamRefreshProgressReporter = {
+        isBusy: (playlistId) =>
+            this.isDeletePending(playlistId) ||
+            this.isRefreshPending(playlistId),
+        begin: ({ playlistId }) => this.setPendingRefresh(playlistId, true),
+        report: ({ playlistId }, event) =>
+            this.updateBusyOperation(playlistId, event),
+        end: ({ playlistId }) => {
+            this.clearBusyOperation(playlistId);
+            this.setPendingRefresh(playlistId, false);
+        },
+    };
 
     private async refreshM3uPlaylist(item: PlaylistMeta): Promise<void> {
         if (this.isDeletePending(item._id) || this.isRefreshPending(item._id)) {
@@ -426,6 +386,9 @@ export class RecentPlaylistsComponent {
                         playlistId: item._id,
                         title: item.title,
                         url: item.url,
+                        ...(item.userAgent
+                            ? { userAgent: item.userAgent }
+                            : {}),
                         filePath: item.filePath,
                     },
                     {
@@ -452,6 +415,8 @@ export class RecentPlaylistsComponent {
                         _id: item._id,
                     },
                     playlistId: item._id,
+                    refreshEpg: true,
+                    operationId,
                 })
             );
 
@@ -460,7 +425,7 @@ export class RecentPlaylistsComponent {
                 this.translate.instant(
                     'HOME.PLAYLISTS.PLAYLIST_UPDATE_SUCCESS'
                 ),
-                null,
+                undefined,
                 { duration: 2000 }
             );
         } catch (error) {

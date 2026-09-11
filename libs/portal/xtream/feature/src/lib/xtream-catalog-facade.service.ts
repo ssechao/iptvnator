@@ -10,6 +10,19 @@ import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
 
 const SORT_STORAGE_KEY = 'xtream-category-sort-mode';
 
+const isValidSortMode = (
+    mode: string | null
+): mode is PortalCatalogSortMode =>
+    mode === 'date-desc' ||
+    mode === 'date-asc' ||
+    mode === 'name-asc' ||
+    mode === 'name-desc' ||
+    mode === 'rating-desc' ||
+    mode === 'rating-asc';
+
+const isRatingSortMode = (mode: PortalCatalogSortMode): boolean =>
+    mode === 'rating-desc' || mode === 'rating-asc';
+
 @Injectable()
 export class XtreamCatalogFacadeService implements PortalCatalogFacade<
     Record<string, unknown>,
@@ -20,14 +33,14 @@ export class XtreamCatalogFacadeService implements PortalCatalogFacade<
     private loadedPositionsPlaylistId: string | null = null;
 
     readonly provider = 'xtream' as const;
-    readonly pageSizeOptions = [10, 25, 50, 100] as const;
     readonly contentType = this.xtreamStore.selectedContentType;
-    readonly limit = this.xtreamStore.limit;
-    readonly pageIndex = this.xtreamStore.page;
     readonly selectedCategory = this.xtreamStore.getSelectedCategory;
     readonly paginatedContent = this.xtreamStore.getPaginatedContent;
     readonly selectedItem = this.xtreamStore.selectedItem;
-    readonly totalPages = this.xtreamStore.getTotalPages;
+    readonly hasMore = this.xtreamStore.hasMoreContent;
+    /** Appends are synchronous in-memory slices — never pending, never failing. */
+    readonly isAppending = computed(() => false);
+    readonly appendError = computed(() => false);
     readonly isPaginatedContentLoading =
         this.xtreamStore.isPaginatedContentLoading;
     readonly selectedCategoryTitle = computed(() => {
@@ -37,7 +50,20 @@ export class XtreamCatalogFacadeService implements PortalCatalogFacade<
     readonly categoryItemCount = computed(
         () => this.xtreamStore.selectItemsFromSelectedCategory().length
     );
-    readonly contentSortMode = this.xtreamStore.contentSortMode;
+    readonly contentSortMode = computed<PortalCatalogSortMode>(() => {
+        const mode = this.xtreamStore.contentSortMode();
+
+        return !this.supportsRatingSort && isRatingSortMode(mode)
+            ? 'date-desc'
+            : mode;
+    });
+    get supportsRatingSort(): boolean {
+        const type = this.contentType();
+        return type === 'vod' || type === 'series';
+    }
+    readonly minRating = computed(() =>
+        this.supportsRatingSort ? this.xtreamStore.minRating() : null
+    );
     readonly playlist = computed<PortalCatalogPlaylistMeta | null>(() => {
         const playlist = this.xtreamStore.currentPlaylist();
         if (!playlist) {
@@ -52,19 +78,18 @@ export class XtreamCatalogFacadeService implements PortalCatalogFacade<
 
     initialize(categoryId?: string | null): void {
         const savedSortMode = localStorage.getItem(SORT_STORAGE_KEY);
-        if (
-            savedSortMode === 'date-desc' ||
-            savedSortMode === 'date-asc' ||
-            savedSortMode === 'name-asc' ||
-            savedSortMode === 'name-desc'
-        ) {
-            this.xtreamStore.setContentSortMode(savedSortMode);
+        if (isValidSortMode(savedSortMode)) {
+            this.setContentSortMode(savedSortMode);
         }
 
         const playlistId = this.xtreamStore.currentPlaylist()?.id;
         if (playlistId && this.loadedPositionsPlaylistId !== playlistId) {
             this.loadedPositionsPlaylistId = playlistId;
-            this.xtreamStore.loadAllPositions(playlistId);
+            // A failed initial load leaves the maps empty (same as before);
+            // the read now rejects instead of masquerading as empty.
+            void this.xtreamStore.loadAllPositions(playlistId).catch(() => {
+                this.loadedPositionsPlaylistId = null;
+            });
         }
 
         this.clearSelectedItem();
@@ -84,17 +109,37 @@ export class XtreamCatalogFacadeService implements PortalCatalogFacade<
         this.xtreamStore.setCategorySearchTerm(query);
     }
 
-    setPage(page: number): void {
-        this.xtreamStore.setPage(page);
+    loadMore(): void {
+        this.xtreamStore.loadMoreContent();
     }
 
-    setLimit(limit: number): void {
-        this.xtreamStore.setLimit(limit);
+    retryAppend(): void {
+        // In-memory appends cannot fail; nothing to retry.
+    }
+
+    saveScrollPosition(scrollTop: number): void {
+        this.xtreamStore.saveCatalogScrollState(scrollTop);
+    }
+
+    consumeSavedScrollPosition(): number | null {
+        return this.xtreamStore.consumeCatalogScrollState();
     }
 
     setContentSortMode(mode: PortalCatalogSortMode): void {
+        if (!this.supportsRatingSort && isRatingSortMode(mode)) {
+            return;
+        }
+
         this.xtreamStore.setContentSortMode(mode);
         localStorage.setItem(SORT_STORAGE_KEY, mode);
+    }
+
+    setMinRating(value: number | null): void {
+        if (!this.supportsRatingSort) {
+            return;
+        }
+
+        this.xtreamStore.setMinRating(value);
     }
 
     selectItem(item: Record<string, unknown>): string[] | null {

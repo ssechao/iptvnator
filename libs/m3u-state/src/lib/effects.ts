@@ -2,28 +2,43 @@ import { inject, Injectable } from '@angular/core';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { Router } from '@angular/router';
 import { EpgService } from '@iptvnator/epg/data-access';
-import { resolveM3uCatchupUrl } from '@iptvnator/shared/m3u-utils';
+import {
+    isDashChannel,
+    isDashStreamUrl,
+    normalizeEpgUrls,
+} from '@iptvnator/shared/m3u-utils';
 import { Actions, createEffect, ofType } from '@ngrx/effects';
 import { Store } from '@ngrx/store';
 import { StorageMap } from '@ngx-pwa/local-storage';
 import { TranslateService } from '@ngx-translate/core';
 import {
     EMPTY,
+    catchError,
+    concatMap,
+    defer,
     filter,
     firstValueFrom,
     from,
     map,
     mergeMap,
+    of,
+    retry,
     switchMap,
     tap,
     withLatestFrom,
 } from 'rxjs';
-import { DataService, PlaylistsService } from '@iptvnator/services';
+import {
+    DataService,
+    EpgSourceSettingsService,
+    PlaylistsService,
+    SettingsStore,
+} from '@iptvnator/services';
 import {
     OPEN_MPV_PLAYER,
     OPEN_VLC_PLAYER,
     Channel,
     Playlist,
+    PlaylistMeta,
     STORE_KEY,
     VideoPlayer,
 } from '@iptvnator/shared/interfaces';
@@ -35,12 +50,20 @@ import {
 } from './actions';
 import {
     selectActive,
+    selectActivePlaylist,
     selectActivePlaylistId,
     selectChannels,
     selectFavorites,
 } from './selectors';
 import { resolveChannelEpgLookupKey } from './channel-epg-lookup.util';
-import { buildExternalPlayerPayload } from './external-player-payload.util';
+import {
+    buildExternalPlayerPayload,
+    type ExternalPlayerHeaderFallback,
+    shouldAutoLaunchExternalPlayer,
+} from './external-player-payload.util';
+import { resolvePlaylistScopedEpgFetchPlan } from './playlist-scoped-epg-fetch.util';
+import { resolveActiveEpgProgramAction } from './resolve-active-epg-program.util';
+import { persistPlaylistUpdate } from './playlist-update.effect-handler';
 
 @Injectable({ providedIn: 'any' })
 export class PlaylistEffects {
@@ -53,6 +76,9 @@ export class PlaylistEffects {
     private storage = inject(StorageMap);
     private store = inject(Store);
     private translate = inject(TranslateService);
+    private settingsStore = inject(SettingsStore);
+    private epgSources = inject(EpgSourceSettingsService);
+    private readonly playlistScopedEpgFetchKeys = new Map<string, string>();
 
     updateFavorites$ = createEffect(
         () => {
@@ -101,15 +127,20 @@ export class PlaylistEffects {
         return this.actions$.pipe(
             ofType(EpgActions.setActiveEpgProgram),
             withLatestFrom(this.store.select(selectActive)),
-            map(([action, activeChannel]) => {
-                const playbackUrl = activeChannel
-                    ? resolveM3uCatchupUrl(activeChannel, action.program)
-                    : null;
-
-                return playbackUrl
-                    ? EpgActions.setActivePlaybackUrl({ playbackUrl })
-                    : EpgActions.resetActiveEpgProgram();
-            })
+            map(([action, activeChannel]) =>
+                resolveActiveEpgProgramAction(
+                    action.program,
+                    activeChannel,
+                    () =>
+                        this.snackBar.open(
+                            this.translate.instant(
+                                'EPG.TIMELINE.CATCHUP_FAILED'
+                            ),
+                            undefined,
+                            { duration: 4000 }
+                        )
+                )
+            )
         );
     });
 
@@ -117,11 +148,15 @@ export class PlaylistEffects {
         () => {
             return this.actions$.pipe(
                 ofType(EpgActions.setActivePlaybackUrl),
-                withLatestFrom(this.store.select(selectActive)),
-                tap(([action, activeChannel]) => {
+                withLatestFrom(
+                    this.store.select(selectActive),
+                    this.store.select(selectActivePlaylist)
+                ),
+                tap(([action, activeChannel, activePlaylist]) => {
                     void this.openWithConfiguredExternalPlayer(
                         action.playbackUrl,
-                        activeChannel
+                        activeChannel,
+                        activePlaylist
                     );
                 })
             );
@@ -133,12 +168,16 @@ export class PlaylistEffects {
         () => {
             return this.actions$.pipe(
                 ofType(EpgActions.returnToLivePlayback),
-                withLatestFrom(this.store.select(selectActive)),
+                withLatestFrom(
+                    this.store.select(selectActive),
+                    this.store.select(selectActivePlaylist)
+                ),
                 filter(([, activeChannel]) => Boolean(activeChannel?.url)),
-                tap(([, activeChannel]) => {
+                tap(([, activeChannel, activePlaylist]) => {
                     void this.openWithConfiguredExternalPlayer(
                         activeChannel?.url ?? '',
-                        activeChannel
+                        activeChannel,
+                        activePlaylist
                     );
                 })
             );
@@ -151,7 +190,8 @@ export class PlaylistEffects {
             ofType(ChannelActions.setActiveChannel),
             // Skip the effect entirely when channel is falsy
             filter((action) => !!action.channel),
-            map((action) => {
+            withLatestFrom(this.store.select(selectActivePlaylist)),
+            map(([action, activePlaylist]) => {
                 const { channel } = action;
 
                 // Use modern EPG service to get channel programs
@@ -160,48 +200,55 @@ export class PlaylistEffects {
                     this.epgService.getChannelPrograms(channelId);
                 }
 
-                // Set user agent if specified on channel
-                if (channel.http['user-agent']) {
-                    window.electron?.setUserAgent(
-                        channel.http['user-agent'],
-                        channel.http.referrer
-                    );
-                }
+                void window.electron
+                    ?.setUserAgent(
+                        channel.http?.['user-agent'],
+                        channel.http?.referrer,
+                        channel.url
+                    )
+                    .catch((error: unknown) => {
+                        console.warn(
+                            '[PlaylistEffects] Failed to configure Electron request headers:',
+                            error
+                        );
+                    });
 
                 firstValueFrom(this.storage.get(STORE_KEY.Settings)).then(
                     (settings: any) => {
-                        const shouldOpenExternalPlayer =
-                            !settings?.openStreamOnDoubleClick ||
-                            action.startPlayback === true;
+                        const payload = buildExternalPlayerPayload(
+                            channel,
+                            channel.url,
+                            activePlaylist
+                        );
+                        if (!payload) {
+                            return;
+                        }
 
                         if (
-                            settings &&
-                            Object.keys(settings).length > 0 &&
-                            shouldOpenExternalPlayer &&
-                            settings.player === VideoPlayer.MPV &&
-                            channel.radio !== 'true'
+                            shouldAutoLaunchExternalPlayer(
+                                settings,
+                                action.startPlayback,
+                                channel,
+                                VideoPlayer.MPV
+                            )
                         ) {
-                            this.dataService.sendIpcEvent(OPEN_MPV_PLAYER, {
-                                url: channel.url,
-                                title: channel.name ?? '',
-                                'user-agent': channel.http['user-agent'],
-                                referer: channel.http.referrer,
-                                origin: channel.http.origin,
-                            });
+                            this.dataService.sendIpcEvent(
+                                OPEN_MPV_PLAYER,
+                                payload
+                            );
                         } else if (
-                            settings &&
-                            Object.keys(settings).length > 0 &&
-                            shouldOpenExternalPlayer &&
-                            settings.player === VideoPlayer.VLC &&
-                            channel.radio !== 'true'
-                        )
-                            this.dataService.sendIpcEvent(OPEN_VLC_PLAYER, {
-                                url: channel.url,
-                                title: channel.name ?? '',
-                                'user-agent': channel.http['user-agent'],
-                                referer: channel.http.referrer,
-                                origin: channel.http.origin,
-                            });
+                            shouldAutoLaunchExternalPlayer(
+                                settings,
+                                action.startPlayback,
+                                channel,
+                                VideoPlayer.VLC
+                            )
+                        ) {
+                            this.dataService.sendIpcEvent(
+                                OPEN_VLC_PLAYER,
+                                payload
+                            );
+                        }
                     }
                 );
 
@@ -216,12 +263,28 @@ export class PlaylistEffects {
         return this.actions$.pipe(
             ofType(PlaylistActions.loadPlaylists),
             switchMap(() =>
-                this.playlistsService.getAllPlaylists().pipe(
+                defer(() => this.playlistsService.getAllPlaylists()).pipe(
+                    // Recreate the storage request once for transient failures.
+                    // A final failure is state, not an empty source inventory.
+                    retry({ count: 1, delay: 300 }),
+                    switchMap((playlists) =>
+                        defer(async () => {
+                            // Settings can register initial cleanup after the
+                            // faster inventory read has already completed.
+                            await this.settingsStore.loadSettings();
+                            await this.epgSources.retryFailedReconciliation();
+                            return playlists;
+                        })
+                    ),
+                    tap((playlists) => {
+                        this.fetchPlaylistScopedEpgForPlaylists(playlists);
+                    }),
                     map((playlists) =>
                         PlaylistActions.loadPlaylistsSuccess({
                             playlists,
                         })
-                    )
+                    ),
+                    catchError(() => of(PlaylistActions.loadPlaylistsFailure()))
                 )
             )
         );
@@ -229,9 +292,18 @@ export class PlaylistEffects {
 
     private async openWithConfiguredExternalPlayer(
         playbackUrl: string,
-        activeChannel: Channel | undefined | null
+        activeChannel: Channel | undefined | null,
+        activePlaylist?: ExternalPlayerHeaderFallback | null
     ): Promise<void> {
-        const payload = buildExternalPlayerPayload(activeChannel, playbackUrl);
+        if (isDashStreamUrl(playbackUrl) || isDashChannel(activeChannel)) {
+            return;
+        }
+
+        const payload = buildExternalPlayerPayload(
+            activeChannel,
+            playbackUrl,
+            activePlaylist
+        );
         if (!payload) {
             return;
         }
@@ -258,6 +330,7 @@ export class PlaylistEffects {
             return this.actions$.pipe(
                 ofType(PlaylistActions.removePlaylist),
                 switchMap(async (action) => {
+                    this.playlistScopedEpgFetchKeys.delete(action.playlistId);
                     await firstValueFrom(
                         this.playlistsService.deletePlaylist(action.playlistId)
                     );
@@ -272,10 +345,13 @@ export class PlaylistEffects {
             return this.actions$.pipe(
                 ofType(PlaylistActions.updatePlaylist),
                 switchMap((action) =>
-                    this.playlistsService.updatePlaylist(action.playlistId, {
-                        ...action.playlist,
-                        _id: action.playlistId,
-                    })
+                    persistPlaylistUpdate(this.playlistsService, action).pipe(
+                        tap(() => {
+                            this.fetchPlaylistScopedEpg(action.playlist, {
+                                force: action.refreshEpg === true,
+                            });
+                        })
+                    )
                 )
             );
         },
@@ -303,6 +379,12 @@ export class PlaylistEffects {
         );
     });
 
+    // concatMap, not switchMap: every action carries a *different* playlist,
+    // so a newer one must never cancel the previous playlist's write. Under
+    // switchMap two adds in quick succession — the OS handing over several
+    // playlist files at once is the realistic case — dropped the first
+    // playlist's EPG fetch and navigation on the floor. Serialising also keeps
+    // the last-added playlist as the one that ends up active.
     addPlaylist$ = createEffect(
         () => {
             return this.actions$.pipe(
@@ -310,18 +392,18 @@ export class PlaylistEffects {
                     PlaylistActions.addPlaylist,
                     PlaylistActions.handleAddingPlaylistByUrl
                 ),
-                tap((action) => {
-                    if ('isTemporary' in action && action.isTemporary) {
-                        return;
-                    }
-
-                    this.navigateToPlaylist(action.playlist);
-                }),
-                switchMap((action) => {
+                concatMap((action) => {
                     if ('isTemporary' in action && action.isTemporary) {
                         return EMPTY;
                     }
-                    return this.playlistsService.addPlaylist(action.playlist);
+                    return this.playlistsService
+                        .addPlaylist(action.playlist)
+                        .pipe(
+                            tap(() => {
+                                this.fetchPlaylistScopedEpg(action.playlist);
+                                this.navigateToPlaylist(action.playlist);
+                            })
+                        );
                 })
             );
         },
@@ -332,8 +414,23 @@ export class PlaylistEffects {
         () => {
             return this.actions$.pipe(
                 ofType(PlaylistActions.updatePlaylistMeta),
+                filter((action) => action.persist !== false),
                 switchMap((action) =>
-                    this.playlistsService.updatePlaylistMeta(action.playlist)
+                    this.playlistsService
+                        .updatePlaylistMeta(action.playlist)
+                        .pipe(
+                            tap(() => {
+                                if (
+                                    this.hasPlaylistScopedEpgSourceChange(
+                                        action.playlist
+                                    )
+                                ) {
+                                    this.fetchPlaylistScopedEpg(
+                                        action.playlist
+                                    );
+                                }
+                            })
+                        )
                 )
             );
         },
@@ -371,7 +468,15 @@ export class PlaylistEffects {
             return this.actions$.pipe(
                 ofType(PlaylistActions.updateManyPlaylists),
                 switchMap((action) =>
-                    this.playlistsService.updateManyPlaylists(action.playlists)
+                    this.playlistsService
+                        .updateManyPlaylists(action.playlists)
+                        .pipe(
+                            tap(() => {
+                                action.playlists.forEach((playlist) =>
+                                    this.fetchPlaylistScopedEpg(playlist)
+                                );
+                            })
+                        )
                 )
             );
         },
@@ -418,5 +523,66 @@ export class PlaylistEffects {
         }
 
         void this.router.navigate(['/workspace', 'playlists', playlist._id]);
+    }
+
+    private fetchPlaylistScopedEpg(
+        playlist: Pick<
+            Playlist,
+            '_id' | 'epgUrls' | 'macAddress' | 'serverUrl'
+        >,
+        options: { force?: boolean } = {}
+    ): void {
+        const plan = resolvePlaylistScopedEpgFetchPlan(
+            playlist,
+            this.getGlobalEpgUrls(),
+            this.playlistScopedEpgFetchKeys.get(playlist._id),
+            options
+        );
+        this.playlistScopedEpgFetchKeys.set(playlist._id, plan.key);
+
+        if (!plan.shouldFetch) {
+            return;
+        }
+
+        this.epgService.fetchEpg(plan.urls);
+    }
+
+    private hasPlaylistScopedEpgSourceChange(playlist: PlaylistMeta): boolean {
+        return (
+            Object.prototype.hasOwnProperty.call(playlist, 'epgUrls') ||
+            Object.prototype.hasOwnProperty.call(playlist, 'detectedEpgUrls') ||
+            Object.prototype.hasOwnProperty.call(playlist, 'manualEpgUrls') ||
+            Object.prototype.hasOwnProperty.call(playlist, 'disabledEpgUrls')
+        );
+    }
+
+    private fetchPlaylistScopedEpgForPlaylists(playlists: Playlist[]): void {
+        const epgUrls = new Set<string>();
+        const globalEpgUrls = this.getGlobalEpgUrls();
+
+        for (const playlist of playlists) {
+            const plan = resolvePlaylistScopedEpgFetchPlan(
+                playlist,
+                globalEpgUrls,
+                this.playlistScopedEpgFetchKeys.get(playlist._id)
+            );
+            this.playlistScopedEpgFetchKeys.set(playlist._id, plan.key);
+
+            if (!plan.shouldFetch) {
+                continue;
+            }
+
+            for (const url of plan.urls) {
+                epgUrls.add(url);
+            }
+        }
+
+        if (epgUrls.size > 0) {
+            this.epgService.fetchEpg(Array.from(epgUrls));
+        }
+    }
+
+    private getGlobalEpgUrls(): string[] {
+        return normalizeEpgUrls(this.settingsStore.getSettings().epgUrl ?? []);
     }
 }

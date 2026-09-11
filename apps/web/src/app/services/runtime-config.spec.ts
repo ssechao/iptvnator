@@ -29,30 +29,48 @@ describe('runtime config helpers', () => {
         expect(
             shouldEnableServiceWorker(true, {
                 serviceWorker: {},
-            } as Navigator, {} as Pick<Window, 'electron'>)
+            } as Navigator)
         ).toBe(true);
         expect(
-            shouldEnableServiceWorker(
-                false,
-                { serviceWorker: {} } as Navigator,
-                {} as Pick<Window, 'electron'>
-            )
+            shouldEnableServiceWorker(false, { serviceWorker: {} } as Navigator)
         ).toBe(false);
+        expect(shouldEnableServiceWorker(true, {} as Navigator)).toBe(false);
+    });
+
+    it('disables service worker for Electron runtime', () => {
         expect(
             shouldEnableServiceWorker(
                 true,
-                {} as Navigator,
-                {} as Pick<Window, 'electron'>
+                { serviceWorker: {} } as Navigator,
+                {
+                    electronBridge: {},
+                    protocol: 'file:',
+                }
             )
         ).toBe(false);
     });
 
-    it('disables the service worker in Electron production builds', () => {
+    it('disables service worker for Electron runtime on non-file origins', () => {
         expect(
             shouldEnableServiceWorker(
                 true,
                 { serviceWorker: {} } as Navigator,
-                { electron: {} } as Pick<Window, 'electron'>
+                {
+                    electronBridge: {},
+                    protocol: 'https:',
+                }
+            )
+        ).toBe(false);
+    });
+
+    it('disables service worker for file origins without an Electron bridge', () => {
+        expect(
+            shouldEnableServiceWorker(
+                true,
+                { serviceWorker: {} } as Navigator,
+                {
+                    protocol: 'file:',
+                }
             )
         ).toBe(false);
     });

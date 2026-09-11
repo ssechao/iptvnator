@@ -1,3 +1,5 @@
+import type { WorkerPerformanceCaptureResult } from './worker-performance-capture';
+
 export const DB_WORKER_OPERATIONS = [
     'DB_HAS_CATEGORIES',
     'DB_GET_CATEGORIES',
@@ -10,16 +12,20 @@ export const DB_WORKER_OPERATIONS = [
     'DB_SAVE_CONTENT',
     'DB_CLEAR_XTREAM_IMPORT_CACHE',
     'DB_GET_CONTENT_BY_XTREAM_ID',
-    'DB_SET_CONTENT_BACKDROP_IF_MISSING',
+    'DB_SET_CONTENT_METADATA_IF_MISSING',
     'DB_SEARCH_CONTENT',
     'DB_GLOBAL_SEARCH',
     'DB_CREATE_PLAYLIST',
     'DB_UPSERT_APP_PLAYLIST',
     'DB_UPSERT_APP_PLAYLISTS',
+    'DB_MIGRATE_APP_PLAYLISTS',
     'DB_GET_APP_PLAYLISTS',
+    'DB_GET_APP_PLAYLIST_METAS',
     'DB_GET_APP_PLAYLIST',
+    'DB_GET_APP_PLAYLIST_FAVORITE_CHANNELS',
     'DB_GET_PLAYLIST',
     'DB_UPDATE_PLAYLIST',
+    'DB_SET_PLAYLIST_SERVER_TIMEZONE',
     'DB_DELETE_PLAYLIST',
     'DB_GET_APP_STATE',
     'DB_SET_APP_STATE',
@@ -47,6 +53,20 @@ export const DB_WORKER_OPERATIONS = [
     'DB_GET_ALL_PLAYBACK_POSITIONS',
     'DB_CLEAR_ALL_PLAYBACK_POSITIONS',
     'DB_CLEAR_PLAYBACK_POSITION',
+    'DB_SAVE_PLAYBACK_POSITIONS_BATCH',
+    'DB_CLEAR_PLAYBACK_POSITIONS_BATCH',
+    'DB_GET_TMDB_METADATA',
+    'DB_SET_TMDB_METADATA',
+    'DB_GET_TMDB_CACHE_STATS',
+    'DB_CLEAR_TMDB_METADATA',
+    'DB_MATCH_TITLES',
+    'DB_FIND_TITLE_SOURCES',
+    'DB_GET_VOD_SOURCE_PIN',
+    'DB_LIST_VOD_SOURCE_PINS',
+    'DB_CLEAR_VOD_SOURCE_PINS_FOR_PLAYLIST',
+    'DB_SET_VOD_SOURCE_PIN',
+    'DB_CLEAR_VOD_SOURCE_PIN',
+    'DB_REPLACE_VOD_SOURCE_PINS',
 ] as const;
 
 export type DbWorkerOperation = (typeof DB_WORKER_OPERATIONS)[number];
@@ -79,11 +99,7 @@ export const DB_OPERATION_PHASES = {
 } as const;
 
 export type DbOperationStatus =
-    | 'started'
-    | 'progress'
-    | 'completed'
-    | 'cancelled'
-    | 'error';
+    'started' | 'progress' | 'completed' | 'cancelled' | 'error';
 
 export interface DbOperationEvent {
     operationId?: string;
@@ -125,19 +141,27 @@ export interface DbWorkerEventMessage {
     event: DbOperationEvent;
 }
 
+export interface DbWorkerPerformanceCancelReceivedMessage {
+    type: 'performance-cancel-received';
+    operationId: string;
+    requestId: string;
+    epochMs: number;
+}
+
 export interface DbWorkerResponseMessage<TResult = unknown> {
     type: 'response';
     requestId: string;
     success: boolean;
     result?: TResult;
     error?: SerializedWorkerError;
+    performance?: WorkerPerformanceCaptureResult;
 }
 
 export type DbWorkerIncomingMessage =
-    | DbWorkerRequestMessage
-    | DbWorkerCancelMessage;
+    DbWorkerRequestMessage | DbWorkerCancelMessage;
 
 export type DbWorkerMessage =
     | DbWorkerReadyMessage
     | DbWorkerEventMessage
+    | DbWorkerPerformanceCancelReceivedMessage
     | DbWorkerResponseMessage;

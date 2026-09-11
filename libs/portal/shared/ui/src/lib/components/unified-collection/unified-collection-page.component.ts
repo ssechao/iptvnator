@@ -7,6 +7,8 @@ import {
     contentChild,
     DestroyRef,
     effect,
+    ElementRef,
+    HostListener,
     inject,
     linkedSignal,
     input,
@@ -38,6 +40,7 @@ import {
     getOpenLiveCollectionItemState,
     getUnifiedCollectionNavigation,
     isWorkspaceLayoutRoute,
+    isTypingInInput,
     LiveLayoutSidebarStateService,
     OPEN_COLLECTION_DETAIL_STATE_KEY,
     OPEN_LIVE_COLLECTION_ITEM_STATE_KEY,
@@ -47,11 +50,15 @@ import {
     routeParamSignal,
     ScopeToggleService,
     STALKER_RETURN_TO_STATE_KEY,
+    SeriesResumeTarget,
     UnifiedCollectionItem,
-    UnifiedFavoritesDataService,
-    UnifiedRecentDataService,
     WorkspaceViewCommandService,
 } from '@iptvnator/portal/shared/util';
+import {
+    UnifiedFavoritesDataService,
+    UnifiedRecentDataService,
+} from '@iptvnator/portal/shared/data-access';
+import { RuntimeCapabilitiesService } from '@iptvnator/services';
 import { selectAllPlaylistsMeta, selectPlaylistsLoadingFlag } from '@iptvnator/m3u-state';
 import { EmptyStateComponent } from '@iptvnator/playlist/shared/ui';
 import { UnifiedLiveTabComponent } from './unified-live-tab.component';
@@ -92,10 +99,12 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
     private readonly router = inject(Router);
     private readonly store = inject(Store);
     private readonly destroyRef = inject(DestroyRef);
+    private readonly hostElement = inject(ElementRef<HTMLElement>);
     private readonly scopeService = inject(ScopeToggleService);
     private readonly favoritesData = inject(UnifiedFavoritesDataService);
     private readonly recentData = inject(UnifiedRecentDataService);
     private readonly dialogService = inject(DialogService);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
     private readonly translate = inject(TranslateService);
     private readonly workspaceViewCommands = inject(WorkspaceViewCommandService);
     private readonly liveSidebarStateService = inject(
@@ -141,7 +150,11 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
     readonly selectedContentType = signal<CollectionContentType>(
         this.historyCollectionViewState()?.selectedContentType ?? 'live'
     );
+    readonly supportsEpg = this.runtime.supportsEpg;
     readonly selectedDetailItem = signal<UnifiedCollectionItem | null>(null);
+    readonly selectedDetailSeriesResume = signal<SeriesResumeTarget | null>(
+        null
+    );
     readonly pendingAutoOpenLiveItem = signal(
         getOpenLiveCollectionItemState(window.history.state)
     );
@@ -155,6 +168,7 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
             return {
                 $implicit: item,
                 item,
+                seriesResume: this.selectedDetailSeriesResume(),
                 close: this.requestCloseDetail,
             };
         }
@@ -266,7 +280,8 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
             this.selectedContentType() === 'live' &&
             this.hasLive()
     );
-    readonly isSidebarCollapsed = this.liveSidebarStateService.isCollapsed;
+    readonly isSidebarCollapsed =
+        this.liveSidebarStateService.isCollapsedFor('collection');
     readonly showSidebarToggle = computed(
         () => this.selectedContentType() === 'live' && this.hasLive()
     );
@@ -358,7 +373,10 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
             return;
         }
 
-        const navigation = this.getGlobalCollectionDetailNavigation(item);
+        const navigation = this.getGlobalCollectionDetailNavigation(
+            item,
+            this.selectedDetailSeriesResume()
+        );
         if (!navigation) {
             return;
         }
@@ -456,7 +474,30 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
     }
 
     toggleSidebar(): void {
-        this.liveSidebarStateService.toggle();
+        this.liveSidebarStateService.toggle('collection');
+    }
+
+    /**
+     * Cmd/Ctrl+B mirrors the routed live layouts (M3U, Xtream, Stalker): the
+     * hidden-list state advertises the shortcut, so the collection live tab
+     * must honour it too. Only while that tab, and therefore the rail, is on
+     * screen; the movies/series grids have nothing to hide.
+     */
+    @HostListener('document:keydown', ['$event'])
+    handleSidebarShortcut(event: KeyboardEvent): void {
+        if (
+            this.showSidebarToggle() &&
+            (event.metaKey || event.ctrlKey) &&
+            event.key.toLowerCase() === 'b' &&
+            !isTypingInInput(event) &&
+            // Behind the workspace's phone context drawer the route content
+            // is inert; this document-level listener still fires, so it
+            // opts out itself instead of toggling an obscured rail.
+            !this.hostElement.nativeElement.closest('[inert]')
+        ) {
+            event.preventDefault();
+            this.toggleSidebar();
+        }
     }
 
     setFavSortMode(mode: FavoritesChannelSortMode): void {
@@ -759,7 +800,10 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
         return !portalType || portalType === item.sourceType;
     }
 
-    private getGlobalCollectionDetailNavigation(item: UnifiedCollectionItem) {
+    private getGlobalCollectionDetailNavigation(
+        item: UnifiedCollectionItem,
+        seriesResume?: SeriesResumeTarget | null
+    ) {
         if (
             item.contentType === 'live' ||
             (item.sourceType !== 'xtream' && item.sourceType !== 'stalker')
@@ -767,16 +811,25 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
             return null;
         }
 
-        return buildGlobalCollectionDetailNavigationTarget(this.mode(), item);
+        return buildGlobalCollectionDetailNavigationTarget(
+            this.mode(),
+            item,
+            seriesResume
+        );
     }
 
-    private openInlineDetail(item: UnifiedCollectionItem): void {
+    private openInlineDetail(
+        item: UnifiedCollectionItem,
+        seriesResume?: SeriesResumeTarget | null
+    ): void {
         this.selectedContentType.set(item.contentType);
         this.selectedDetailItem.set(item);
+        this.selectedDetailSeriesResume.set(seriesResume ?? null);
     }
 
     private clearInlineDetail(): void {
         this.selectedDetailItem.set(null);
+        this.selectedDetailSeriesResume.set(null);
         this.autoSelectContentType();
         clearNavigationStateKeys([OPEN_COLLECTION_DETAIL_STATE_KEY]);
     }
@@ -840,12 +893,13 @@ export class UnifiedCollectionPageComponent implements AfterContentInit {
     }
 
     private syncDetailFromHistoryState(): void {
-        const detailItem = getOpenCollectionDetailItemState(
+        const detailState = getOpenCollectionDetailItemState(
             window.history.state
-        )?.item;
+        );
+        const detailItem = detailState?.item;
 
         if (detailItem && this.canOpenInlineDetail(detailItem)) {
-            this.openInlineDetail(detailItem);
+            this.openInlineDetail(detailItem, detailState.seriesResume);
             return;
         }
 

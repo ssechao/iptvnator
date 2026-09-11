@@ -1,17 +1,76 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import {
+    APP_UPDATE_CHECK,
+    APP_UPDATE_DOWNLOAD,
+    APP_UPDATE_GET_RELEASE_NOTES,
+    APP_UPDATE_GET_STATUS,
+    APP_UPDATE_INSTALL,
+    APP_UPDATE_STATUS_CHANGED,
+    ACKNOWLEDGE_PLAYLIST_OPEN_REQUEST,
+    ANNOUNCE_PLAYLIST_OPEN_LISTENER,
+    OPEN_FILE,
+} from '@iptvnator/shared/interfaces/ipc-commands';
+import {
+    attachEmbeddedMpvFrameView,
+    detachEmbeddedMpvFrameView,
+} from './embedded-mpv-frame-pump';
+import {
+    createPreloadPerformanceCapture,
+    toPreloadPerformanceTargetMethod,
+} from './preload-performance-capture';
+import {
+    createXtreamPreloadPerformanceCapture,
+    isXtreamPreloadPerformanceCaptureEnabled,
+    toXtreamPreloadPerformanceTargetMethod,
+} from './xtream-preload-performance-capture';
 import type {
+    ContentMetadataPatch,
+    DownloadMetadataSnapshot,
     EmbeddedMpvBounds,
     EmbeddedMpvRecordingStartOptions,
+    EmbeddedMpvSubtitleStyle,
     EmbeddedMpvSession,
     EmbeddedMpvSupport,
+    ElectronBridgeApi,
+    ElectronBridgeAppUpdateReleaseNotesRequest,
+    ElectronBridgeAppUpdateStatus,
+    ElectronBridgeDbOperationEvent,
+    ElectronBridgeDownloadStartPayload,
+    ElectronBridgeCurrentProgramsOptions,
+    ElectronBridgeEpgGuideWindow,
+    ElectronBridgeEpgLookupOptions,
+    ElectronBridgeEpgProgress,
+    ElectronBridgePlaybackPositionInput,
+    ElectronBridgePlaylistInput,
+    ElectronBridgePlaylistOpenRequest,
+    ElectronBridgePlaylistUpsertInput,
+    ElectronBridgeRemoteControlCommand,
+    ElectronBridgeRemoteControlStatus,
+    ElectronBridgeTrustOptions,
+    ElectronBridgePlaylistFetchOptions,
+    ElectronBridgeWindowState,
+    ElectronBridgeXtreamContentStream,
     ExternalPlayerSession,
+    GlobalSearchPaginationOptions,
+    GlobalSearchResultSource,
+    PlaybackPositionData,
+    PlayerContentInfo,
+    Playlist,
     PlaylistRefreshEvent,
     PlaylistRefreshPayload,
+    PortalDebugEvent,
+    RecordingProgramSnapshot,
     ResolvedPortalPlayback,
+    Settings,
+    TmdbCacheEntry,
+    TmdbCacheMediaType,
+    StreamProbeHeaders,
+    VodSourcePin,
     XtreamCategory,
 } from '@iptvnator/shared/interfaces';
 import {
     DEBUG_TRACE_EVENT_CHANNEL,
+    isPerformanceCaptureEnabled,
     isRendererApiTraceEnabled,
     roundTraceDuration,
     summarizeForTrace,
@@ -22,37 +81,38 @@ const EXTERNAL_PLAYER_SESSION_UPDATE = 'EXTERNAL_PLAYER_SESSION_UPDATE';
 const EMBEDDED_MPV_SESSION_UPDATE = 'EMBEDDED_MPV_SESSION_UPDATE';
 const DB_OPERATION_EVENT = 'DB_OPERATION_EVENT';
 const PLAYLIST_REFRESH_EVENT = 'PLAYLIST:REFRESH_EVENT';
-
-type PortalDebugEvent = {
-    requestId: string;
-    provider: 'xtream' | 'stalker';
-    operation: string;
-    transport: 'electron-main' | 'electron-renderer' | 'pwa-http';
-    startedAt: string;
-    durationMs: number;
-    status: 'success' | 'error';
-    request: unknown;
-    response?: unknown;
-    error?: unknown;
-};
-
-type DbOperationEvent = {
-    operationId?: string;
-    operation: string;
-    playlistId?: string;
-    status: 'started' | 'progress' | 'completed' | 'cancelled' | 'error';
-    phase?: string;
-    current?: number;
-    total?: number;
-    increment?: number;
-    error?: string;
-};
+const WINDOW_MINIMIZE = 'WINDOW:MINIMIZE';
+const WINDOW_TOGGLE_MAXIMIZE = 'WINDOW:TOGGLE_MAXIMIZE';
+const WINDOW_TOGGLE_FULLSCREEN = 'WINDOW:TOGGLE_FULLSCREEN';
+const WINDOW_CLOSE = 'WINDOW:CLOSE';
+const WINDOW_GET_STATE = 'WINDOW:GET_STATE';
+const WINDOW_STATE_CHANGED = 'WINDOW:STATE_CHANGED';
+const WINDOW_SET_CLOSE_GUARD = 'WINDOW:SET_CLOSE_GUARD';
+const WINDOW_CONFIRM_CLOSE = 'WINDOW:CONFIRM_CLOSE';
+const WINDOW_CANCEL_CLOSE = 'WINDOW:CANCEL_CLOSE';
+const WINDOW_CLOSE_REQUESTED = 'WINDOW:CLOSE_REQUESTED';
+const PLAYBACK_SET_KEEP_AWAKE = 'PLAYBACK:SET_KEEP_AWAKE';
 
 const dbSaveContentProgressListeners = new Set<
-    (event: Electron.IpcRendererEvent, data: DbOperationEvent) => void
+    (
+        event: Electron.IpcRendererEvent,
+        data: ElectronBridgeDbOperationEvent
+    ) => void
 >();
 
 const shouldTraceRendererApi = isRendererApiTraceEnabled();
+const shouldCapturePerformance = isPerformanceCaptureEnabled();
+const shouldCaptureXtreamPerformance =
+    isXtreamPreloadPerformanceCaptureEnabled();
+const preloadPerformanceCapture = createPreloadPerformanceCapture(
+    shouldCapturePerformance,
+    (channel, marker) => ipcRenderer.send(channel, marker)
+);
+const xtreamPreloadPerformanceCapture = shouldCaptureXtreamPerformance
+    ? createXtreamPreloadPerformanceCapture(true, (channel, marker) =>
+          ipcRenderer.send(channel, marker)
+      )
+    : null;
 
 function emitRendererTrace(payload: {
     method: string;
@@ -69,17 +129,25 @@ function emitRendererTrace(payload: {
     ipcRenderer.send(DEBUG_TRACE_EVENT_CHANNEL, payload);
 }
 
-function wrapElectronApi<T extends Record<string, unknown>>(api: T): T {
-    if (!shouldTraceRendererApi) {
+function wrapElectronApi<T extends object>(api: T): T {
+    if (!shouldTraceRendererApi && !shouldCapturePerformance) {
         return api;
     }
 
     return Object.fromEntries(
         Object.entries(api).map(([name, value]) => {
+            const isPreloadPerformanceTarget =
+                toPreloadPerformanceTargetMethod(name) !== null;
+            const isXtreamPreloadPerformanceTarget =
+                shouldCaptureXtreamPerformance &&
+                toXtreamPreloadPerformanceTargetMethod(name) !== null;
             if (
                 typeof value !== 'function' ||
                 name.startsWith('on') ||
-                name.startsWith('remove')
+                name.startsWith('remove') ||
+                (!shouldTraceRendererApi &&
+                    !isPreloadPerformanceTarget &&
+                    !isXtreamPreloadPerformanceTarget)
             ) {
                 return [name, value];
             }
@@ -89,13 +157,23 @@ function wrapElectronApi<T extends Record<string, unknown>>(api: T): T {
             return [
                 name,
                 (...args: unknown[]) => {
-                    const startedAt =
-                        globalThis.performance?.now?.() ?? Date.now();
-                    emitRendererTrace({
-                        args: summarizeForTrace(args),
-                        method: name,
-                        phase: 'start',
-                    });
+                    const startedAt = shouldTraceRendererApi
+                        ? (globalThis.performance?.now?.() ?? Date.now())
+                        : 0;
+                    if (shouldTraceRendererApi) {
+                        emitRendererTrace({
+                            args: summarizeForTrace(args),
+                            method: name,
+                            phase: 'start',
+                        });
+                    }
+                    const performanceCall = preloadPerformanceCapture.start(
+                        name,
+                        args
+                    );
+                    const xtreamPerformanceCall =
+                        xtreamPreloadPerformanceCapture?.start(name, args) ??
+                        null;
 
                     try {
                         const result = original(...args);
@@ -107,54 +185,86 @@ function wrapElectronApi<T extends Record<string, unknown>>(api: T): T {
                         ) {
                             return (result as Promise<unknown>)
                                 .then((resolvedValue) => {
-                                    emitRendererTrace({
-                                        durationMs: roundTraceDuration(
-                                            (globalThis.performance?.now?.() ??
-                                                Date.now()) - startedAt
-                                        ),
-                                        method: name,
-                                        phase: 'success',
-                                        result: summarizeForTrace(
-                                            resolvedValue
-                                        ),
-                                    });
+                                    if (shouldTraceRendererApi) {
+                                        emitRendererTrace({
+                                            durationMs: roundTraceDuration(
+                                                (globalThis.performance?.now?.() ??
+                                                    Date.now()) - startedAt
+                                            ),
+                                            method: name,
+                                            phase: 'success',
+                                            result: summarizeForTrace(
+                                                resolvedValue
+                                            ),
+                                        });
+                                    }
+                                    preloadPerformanceCapture.success(
+                                        performanceCall,
+                                        resolvedValue
+                                    );
+                                    xtreamPreloadPerformanceCapture?.success(
+                                        xtreamPerformanceCall
+                                    );
                                     return resolvedValue;
                                 })
                                 .catch((error: unknown) => {
-                                    emitRendererTrace({
-                                        durationMs: roundTraceDuration(
-                                            (globalThis.performance?.now?.() ??
-                                                Date.now()) - startedAt
-                                        ),
-                                        error: summarizeForTrace(error),
-                                        method: name,
-                                        phase: 'error',
-                                    });
+                                    if (shouldTraceRendererApi) {
+                                        emitRendererTrace({
+                                            durationMs: roundTraceDuration(
+                                                (globalThis.performance?.now?.() ??
+                                                    Date.now()) - startedAt
+                                            ),
+                                            error: summarizeForTrace(error),
+                                            method: name,
+                                            phase: 'error',
+                                        });
+                                    }
+                                    preloadPerformanceCapture.error(
+                                        performanceCall
+                                    );
+                                    xtreamPreloadPerformanceCapture?.error(
+                                        xtreamPerformanceCall
+                                    );
                                     throw error;
                                 });
                         }
 
-                        emitRendererTrace({
-                            durationMs: roundTraceDuration(
-                                (globalThis.performance?.now?.() ??
-                                    Date.now()) - startedAt
-                            ),
-                            method: name,
-                            phase: 'success',
-                            result: summarizeForTrace(result),
-                        });
+                        if (shouldTraceRendererApi) {
+                            emitRendererTrace({
+                                durationMs: roundTraceDuration(
+                                    (globalThis.performance?.now?.() ??
+                                        Date.now()) - startedAt
+                                ),
+                                method: name,
+                                phase: 'success',
+                                result: summarizeForTrace(result),
+                            });
+                        }
+                        preloadPerformanceCapture.success(
+                            performanceCall,
+                            result
+                        );
+                        xtreamPreloadPerformanceCapture?.success(
+                            xtreamPerformanceCall
+                        );
 
                         return result;
                     } catch (error) {
-                        emitRendererTrace({
-                            durationMs: roundTraceDuration(
-                                (globalThis.performance?.now?.() ??
-                                    Date.now()) - startedAt
-                            ),
-                            error: summarizeForTrace(error),
-                            method: name,
-                            phase: 'error',
-                        });
+                        if (shouldTraceRendererApi) {
+                            emitRendererTrace({
+                                durationMs: roundTraceDuration(
+                                    (globalThis.performance?.now?.() ??
+                                        Date.now()) - startedAt
+                                ),
+                                error: summarizeForTrace(error),
+                                method: name,
+                                phase: 'error',
+                            });
+                        }
+                        preloadPerformanceCapture.error(performanceCall);
+                        xtreamPreloadPerformanceCapture?.error(
+                            xtreamPerformanceCall
+                        );
                         throw error;
                     }
                 },
@@ -163,32 +273,29 @@ function wrapElectronApi<T extends Record<string, unknown>>(api: T): T {
     ) as T;
 }
 
-const electronApi = {
+const electronApi: ElectronBridgeApi = {
     // Remote control channel change listener
     onChannelChange: (
         callback: (data: { direction: 'up' | 'down' }) => void
     ) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data);
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: { direction: 'up' | 'down' }
+        ) => callback(data);
         ipcRenderer.on('CHANNEL_CHANGE', handler);
         return () => ipcRenderer.off('CHANNEL_CHANGE', handler);
     },
     onRemoteControlCommand: (
-        callback: (data: {
-            type:
-                | 'channel-select-number'
-                | 'volume-up'
-                | 'volume-down'
-                | 'volume-toggle-mute';
-            number?: number;
-        }) => void
+        callback: (data: ElectronBridgeRemoteControlCommand) => void
     ) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data);
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: ElectronBridgeRemoteControlCommand
+        ) => callback(data);
         ipcRenderer.on('REMOTE_CONTROL_COMMAND', handler);
         return () => ipcRenderer.off('REMOTE_CONTROL_COMMAND', handler);
     },
-    updateRemoteControlStatus: (status: any) => {
+    updateRemoteControlStatus: (status: ElectronBridgeRemoteControlStatus) => {
         ipcRenderer.send('REMOTE_CONTROL_STATUS_UPDATE', status);
     },
     // Player error listener
@@ -202,26 +309,25 @@ const electronApi = {
         ipcRenderer.on('player-error', (_event, data) => callback(data));
     },
     onPortalDebugEvent: (callback: (data: PortalDebugEvent) => void) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data as PortalDebugEvent);
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: PortalDebugEvent
+        ) => callback(data);
         ipcRenderer.on(PORTAL_DEBUG_EVENT, handler);
         return () => ipcRenderer.off(PORTAL_DEBUG_EVENT, handler);
     },
     // EPG progress listener
-    onEpgProgress: (
-        callback: (data: {
-            url: string;
-            status: 'loading' | 'complete' | 'error';
-            stats?: { totalChannels: number; totalPrograms: number };
-            error?: string;
-        }) => void
-    ) => {
+    onEpgProgress: (callback: (data: ElectronBridgeEpgProgress) => void) => {
         ipcRenderer.on('EPG_PROGRESS_UPDATE', (_event, data) => callback(data));
     },
     // Playback position update listener - returns unsubscribe function
-    onPlaybackPositionUpdate: (callback: (data: any) => void) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data);
+    onPlaybackPositionUpdate: (
+        callback: (data: PlaybackPositionData) => void
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: PlaybackPositionData
+        ) => callback(data);
         ipcRenderer.on('playback-position-update', handler);
         return () => ipcRenderer.off('playback-position-update', handler);
     },
@@ -245,17 +351,23 @@ const electronApi = {
         ipcRenderer.on(EMBEDDED_MPV_SESSION_UPDATE, handler);
         return () => ipcRenderer.off(EMBEDDED_MPV_SESSION_UPDATE, handler);
     },
-    onDbOperationEvent: (callback: (data: DbOperationEvent) => void) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data as DbOperationEvent);
+    onDbOperationEvent: (
+        callback: (data: ElectronBridgeDbOperationEvent) => void
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: ElectronBridgeDbOperationEvent
+        ) => callback(data);
         ipcRenderer.on(DB_OPERATION_EVENT, handler);
         return () => ipcRenderer.off(DB_OPERATION_EVENT, handler);
     },
     onPlaylistRefreshEvent: (
         callback: (data: PlaylistRefreshEvent) => void
     ) => {
-        const handler = (_event: Electron.IpcRendererEvent, data: any) =>
-            callback(data as PlaylistRefreshEvent);
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            data: PlaylistRefreshEvent
+        ) => callback(data);
         ipcRenderer.on(PLAYLIST_REFRESH_EVENT, handler);
         return () => ipcRenderer.off(PLAYLIST_REFRESH_EVENT, handler);
     },
@@ -263,7 +375,7 @@ const electronApi = {
     onDbSaveContentProgress: (callback: (count: number) => void) => {
         const handler = (
             _event: Electron.IpcRendererEvent,
-            data: DbOperationEvent
+            data: ElectronBridgeDbOperationEvent
         ) => {
             if (
                 data.operation !== 'save-content' ||
@@ -287,11 +399,75 @@ const electronApi = {
     },
     getAppVersion: () => ipcRenderer.invoke('get-app-version'),
     platform: process.platform,
-    fetchPlaylistByUrl: (url: string, title?: string) =>
-        ipcRenderer.invoke('fetch-playlist-by-url', url, title),
+    getAppUpdateStatus: () => ipcRenderer.invoke(APP_UPDATE_GET_STATUS),
+    checkForAppUpdate: () => ipcRenderer.invoke(APP_UPDATE_CHECK),
+    downloadAppUpdate: () => ipcRenderer.invoke(APP_UPDATE_DOWNLOAD),
+    installAppUpdate: () => ipcRenderer.invoke(APP_UPDATE_INSTALL),
+    getAppUpdateReleaseNotes: (
+        request?: ElectronBridgeAppUpdateReleaseNotesRequest
+    ) => ipcRenderer.invoke(APP_UPDATE_GET_RELEASE_NOTES, request),
+    onAppUpdateStatusChange: (
+        callback: (status: ElectronBridgeAppUpdateStatus) => void
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            status: ElectronBridgeAppUpdateStatus
+        ) => callback(status);
+        ipcRenderer.on(APP_UPDATE_STATUS_CHANGED, handler);
+        return () => ipcRenderer.off(APP_UPDATE_STATUS_CHANGED, handler);
+    },
+    minimizeWindow: () => ipcRenderer.invoke(WINDOW_MINIMIZE),
+    toggleMaximizeWindow: () => ipcRenderer.invoke(WINDOW_TOGGLE_MAXIMIZE),
+    toggleFullScreenWindow: () => ipcRenderer.invoke(WINDOW_TOGGLE_FULLSCREEN),
+    closeWindow: () => ipcRenderer.invoke(WINDOW_CLOSE),
+    getWindowState: () => ipcRenderer.invoke(WINDOW_GET_STATE),
+    onWindowStateChange: (
+        callback: (state: ElectronBridgeWindowState) => void
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            state: ElectronBridgeWindowState
+        ) => callback(state);
+        ipcRenderer.on(WINDOW_STATE_CHANGED, handler);
+        return () => ipcRenderer.off(WINDOW_STATE_CHANGED, handler);
+    },
+    setWindowCloseGuard: (active: boolean) =>
+        ipcRenderer.invoke(WINDOW_SET_CLOSE_GUARD, active),
+    confirmWindowClose: () => ipcRenderer.invoke(WINDOW_CONFIRM_CLOSE),
+    cancelWindowClose: (requestId?: number) =>
+        ipcRenderer.invoke(WINDOW_CANCEL_CLOSE, requestId),
+    onWindowCloseRequested: (callback: (requestId: number) => void) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            requestId: number
+        ) => callback(requestId);
+        ipcRenderer.on(WINDOW_CLOSE_REQUESTED, handler);
+        return () => ipcRenderer.off(WINDOW_CLOSE_REQUESTED, handler);
+    },
+    setPlaybackKeepAwake: (active: boolean) =>
+        ipcRenderer.invoke(PLAYBACK_SET_KEEP_AWAKE, active === true),
+    fetchPlaylistByUrl: (
+        url: string,
+        title?: string,
+        options?: ElectronBridgePlaylistFetchOptions
+    ) => ipcRenderer.invoke('fetch-playlist-by-url', url, title, options),
     updatePlaylistFromFilePath: (filePath: string, title: string) =>
         ipcRenderer.invoke('update-playlist-from-file-path', filePath, title),
     openPlaylistFromFile: () => ipcRenderer.invoke('open-playlist-from-file'),
+    onPlaylistOpenRequest: (
+        callback: (request: ElectronBridgePlaylistOpenRequest) => void
+    ) => {
+        const handler = (
+            _event: Electron.IpcRendererEvent,
+            request: ElectronBridgePlaylistOpenRequest
+        ) => callback(request);
+        ipcRenderer.on(OPEN_FILE, handler);
+        return () => ipcRenderer.off(OPEN_FILE, handler);
+    },
+    announcePlaylistOpenListener: () =>
+        ipcRenderer.invoke(ANNOUNCE_PLAYLIST_OPEN_LISTENER),
+    acknowledgePlaylistOpenRequest: (requestId: string) =>
+        ipcRenderer.invoke(ACKNOWLEDGE_PLAYLIST_OPEN_REQUEST, requestId),
     getPathForFile: (file: File) => webUtils.getPathForFile(file),
     saveFileDialog: (
         defaultPath: string,
@@ -299,16 +475,30 @@ const electronApi = {
     ) => ipcRenderer.invoke('save-file-dialog', defaultPath, filters),
     writeFile: (filePath: string, content: string) =>
         ipcRenderer.invoke('write-file', filePath, content),
-    setUserAgent: (userAgent: string, referer?: string) =>
-        ipcRenderer.invoke('set-user-agent', userAgent, referer),
+    setUserAgent: (
+        userAgent?: string | null,
+        referer?: string | null,
+        scopeUrl?: string | null,
+        credentials?: {
+            authorization?: string | null;
+            cookie?: string | null;
+        } | null
+    ) =>
+        ipcRenderer.invoke(
+            'set-user-agent',
+            userAgent,
+            referer,
+            scopeUrl,
+            credentials
+        ),
     openInMpv: (
         url: string,
         title: string,
         thumbnail: string,
-        userAgent: string,
+        userAgent: string | undefined,
         referer?: string,
         origin?: string,
-        contentInfo?: any,
+        contentInfo?: PlayerContentInfo,
         startTime?: number,
         headers?: Record<string, string>
     ): Promise<ExternalPlayerSession> =>
@@ -328,10 +518,10 @@ const electronApi = {
         url: string,
         title: string,
         thumbnail: string,
-        userAgent: string,
+        userAgent: string | undefined,
         referer?: string,
         origin?: string,
-        contentInfo?: any,
+        contentInfo?: PlayerContentInfo,
         startTime?: number,
         headers?: Record<string, string>
     ): Promise<ExternalPlayerSession> =>
@@ -384,6 +574,11 @@ const electronApi = {
         seconds: number
     ): Promise<EmbeddedMpvSession | null> =>
         ipcRenderer.invoke('EMBEDDED_MPV_SEEK', sessionId, seconds),
+    seekEmbeddedMpvBy: (
+        sessionId: string,
+        deltaSeconds: number
+    ): Promise<EmbeddedMpvSession | null> =>
+        ipcRenderer.invoke('EMBEDDED_MPV_SEEK_BY', sessionId, deltaSeconds),
     setEmbeddedMpvVolume: (
         sessionId: string,
         volume: number
@@ -403,6 +598,27 @@ const electronApi = {
             sessionId,
             trackId
         ),
+    addEmbeddedMpvSubtitle: (
+        sessionId: string,
+        filePath: string
+    ): Promise<EmbeddedMpvSession | null> =>
+        ipcRenderer.invoke('EMBEDDED_MPV_ADD_SUBTITLE', sessionId, filePath),
+    setEmbeddedMpvSubtitleDelay: (
+        sessionId: string,
+        seconds: number
+    ): Promise<EmbeddedMpvSession | null> =>
+        ipcRenderer.invoke(
+            'EMBEDDED_MPV_SET_SUBTITLE_DELAY',
+            sessionId,
+            seconds
+        ),
+    setEmbeddedMpvSubtitleStyle: (
+        sessionId: string,
+        style: EmbeddedMpvSubtitleStyle
+    ): Promise<EmbeddedMpvSession | null> =>
+        ipcRenderer.invoke('EMBEDDED_MPV_SET_SUBTITLE_STYLE', sessionId, style),
+    selectEmbeddedMpvSubtitleFile: (): Promise<string | null> =>
+        ipcRenderer.invoke('EMBEDDED_MPV_SELECT_SUBTITLE_FILE'),
     setEmbeddedMpvSpeed: (
         sessionId: string,
         speed: number
@@ -430,30 +646,71 @@ const electronApi = {
         sessionId: string
     ): Promise<EmbeddedMpvSession | null> =>
         ipcRenderer.invoke('EMBEDDED_MPV_DISPOSE_SESSION', sessionId),
-    autoUpdatePlaylists: (playlists) =>
-        ipcRenderer.invoke('AUTO_UPDATE', playlists),
-    fetchEpg: (urls: string[]) =>
-        ipcRenderer.invoke('FETCH_EPG', { url: urls }),
-    getChannelPrograms: (channelId: string) =>
-        ipcRenderer.invoke('GET_CHANNEL_PROGRAMS', { channelId }),
-    getCurrentProgramsBatch: (channelIds: string[]) =>
-        ipcRenderer.invoke('GET_CURRENT_PROGRAMS_BATCH', { channelIds }),
-    getEpgChannelMetadata: (channelIds: string[]) =>
-        ipcRenderer.invoke('EPG_GET_CHANNEL_METADATA', { channelIds }),
+    attachEmbeddedMpvFrameView: (sessionId: string): Promise<boolean> =>
+        attachEmbeddedMpvFrameView(sessionId),
+    detachEmbeddedMpvFrameView: (): void => detachEmbeddedMpvFrameView(),
+    autoUpdatePlaylists: (
+        playlists: Playlist[],
+        options?: ElectronBridgeTrustOptions
+    ) => ipcRenderer.invoke('AUTO_UPDATE', playlists, options),
+    fetchEpg: (urls: string[], options?: ElectronBridgeTrustOptions) =>
+        ipcRenderer.invoke('FETCH_EPG', { url: urls, options }),
+    getChannelPrograms: (
+        channelId: string,
+        options?: ElectronBridgeEpgLookupOptions
+    ) => ipcRenderer.invoke('GET_CHANNEL_PROGRAMS', { channelId, options }),
+    getCurrentProgramsBatch: (
+        channelIds: string[],
+        options?: ElectronBridgeCurrentProgramsOptions
+    ) =>
+        ipcRenderer.invoke('GET_CURRENT_PROGRAMS_BATCH', {
+            channelIds,
+            options,
+        }),
+    getEpgChannelMetadata: (
+        channelIds: string[],
+        options?: ElectronBridgeEpgLookupOptions
+    ) =>
+        ipcRenderer.invoke('EPG_GET_CHANNEL_METADATA', { channelIds, options }),
     getEpgChannels: () => ipcRenderer.invoke('EPG_GET_CHANNELS'),
-    getEpgChannelsByRange: (skip: number, limit: number) =>
-        ipcRenderer.invoke('EPG_GET_CHANNELS_BY_RANGE', { skip, limit }),
-    forceFetchEpg: (url: string) => ipcRenderer.invoke('EPG_FORCE_FETCH', url),
+    getEpgProgramsForChannels: (window: ElectronBridgeEpgGuideWindow) =>
+        ipcRenderer.invoke('EPG_GET_PROGRAMS_FOR_CHANNELS', window),
+    getEpgProgramCoverage: (window: ElectronBridgeEpgGuideWindow) =>
+        ipcRenderer.invoke('EPG_GET_PROGRAM_COVERAGE', window),
+    forceFetchEpg: (url: string, options?: ElectronBridgeTrustOptions) =>
+        ipcRenderer.invoke('EPG_FORCE_FETCH', { url, options }),
     clearEpgData: () => ipcRenderer.invoke('EPG_CLEAR_ALL'),
+    reconcileEpgSources: (urls: string[]) =>
+        ipcRenderer.invoke('EPG_RECONCILE_SOURCES', { urls }),
+    clearEpgDataForSource: (sourceUrl: string) =>
+        ipcRenderer.invoke('EPG_CLEAR_SOURCE', { sourceUrl }),
     checkEpgFreshness: (urls: string[], maxAgeHours?: number) =>
         ipcRenderer.invoke('EPG_CHECK_FRESHNESS', { urls, maxAgeHours }),
     searchEpgPrograms: (searchTerm: string, limit?: number) =>
         ipcRenderer.invoke('EPG_DB_SEARCH_PROGRAMS', searchTerm, limit),
+    getEpgMapping: (channelKey: string) =>
+        ipcRenderer.invoke('EPG_MAPPING_GET', { channelKey }),
+    getEpgMappingsBatch: (channelKeys: string[]) =>
+        ipcRenderer.invoke('EPG_MAPPING_GET_BATCH', { channelKeys }),
+    setEpgMapping: (
+        channelKey: string,
+        epgChannelId: string,
+        playlistId?: string
+    ) =>
+        ipcRenderer.invoke('EPG_MAPPING_SET', {
+            channelKey,
+            epgChannelId,
+            playlistId,
+        }),
+    deleteEpgMapping: (channelKey: string) =>
+        ipcRenderer.invoke('EPG_MAPPING_DELETE', { channelKey }),
+    searchEpgChannels: (searchTerm: string, limit?: number) =>
+        ipcRenderer.invoke('EPG_CHANNEL_SEARCH', { searchTerm, limit }),
     setMpvPlayerPath: (mpvPlayerPath: string) =>
         ipcRenderer.invoke('SET_MPV_PLAYER_PATH', mpvPlayerPath),
     setVlcPlayerPath: (vlcPlayerPath: string) =>
         ipcRenderer.invoke('SET_VLC_PLAYER_PATH', vlcPlayerPath),
-    updateSettings: (settings: any) =>
+    updateSettings: (settings: Partial<Settings>) =>
         ipcRenderer.invoke('SETTINGS_UPDATE', settings),
     getAiSettings: () => ipcRenderer.invoke('GET_AI_SETTINGS'),
     stalkerRequest: (payload: {
@@ -463,7 +720,10 @@ const electronApi = {
         token?: string;
         serialNumber?: string;
         requestId?: string;
+        skipConnectionGuard?: boolean;
     }) => ipcRenderer.invoke('STALKER_REQUEST', payload),
+    resetHostConnectivityGuard: (url: string) =>
+        ipcRenderer.invoke('CONNECTIVITY_GUARD_RESET', { url }),
     xtreamRequest: (payload: {
         url: string;
         params: Record<string, string>;
@@ -475,24 +735,50 @@ const electronApi = {
         ipcRenderer.invoke('XTREAM_CANCEL_SESSION', sessionId),
     xtreamProbeUrl: (url: string, method?: 'GET' | 'HEAD') =>
         ipcRenderer.invoke('XTREAM_PROBE_URL', { url, method }),
+    probeStreamUrl: (
+        url: string,
+        method?: 'GET' | 'HEAD',
+        headers?: StreamProbeHeaders
+    ) => ipcRenderer.invoke('STREAM_PROBE_URL', { url, method, ...headers }),
     refreshPlaylist: (payload: PlaylistRefreshPayload) =>
         ipcRenderer.invoke('PLAYLIST:REFRESH', payload),
     cancelPlaylistRefresh: (operationId: string) =>
         ipcRenderer.invoke('PLAYLIST:CANCEL_REFRESH', operationId),
     // Database operations
-    dbCreatePlaylist: (playlist: any) =>
+    dbCreatePlaylist: (playlist: ElectronBridgePlaylistUpsertInput) =>
         ipcRenderer.invoke('DB_CREATE_PLAYLIST', playlist),
     dbGetPlaylist: (playlistId: string) =>
         ipcRenderer.invoke('DB_GET_PLAYLIST', playlistId),
-    dbUpsertAppPlaylist: (playlist: any) =>
+    dbSetPlaylistServerTimezone: (
+        playlistId: string,
+        connection: { serverUrl: string; username: string; password: string },
+        serverTimezone: string
+    ) =>
+        ipcRenderer.invoke(
+            'DB_SET_PLAYLIST_SERVER_TIMEZONE',
+            playlistId,
+            connection,
+            serverTimezone
+        ),
+    dbUpsertAppPlaylist: (playlist: Playlist, _operationId?: string) =>
         ipcRenderer.invoke('DB_UPSERT_APP_PLAYLIST', playlist),
-    dbUpsertAppPlaylists: (playlists: any[]) =>
+    dbMigrateAppPlaylists: (playlists: Playlist[]) =>
+        ipcRenderer.invoke('DB_MIGRATE_APP_PLAYLISTS', playlists),
+    dbRecoverLegacyPlaylists: () =>
+        ipcRenderer.invoke('DB_RECOVER_LEGACY_PLAYLISTS'),
+    dbUpsertAppPlaylists: (playlists: Playlist[]) =>
         ipcRenderer.invoke('DB_UPSERT_APP_PLAYLISTS', playlists),
     dbGetAppPlaylists: () => ipcRenderer.invoke('DB_GET_APP_PLAYLISTS'),
-    dbGetAppPlaylist: (playlistId: string) =>
+    dbGetAppPlaylistMetas: () =>
+        ipcRenderer.invoke('DB_GET_APP_PLAYLIST_METAS'),
+    dbGetAppPlaylist: (playlistId: string, _operationId?: string) =>
         ipcRenderer.invoke('DB_GET_APP_PLAYLIST', playlistId),
-    dbUpdatePlaylist: (playlistId: string, updates: any) =>
-        ipcRenderer.invoke('DB_UPDATE_PLAYLIST', playlistId, updates),
+    dbGetAppPlaylistFavoriteChannels: (playlistId: string) =>
+        ipcRenderer.invoke('DB_GET_APP_PLAYLIST_FAVORITE_CHANNELS', playlistId),
+    dbUpdatePlaylist: (
+        playlistId: string,
+        updates: Partial<Playlist> | ElectronBridgePlaylistInput
+    ) => ipcRenderer.invoke('DB_UPDATE_PLAYLIST', playlistId, updates),
     dbDeletePlaylist: (playlistId: string, operationId?: string) =>
         ipcRenderer.invoke('DB_DELETE_PLAYLIST', playlistId, operationId),
     dbDeleteXtreamContent: (playlistId: string, operationId?: string) =>
@@ -541,7 +827,7 @@ const electronApi = {
         ipcRenderer.invoke('DB_GET_CONTENT', playlistId, type),
     dbSaveContent: (
         playlistId: string,
-        streams: any[],
+        streams: ElectronBridgeXtreamContentStream[],
         type: string,
         operationId?: string
     ) =>
@@ -572,23 +858,33 @@ const electronApi = {
     dbGlobalSearch: (
         searchTerm: string,
         types: string[],
-        excludeHidden?: boolean
-    ) =>
-        ipcRenderer.invoke(
+        excludeHidden?: boolean,
+        sources?: GlobalSearchResultSource[],
+        options?: GlobalSearchPaginationOptions
+    ) => {
+        if (sources?.length || options) {
+            return ipcRenderer.invoke(
+                'DB_GLOBAL_SEARCH',
+                searchTerm,
+                types,
+                excludeHidden,
+                sources,
+                options
+            );
+        }
+
+        return ipcRenderer.invoke(
             'DB_GLOBAL_SEARCH',
             searchTerm,
             types,
             excludeHidden
-        ),
+        );
+    },
     dbGetGlobalRecentlyAdded: (
         kind: 'all' | 'vod' | 'series',
         limit?: number,
         playlistType?:
-            | 'xtream'
-            | 'stalker'
-            | 'm3u-file'
-            | 'm3u-text'
-            | 'm3u-url'
+            'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url'
     ) =>
         ipcRenderer.invoke(
             'DB_GET_GLOBAL_RECENTLY_ADDED',
@@ -620,7 +916,7 @@ const electronApi = {
     dbGetAllGlobalFavorites: () =>
         ipcRenderer.invoke('DB_GET_ALL_GLOBAL_FAVORITES'),
     dbReorderGlobalFavorites: (
-        updates: { content_id: number; position: number }[]
+        updates: { content_id: number; playlist_id: string; position: number }[]
     ) => ipcRenderer.invoke('DB_REORDER_GLOBAL_FAVORITES', updates),
     // Recently viewed (playlist-specific)
     dbGetRecentItems: (playlistId: string) =>
@@ -654,11 +950,14 @@ const electronApi = {
             playlistId,
             contentType
         ),
-    dbSetContentBackdropIfMissing: (contentId: number, backdropUrl?: string) =>
+    dbSetContentMetadataIfMissing: (
+        contentId: number,
+        patch?: ContentMetadataPatch
+    ) =>
         ipcRenderer.invoke(
-            'DB_SET_CONTENT_BACKDROP_IF_MISSING',
+            'DB_SET_CONTENT_METADATA_IF_MISSING',
             contentId,
-            backdropUrl
+            patch
         ),
     dbDeleteAllPlaylists: (operationId?: string) =>
         ipcRenderer.invoke('DB_DELETE_ALL_PLAYLISTS', operationId),
@@ -667,9 +966,56 @@ const electronApi = {
     dbGetAppState: (key: string) => ipcRenderer.invoke('DB_GET_APP_STATE', key),
     dbSetAppState: (key: string, value: string) =>
         ipcRenderer.invoke('DB_SET_APP_STATE', key, value),
+    // TMDB metadata cache
+    dbGetTmdbMetadata: (
+        mediaType: TmdbCacheMediaType,
+        lookupKey: string,
+        language: string
+    ) =>
+        ipcRenderer.invoke(
+            'DB_GET_TMDB_METADATA',
+            mediaType,
+            lookupKey,
+            language
+        ),
+    dbSetTmdbMetadata: (entry: TmdbCacheEntry) =>
+        ipcRenderer.invoke('DB_SET_TMDB_METADATA', entry),
+    dbGetTmdbCacheStats: () => ipcRenderer.invoke('DB_GET_TMDB_CACHE_STATS'),
+    dbClearTmdbMetadata: () => ipcRenderer.invoke('DB_CLEAR_TMDB_METADATA'),
+    dbMatchTitles: (titles: string[]) =>
+        ipcRenderer.invoke('DB_MATCH_TITLES', titles),
+    // VOD multi-source
+    dbFindTitleSources: (request: {
+        title: string;
+        year?: number | null;
+        excludePlaylistId?: string | null;
+    }) => ipcRenderer.invoke('DB_FIND_TITLE_SOURCES', request),
+    dbGetVodSourcePin: (matchKeys: string[]) =>
+        ipcRenderer.invoke('DB_GET_VOD_SOURCE_PIN', matchKeys),
+    dbListVodSourcePins: (playlistId: string) =>
+        ipcRenderer.invoke('DB_LIST_VOD_SOURCE_PINS', playlistId),
+    dbClearVodSourcePinsForPlaylist: (playlistId: string) =>
+        ipcRenderer.invoke('DB_CLEAR_VOD_SOURCE_PINS_FOR_PLAYLIST', playlistId),
+    dbSetVodSourcePin: (
+        pin: VodSourcePin,
+        retireKeys?: string[],
+        aliasKeys?: string[]
+    ) =>
+        ipcRenderer.invoke(
+            'DB_SET_VOD_SOURCE_PIN',
+            pin,
+            retireKeys ?? [],
+            aliasKeys ?? []
+        ),
+    dbReplaceVodSourcePins: (playlistId: string, pins: VodSourcePin[]) =>
+        ipcRenderer.invoke('DB_REPLACE_VOD_SOURCE_PINS', playlistId, pins),
+    dbClearVodSourcePin: (matchKeys: string[]) =>
+        ipcRenderer.invoke('DB_CLEAR_VOD_SOURCE_PIN', matchKeys),
     // Playback Positions
-    dbSavePlaybackPosition: (playlistId: string, data: any) =>
-        ipcRenderer.invoke('DB_SAVE_PLAYBACK_POSITION', playlistId, data),
+    dbSavePlaybackPosition: (
+        playlistId: string,
+        data: ElectronBridgePlaybackPositionInput
+    ) => ipcRenderer.invoke('DB_SAVE_PLAYBACK_POSITION', playlistId, data),
     dbGetPlaybackPosition: (
         playlistId: string,
         contentXtreamId: number,
@@ -711,42 +1057,53 @@ const electronApi = {
             contentXtreamId,
             contentType
         ),
+    dbSavePlaybackPositionsBatch: (
+        playlistId: string,
+        items: ElectronBridgePlaybackPositionInput[]
+    ) =>
+        ipcRenderer.invoke(
+            'DB_SAVE_PLAYBACK_POSITIONS_BATCH',
+            playlistId,
+            items
+        ),
+    dbClearPlaybackPositionsBatch: (
+        playlistId: string,
+        items: { contentXtreamId: number; contentType: 'vod' | 'episode' }[]
+    ) =>
+        ipcRenderer.invoke(
+            'DB_CLEAR_PLAYBACK_POSITIONS_BATCH',
+            playlistId,
+            items
+        ),
     getLocalIpAddresses: () => ipcRenderer.invoke('get-local-ip-addresses'),
     // Downloads
-    downloadsStart: (data: {
-        playlistId: string;
-        xtreamId: number;
-        contentType: 'vod' | 'episode';
-        title: string;
-        url: string;
-        posterUrl?: string;
-        downloadFolder: string;
-        headers?: { userAgent?: string; referer?: string; origin?: string };
-        seriesXtreamId?: number;
-        seasonNumber?: number;
-        episodeNumber?: number;
-        // Playlist info for auto-creation if needed
-        playlistName?: string;
-        playlistType?:
-            | 'xtream'
-            | 'stalker'
-            | 'm3u-file'
-            | 'm3u-text'
-            | 'm3u-url';
-        serverUrl?: string;
-        portalUrl?: string;
-        macAddress?: string;
-    }) => ipcRenderer.invoke('DOWNLOADS_START', data),
+    downloadsStart: (data: ElectronBridgeDownloadStartPayload) =>
+        ipcRenderer.invoke('DOWNLOADS_START', data),
     downloadsCancel: (downloadId: number) =>
         ipcRenderer.invoke('DOWNLOADS_CANCEL', downloadId),
+    downloadsPause: (downloadId: number) =>
+        ipcRenderer.invoke('DOWNLOADS_PAUSE', downloadId),
+    downloadsResume: (downloadId: number, downloadFolder: string) =>
+        ipcRenderer.invoke('DOWNLOADS_RESUME', downloadId, downloadFolder),
     downloadsRetry: (downloadId: number, downloadFolder: string) =>
         ipcRenderer.invoke('DOWNLOADS_RETRY', downloadId, downloadFolder),
+    downloadsRedownloadMissing: (downloadId: number) =>
+        ipcRenderer.invoke('DOWNLOADS_REDOWNLOAD_MISSING', downloadId),
     downloadsRemove: (downloadId: number) =>
         ipcRenderer.invoke('DOWNLOADS_REMOVE', downloadId),
     downloadsGetList: (playlistId?: string) =>
         ipcRenderer.invoke('DOWNLOADS_GET_LIST', playlistId),
     downloadsGet: (downloadId: number) =>
         ipcRenderer.invoke('DOWNLOADS_GET', downloadId),
+    downloadsUpdateMetadata: (
+        downloadId: number,
+        metadataSnapshot: DownloadMetadataSnapshot
+    ) =>
+        ipcRenderer.invoke(
+            'DOWNLOADS_UPDATE_METADATA',
+            downloadId,
+            metadataSnapshot
+        ),
     downloadsGetDefaultFolder: () =>
         ipcRenderer.invoke('DOWNLOADS_GET_DEFAULT_FOLDER'),
     downloadsSelectFolder: () => ipcRenderer.invoke('DOWNLOADS_SELECT_FOLDER'),
@@ -760,6 +1117,28 @@ const electronApi = {
         const handler = () => callback();
         ipcRenderer.on('DOWNLOADS_UPDATE_EVENT', handler);
         return () => ipcRenderer.off('DOWNLOADS_UPDATE_EVENT', handler);
+    },
+    // Live-TV recordings
+    recordingsGetList: (playlistId?: string) =>
+        ipcRenderer.invoke('RECORDINGS_GET_LIST', playlistId),
+    recordingsGet: (recordingId: number) =>
+        ipcRenderer.invoke('RECORDINGS_GET', recordingId),
+    recordingsStop: (recordingId: number) =>
+        ipcRenderer.invoke('RECORDINGS_STOP', recordingId),
+    recordingsRemove: (recordingId: number) =>
+        ipcRenderer.invoke('RECORDINGS_REMOVE', recordingId),
+    recordingsUpdatePrograms: (
+        targetPath: string,
+        programs: RecordingProgramSnapshot[]
+    ) => ipcRenderer.invoke('RECORDINGS_UPDATE_PROGRAMS', targetPath, programs),
+    recordingsRevealFile: (filePath: string) =>
+        ipcRenderer.invoke('RECORDINGS_REVEAL_FILE', filePath),
+    recordingsPlayFile: (filePath: string) =>
+        ipcRenderer.invoke('RECORDINGS_PLAY_FILE', filePath),
+    onRecordingsUpdate: (callback: () => void) => {
+        const handler = () => callback();
+        ipcRenderer.on('RECORDINGS_UPDATE_EVENT', handler);
+        return () => ipcRenderer.off('RECORDINGS_UPDATE_EVENT', handler);
     },
 };
 

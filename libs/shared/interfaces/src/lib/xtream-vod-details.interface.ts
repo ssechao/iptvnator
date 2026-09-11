@@ -1,3 +1,10 @@
+import {
+    TmdbCountryFacet,
+    TmdbEnrichedCastMember,
+    TmdbGenreFacet,
+    TmdbRecommendation,
+} from './tmdb.interface';
+
 export interface XtreamVodInfo {
     kinopoisk_url: string;
     tmdb_id: number | string;
@@ -6,6 +13,18 @@ export interface XtreamVodInfo {
     cover_big: string;
     movie_image: string;
     releasedate: string;
+    /**
+     * Set by TMDB enrichment when it filled `releasedate` itself because the
+     * provider sent none. Absent in raw provider responses, and absent after
+     * a merge that kept the provider's own date.
+     *
+     * The merge substitutes silently, so afterwards the field alone cannot
+     * say who stated the date. Anything recording it as a PROVIDER fact —
+     * `content.release_year`, and the exclusion index's `trustedReleaseYear`
+     * — must read this first, or an inferred year ends up gating decisions
+     * that are only sound on a stated one.
+     */
+    tmdb_supplied_release_date?: boolean;
     episode_run_time: number;
     youtube_trailer: string;
     director: string;
@@ -29,6 +48,15 @@ export interface XtreamVodInfo {
     status?: string;
     rating_kinopoisk?: string;
     rating_imdb?: string;
+    /** Populated by TMDB enrichment; absent in raw provider responses */
+    tmdb_cast?: TmdbEnrichedCastMember[];
+    /** Directors (movies) / creators (series) as clickable person chips */
+    tmdb_directors?: TmdbEnrichedCastMember[];
+    /** Populated by TMDB enrichment; matched against the catalog in views */
+    tmdb_recommendations?: TmdbRecommendation[];
+    /** Populated by TMDB enrichment; per-entry clickable Discover chips */
+    tmdb_genres?: TmdbGenreFacet[];
+    tmdb_countries?: TmdbCountryFacet[];
 }
 
 export interface XtreamVodMovieData {

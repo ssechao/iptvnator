@@ -17,13 +17,38 @@ import { DialogService } from '@iptvnator/ui/components';
 import {
     DatabaseService,
     DataService,
+    DbOperationEvent,
     PlaybackPositionService,
+    PlaylistDeleteActionService,
+    PlaylistRefreshService,
+    RuntimeCapabilitiesService,
     SortBy,
     SortOrder,
     SortService,
 } from '@iptvnator/services';
-import { PLAYLIST_UPDATE, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    CONNECTIVITY_GUARD_RESET,
+    PLAYLIST_UPDATE,
+    PlaylistMeta,
+} from '@iptvnator/shared/interfaces';
+import {
+    RENDERER_PERFORMANCE_PHASE_HOOK_KEY,
+    type RendererPerformancePhaseEvent,
+} from '@iptvnator/shared/logging';
 import { RecentPlaylistsComponent } from './recent-playlists.component';
+
+const performanceHookSymbol = Symbol.for(RENDERER_PERFORMANCE_PHASE_HOOK_KEY);
+
+function setPerformanceHook(
+    hook: ((event: RendererPerformancePhaseEvent) => void) | null
+): void {
+    const target = globalThis as unknown as Record<symbol, unknown>;
+    if (hook === null) {
+        delete target[performanceHookSymbol];
+    } else {
+        target[performanceHookSymbol] = hook;
+    }
+}
 
 function createDeferred<T>() {
     let resolve!: (value: T) => void;
@@ -76,6 +101,18 @@ describe('RecentPlaylistsComponent busy state', () => {
     let playbackPositionService: {
         getAllPlaybackPositions: jest.Mock;
     };
+    let playlistDeleteAction: {
+        deletePlaylist: jest.Mock;
+    };
+    let playlistRefreshService: {
+        cancelRefresh: jest.Mock;
+        refreshPlaylist: jest.Mock;
+    };
+    let runtime: {
+        isElectron: boolean;
+        supportsPlaylistRefresh: boolean;
+        supportsXtreamSqliteDataSource: boolean;
+    };
     let router: {
         navigate: jest.Mock;
     };
@@ -100,6 +137,21 @@ describe('RecentPlaylistsComponent busy state', () => {
         };
         playbackPositionService = {
             getAllPlaybackPositions: jest.fn().mockResolvedValue([]),
+        };
+        playlistDeleteAction = {
+            deletePlaylist: jest.fn().mockResolvedValue(true),
+        };
+        playlistRefreshService = {
+            cancelRefresh: jest.fn().mockResolvedValue(undefined),
+            refreshPlaylist: jest.fn().mockResolvedValue({
+                id: 'playlist-1',
+                items: [],
+            }),
+        };
+        runtime = {
+            isElectron: true,
+            supportsPlaylistRefresh: true,
+            supportsXtreamSqliteDataSource: true,
         };
         router = {
             navigate: jest.fn(),
@@ -138,6 +190,18 @@ describe('RecentPlaylistsComponent busy state', () => {
                 {
                     provide: PlaybackPositionService,
                     useValue: playbackPositionService,
+                },
+                {
+                    provide: PlaylistDeleteActionService,
+                    useValue: playlistDeleteAction,
+                },
+                {
+                    provide: PlaylistRefreshService,
+                    useValue: playlistRefreshService,
+                },
+                {
+                    provide: RuntimeCapabilitiesService,
+                    useValue: runtime,
                 },
                 {
                     provide: PlaylistContextFacade,
@@ -190,20 +254,22 @@ describe('RecentPlaylistsComponent busy state', () => {
     });
 
     afterEach(() => {
+        setPerformanceHook(null);
         jest.restoreAllMocks();
         localStorage.clear();
     });
 
     it('tracks delete progress and clears the busy row after completion', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => events.push(event));
         const item = createPlaylistMeta({ _id: 'playlist-delete-1' });
         const deletion = createDeferred<boolean>();
 
-        databaseService.deletePlaylist.mockImplementation(
+        playlistDeleteAction.deletePlaylist.mockImplementation(
             (
-                _playlistId: string,
+                _playlist: PlaylistMeta,
                 options?: {
-                    onEvent?: (event: any) => void;
-                    operationId?: string;
+                    onEvent?: (event: DbOperationEvent) => void;
                 }
             ) => {
                 options?.onEvent?.({
@@ -226,6 +292,9 @@ describe('RecentPlaylistsComponent busy state', () => {
         );
         expect(component.getBusyProgress(item._id)).toBe(25);
         expect(component.canCancelBusyOperation(item)).toBe(true);
+        expect(playlistDeleteAction.deletePlaylist).toHaveBeenCalledWith(item, {
+            onEvent: expect.any(Function),
+        });
 
         await component.cancelBusyOperation(item);
         expect(databaseService.cancelOperation).toHaveBeenCalledWith(
@@ -245,6 +314,92 @@ describe('RecentPlaylistsComponent busy state', () => {
             undefined,
             { duration: 2000 }
         );
+        expect(
+            events.map(({ boundary, metadata, outcome, phase }) => ({
+                boundary,
+                items: metadata?.items,
+                outcome,
+                phase,
+            }))
+        ).toEqual([
+            {
+                boundary: 'start',
+                items: 1,
+                outcome: undefined,
+                phase: 'store.xtream-delete-row',
+            },
+            {
+                boundary: 'end',
+                items: 1,
+                outcome: 'success',
+                phase: 'store.xtream-delete-row',
+            },
+        ]);
+    });
+
+    it('delegates playlist deletion and updates local UI state after success', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => events.push(event));
+        const item = createPlaylistMeta({
+            _id: 'pwa-playlist-1',
+            serverUrl: undefined,
+            username: undefined,
+            password: undefined,
+            url: 'https://example.com/playlist.m3u',
+        });
+        playlistDeleteAction.deletePlaylist.mockResolvedValue(true);
+
+        await component.removePlaylist(item);
+
+        expect(playlistDeleteAction.deletePlaylist).toHaveBeenCalledWith(item, {
+            onEvent: expect.any(Function),
+        });
+        expect(databaseService.deletePlaylist).not.toHaveBeenCalled();
+        expect(store.dispatch).toHaveBeenCalledWith(
+            PlaylistActions.removePlaylist({ playlistId: item._id })
+        );
+        expect(snackBar.open).toHaveBeenCalledWith(
+            'HOME.PLAYLISTS.REMOVE_DIALOG.SUCCESS',
+            undefined,
+            { duration: 2000 }
+        );
+        expect(events).toEqual([]);
+    });
+
+    it('records dispatch failure and still clears delete-row busy state', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        const item = createPlaylistMeta({ _id: 'dispatch-failure' });
+        const dispatchError = new Error('dispatch failed');
+        setPerformanceHook((event) => events.push(event));
+        (store.dispatch as jest.Mock).mockImplementation(() => {
+            throw dispatchError;
+        });
+
+        await expect(component.removePlaylist(item)).rejects.toBe(
+            dispatchError
+        );
+
+        expect(component.isDeletePending(item._id)).toBe(false);
+        expect(component.getBusyProgress(item._id)).toBeNull();
+        expect(snackBar.open).not.toHaveBeenCalled();
+        expect(
+            events.map(({ boundary, outcome, phase }) => ({
+                boundary,
+                outcome,
+                phase,
+            }))
+        ).toEqual([
+            {
+                boundary: 'start',
+                outcome: undefined,
+                phase: 'store.xtream-delete-row',
+            },
+            {
+                boundary: 'end',
+                outcome: 'error',
+                phase: 'store.xtream-delete-row',
+            },
+        ]);
     });
 
     it('tracks Xtream refresh progress and clears the busy row after abort', async () => {
@@ -263,6 +418,12 @@ describe('RecentPlaylistsComponent busy state', () => {
             }>;
         }>();
         let confirmPromise: Promise<void> | undefined;
+        // The shared flow awaits the connectivity-guard reset before it starts
+        // deleting, so the delete is several ticks away and counting them is
+        // fragile. The mock fires onEvent synchronously and the component
+        // applies it synchronously, so resolving this deferred inside the mock
+        // is a deterministic "the busy row has been updated" signal.
+        const workerEventDelivered = createDeferred<void>();
 
         dialogService.openConfirmDialog.mockImplementation(
             ({ onConfirm }: { onConfirm?: () => Promise<void> }) => {
@@ -274,7 +435,7 @@ describe('RecentPlaylistsComponent busy state', () => {
             (
                 _playlistId: string,
                 options?: {
-                    onEvent?: (event: any) => void;
+                    onEvent?: (event: DbOperationEvent) => void;
                     operationId?: string;
                 }
             ) => {
@@ -286,12 +447,14 @@ describe('RecentPlaylistsComponent busy state', () => {
                     current: 1,
                     total: 4,
                 });
+                workerEventDelivered.resolve();
+
                 return refresh.promise;
             }
         );
 
         component.refreshXtreamPlaylist(item);
-        await Promise.resolve();
+        await workerEventDelivered.promise;
 
         expect(component.isRefreshPending(item._id)).toBe(true);
         expect(component.getBusyMessage(item)).toBe(
@@ -317,6 +480,11 @@ describe('RecentPlaylistsComponent busy state', () => {
         const item = createPlaylistMeta({ _id: 'playlist-refresh-success-1' });
         let confirmPromise: Promise<void> | undefined;
         const executionOrder: string[] = [];
+        const performanceEvents: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => {
+            performanceEvents.push(event);
+            executionOrder.push(event.boundary);
+        });
         const dateNowSpy = jest
             .spyOn(Date, 'now')
             .mockReturnValue(1712145600000);
@@ -378,34 +546,94 @@ describe('RecentPlaylistsComponent busy state', () => {
         );
         expect(setItemSpy).toHaveBeenCalledWith(
             `xtream-restore-${item._id}`,
-            JSON.stringify({
-                hiddenCategories: [{ xtreamId: 404, categoryType: 'live' }],
-                favorites: [
-                    { xtreamId: 101, contentType: 'live' },
-                    { xtreamId: 202, contentType: 'movie' },
-                ],
-                recentlyViewed: [
-                    {
-                        xtreamId: 303,
-                        contentType: 'series',
-                        viewedAt: '2026-04-03T11:15:00.000Z',
-                    },
-                ],
-                playbackPositions: [],
-            })
+            expect.any(String)
         );
+        const persistedRestoreState = JSON.parse(
+            setItemSpy.mock.calls.find(
+                ([key]) => key === `xtream-restore-${item._id}`
+            )?.[1] ?? 'null'
+        );
+        expect(persistedRestoreState).toEqual({
+            hiddenCategories: [{ xtreamId: 404, categoryType: 'live' }],
+            favorites: [
+                { xtreamId: 101, contentType: 'live' },
+                { xtreamId: 202, contentType: 'movie' },
+            ],
+            recentlyViewed: [
+                {
+                    xtreamId: 303,
+                    contentType: 'series',
+                    viewedAt: '2026-04-03T11:15:00.000Z',
+                },
+            ],
+            playbackPositions: [],
+        });
         expect(router.navigate).toHaveBeenCalledWith([
             '/workspace',
             'xtreams',
             item._id,
         ]);
-        expect(executionOrder).toEqual(['setItem', 'dispatch', 'navigate']);
+        expect(executionOrder).toEqual([
+            'setItem',
+            'start',
+            'dispatch',
+            'end',
+            'navigate',
+        ]);
+        expect(performanceEvents).toHaveLength(2);
+        expect(performanceEvents[0]?.phaseId).toBe(
+            performanceEvents[1]?.phaseId
+        );
+        expect(
+            performanceEvents.map(({ boundary, metadata, outcome, phase }) => ({
+                boundary,
+                metadata,
+                outcome,
+                phase,
+            }))
+        ).toEqual([
+            {
+                boundary: 'start',
+                metadata: { items: 1 },
+                outcome: undefined,
+                phase: 'store.xtream-refresh-meta',
+            },
+            {
+                boundary: 'end',
+                metadata: { items: 1 },
+                outcome: 'success',
+                phase: 'store.xtream-refresh-meta',
+            },
+        ]);
 
         setItemSpy.mockRestore();
         dateNowSpy.mockRestore();
     });
 
     it('uses the legacy IPC refresh flow for non-Xtream playlists', () => {
+        runtime.supportsPlaylistRefresh = false;
+        const item = createPlaylistMeta({
+            _id: 'playlist-m3u-1',
+            serverUrl: undefined,
+            username: undefined,
+            password: undefined,
+            filePath: undefined,
+            url: 'https://example.com/test.m3u',
+            userAgent: 'IPTVnator-Test/1.0',
+        });
+
+        component.refreshPlaylist(item);
+
+        expect(dataService.sendIpcEvent).toHaveBeenCalledWith(PLAYLIST_UPDATE, {
+            id: item._id,
+            title: item.title,
+            url: item.url,
+            userAgent: item.userAgent,
+        });
+    });
+
+    it('does not use legacy IPC refresh for file-backed playlists without the refresh bridge', () => {
+        runtime.supportsPlaylistRefresh = false;
         const item = createPlaylistMeta({
             _id: 'playlist-m3u-1',
             serverUrl: undefined,
@@ -416,10 +644,95 @@ describe('RecentPlaylistsComponent busy state', () => {
 
         component.refreshPlaylist(item);
 
-        expect(dataService.sendIpcEvent).toHaveBeenCalledWith(PLAYLIST_UPDATE, {
-            id: item._id,
-            title: item.title,
-            filePath: item.filePath,
+        expect(dataService.sendIpcEvent).not.toHaveBeenCalled();
+        expect(playlistRefreshService.refreshPlaylist).not.toHaveBeenCalled();
+    });
+
+    it('re-evaluates refresh bridge availability when refreshing local M3U playlists', async () => {
+        runtime.supportsPlaylistRefresh = false;
+        const lateComponent = TestBed.createComponent(
+            RecentPlaylistsComponent
+        ).componentInstance;
+        runtime.supportsPlaylistRefresh = true;
+        const item = createPlaylistMeta({
+            _id: 'playlist-m3u-2',
+            serverUrl: undefined,
+            username: undefined,
+            password: undefined,
+            filePath: '/tmp/test.m3u',
+            userAgent: 'IPTVnator-Test/1.0',
         });
+
+        lateComponent.refreshPlaylist(item);
+
+        expect(playlistRefreshService.refreshPlaylist).toHaveBeenCalledWith(
+            {
+                operationId: 'playlist-refresh-op',
+                playlistId: item._id,
+                title: item.title,
+                url: item.url,
+                userAgent: item.userAgent,
+                filePath: item.filePath,
+            },
+            {
+                onEvent: expect.any(Function),
+            }
+        );
+        expect(dataService.sendIpcEvent).not.toHaveBeenCalled();
+
+        await Promise.resolve();
+        expect(store.dispatch).toHaveBeenCalledWith(
+            PlaylistActions.updatePlaylist({
+                playlist: expect.objectContaining({
+                    _id: item._id,
+                }),
+                playlistId: item._id,
+                refreshEpg: true,
+                operationId: 'playlist-refresh-op',
+            })
+        );
+    });
+
+    it('clears the connectivity guard before deleting the cached Xtream catalog', async () => {
+        // Second, independent implementation of the destructive refresh (the
+        // Workspace sources page). Same consequence as the shared action: the
+        // catalog is already gone by the time an open guard fast-fails the
+        // re-import bootstrap.
+        const item = {
+            _id: 'xtream-guard',
+            title: 'Guarded Xtream',
+            serverUrl: 'http://panel.example:8080',
+        } as PlaylistMeta;
+        const order: string[] = [];
+        let confirmPromise: Promise<void> | undefined;
+
+        dataService.sendIpcEvent.mockImplementation((event: string) => {
+            order.push(`ipc:${event}`);
+            return Promise.resolve({ success: true });
+        });
+        databaseService.deleteXtreamPlaylistContent.mockImplementation(() => {
+            order.push('deleteXtreamPlaylistContent');
+            return Promise.resolve({
+                hiddenCategories: [],
+                favorites: [],
+                recentlyViewed: [],
+                sourcePins: [],
+            });
+        });
+        dialogService.openConfirmDialog.mockImplementation(
+            ({ onConfirm }: { onConfirm?: () => Promise<void> }) => {
+                confirmPromise = onConfirm?.();
+            }
+        );
+
+        component.refreshXtreamPlaylist(item);
+        await confirmPromise;
+
+        expect(order[0]).toBe(`ipc:${CONNECTIVITY_GUARD_RESET}`);
+        expect(order).toContain('deleteXtreamPlaylistContent');
+        expect(dataService.sendIpcEvent).toHaveBeenCalledWith(
+            CONNECTIVITY_GUARD_RESET,
+            { url: item.serverUrl }
+        );
     });
 });

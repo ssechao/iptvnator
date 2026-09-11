@@ -11,10 +11,16 @@ import { sql } from 'drizzle-orm';
 import {
     index,
     integer,
+    primaryKey,
     sqliteTable,
     text,
     uniqueIndex,
 } from 'drizzle-orm/sqlite-core';
+
+// Manual EPG-to-channel mappings live in their own schema module; re-export
+// them so `import * as schema from './schema'` keeps a complete namespace.
+export * from './epg-mapping.schema';
+export * from './vod-source-pins.schema';
 
 // Playlists table
 export const playlists = sqliteTable('playlists', {
@@ -32,6 +38,10 @@ export const playlists = sqliteTable('playlists', {
     origin: text('origin'),
     referrer: text('referrer'),
     filePath: text('filePath'),
+    epgUrls: text('epg_urls'),
+    detectedEpgUrls: text('detected_epg_urls'),
+    manualEpgUrls: text('manual_epg_urls'),
+    disabledEpgUrls: text('disabled_epg_urls'),
     autoRefresh: integer('autoRefresh', { mode: 'boolean' }).default(false),
     autoRefreshIntervalHours: integer('auto_refresh_interval_hours'),
     macAddress: text('macAddress'),
@@ -95,6 +105,12 @@ export const content = sqliteTable(
         added: text('added'),
         posterUrl: text('poster_url'),
         backdropUrl: text('backdrop_url'),
+        // Identity a detail view resolved for this item, so anything reading
+        // it later can repeat that lookup instead of re-deriving one from the
+        // display title. See ContentMetadataPatch in @iptvnator/shared/interfaces.
+        tmdbId: integer('tmdb_id'),
+        releaseYear: integer('release_year'),
+        originalTitle: text('original_title'),
         epgChannelId: text('epg_channel_id'),
         tvArchive: integer('tv_archive'),
         tvArchiveDuration: integer('tv_archive_duration'),
@@ -107,6 +123,7 @@ export const content = sqliteTable(
         categoryIdx: index('idx_content_category').on(table.categoryId),
         titleIdx: index('idx_content_title').on(table.title),
         xtreamIdx: index('idx_content_xtream').on(table.xtreamId),
+        epgChannelIdx: index('idx_content_epg_channel').on(table.epgChannelId),
         categoryTypeXtreamUnique: uniqueIndex(
             'content_category_type_xtream_unique'
         ).on(table.categoryId, table.type, table.xtreamId),
@@ -189,6 +206,26 @@ export const epgChannels = sqliteTable(
     })
 );
 
+// A global XMLTV ID can be shared by sources with different channel metadata.
+export const epgChannelSources = sqliteTable(
+    'epg_channel_sources',
+    {
+        channelId: text('channel_id')
+            .notNull()
+            .references(() => epgChannels.id, { onDelete: 'cascade' }),
+        sourceUrl: text('source_url').notNull(),
+        displayName: text('display_name').notNull(),
+        iconUrl: text('icon_url'),
+        url: text('url'),
+        updatedAt: text('updated_at').default(sql`CURRENT_TIMESTAMP`),
+        writeOrder: integer('write_order').notNull().default(0),
+    },
+    (table) => [
+        primaryKey({ columns: [table.channelId, table.sourceUrl] }),
+        index('idx_epg_channel_sources_source').on(table.sourceUrl),
+    ]
+);
+
 // EPG Programs table
 export const epgPrograms = sqliteTable(
     'epg_programs',
@@ -205,12 +242,20 @@ export const epgPrograms = sqliteTable(
         iconUrl: text('icon_url'),
         rating: text('rating'),
         episodeNum: text('episode_num'),
+        sourceUrl: text('source_url'),
     },
     (table) => ({
         channelIdx: index('idx_epg_programs_channel').on(table.channelId),
+        sourceIdx: index('idx_epg_programs_source').on(table.sourceUrl),
         startIdx: index('idx_epg_programs_start').on(table.start),
         stopIdx: index('idx_epg_programs_stop').on(table.stop),
         timeRangeIdx: index('idx_epg_programs_time_range').on(
+            table.channelId,
+            table.start,
+            table.stop
+        ),
+        sourceTimeRangeIdx: index('idx_epg_programs_source_time_range').on(
+            table.sourceUrl,
             table.channelId,
             table.start,
             table.stop
@@ -291,50 +336,89 @@ export type NewEpgProgramDb = typeof epgPrograms.$inferInsert;
 export type PlaybackPosition = typeof playbackPositions.$inferSelect;
 export type NewPlaybackPosition = typeof playbackPositions.$inferInsert;
 
-// Downloads table
-export const downloads = sqliteTable(
-    'downloads',
+export * from './download-tables';
+
+// Live-TV recordings table. Rows are created by the embedded-MPV recording
+// tracker, not by the download queue: a recording has no source URL to
+// re-fetch, no byte totals, and no retry/resume semantics, so it lives beside
+// `downloads` instead of inside it. playlist_id has no FK on purpose —
+// recordings outlive the deletion of their source playlist.
+export const recordings = sqliteTable(
+    'recordings',
     {
         id: integer('id').primaryKey({ autoIncrement: true }),
-        playlistId: text('playlist_id')
-            .notNull()
-            .references(() => playlists.id, { onDelete: 'cascade' }),
-        // Content identifiers
-        xtreamId: integer('xtream_id').notNull(),
-        contentType: text('content_type', {
-            enum: ['vod', 'episode'],
-        }).notNull(),
-        // For episodes: store series info
-        seriesXtreamId: integer('series_xtream_id'),
-        seasonNumber: integer('season_number'),
-        episodeNumber: integer('episode_number'),
-        // Download metadata
-        title: text('title').notNull(),
-        url: text('url').notNull(),
-        fileName: text('file_name'),
-        filePath: text('file_path'),
-        posterUrl: text('poster_url'),
-        // Download progress
+        // Transient embedded-MPV session id, correlation/debugging only.
+        sessionId: text('session_id'),
+        // PID of the process that opened the recording. Startup recovery uses
+        // it to leave rows owned by another live instance alone
+        // (IPTVNATOR_ALLOW_MULTIPLE_INSTANCES).
+        ownerPid: integer('owner_pid'),
         status: text('status', {
-            enum: ['queued', 'downloading', 'completed', 'failed', 'canceled'],
+            enum: ['recording', 'completed', 'interrupted', 'failed'],
         })
             .notNull()
-            .default('queued'),
-        bytesDownloaded: integer('bytes_downloaded').default(0),
-        totalBytes: integer('total_bytes'),
+            .default('recording'),
+        filePath: text('file_path').notNull(),
+        fileSizeBytes: integer('file_size_bytes'),
+        // Metadata snapshot captured at recording start (EPG is
+        // time-sensitive; it cannot be reconstructed after the fact).
+        channelName: text('channel_name').notNull(),
+        channelLogoUrl: text('channel_logo_url'),
+        playlistId: text('playlist_id'),
+        playlistName: text('playlist_name'),
+        sourceType: text('source_type', {
+            enum: ['m3u', 'xtream', 'stalker'],
+        }),
+        epgChannelId: text('epg_channel_id'),
+        programTitle: text('program_title'),
+        programDescription: text('program_description'),
+        programStart: text('program_start'),
+        programStop: text('program_stop'),
+        // Stop-time enrichment: JSON array of program snapshots overlapping
+        // [started_at, ended_at] (a recording can span program boundaries).
+        programsJson: text('programs_json'),
         errorMessage: text('error_message'),
-        // Timestamps
+        startedAt: text('started_at').notNull(),
+        endedAt: text('ended_at'),
         createdAt: text('created_at').default(sql`CURRENT_TIMESTAMP`),
         updatedAt: text('updated_at').default(sql`CURRENT_TIMESTAMP`),
     },
     (table) => ({
-        playlistIdx: index('downloads_playlist_idx').on(table.playlistId),
-        statusIdx: index('downloads_status_idx').on(table.status),
-        xtreamPlaylistUnique: uniqueIndex(
-            'downloads_xtream_playlist_unique'
-        ).on(table.xtreamId, table.playlistId, table.contentType),
+        statusIdx: index('recordings_status_idx').on(table.status),
+        filePathIdx: index('recordings_file_path_idx').on(table.filePath),
+        playlistIdx: index('recordings_playlist_idx').on(table.playlistId),
     })
 );
 
-export type Download = typeof downloads.$inferSelect;
-export type NewDownload = typeof downloads.$inferInsert;
+export type Recording = typeof recordings.$inferSelect;
+export type NewRecording = typeof recordings.$inferInsert;
+
+// TMDB metadata cache table.
+// Two row kinds share the table, discriminated by the lookup_key prefix:
+// - 'id:<tmdbId>'                 → full TMDB details payload (JSON)
+// - 'title:<normalized>|year:<y>' → search resolution; tmdb_id NULL means
+//                                   "no confident match" (negative cache)
+export const tmdbMetadata = sqliteTable(
+    'tmdb_metadata',
+    {
+        id: integer('id').primaryKey({ autoIncrement: true }),
+        mediaType: text('media_type', {
+            enum: ['movie', 'tv', 'person'],
+        }).notNull(),
+        lookupKey: text('lookup_key').notNull(),
+        language: text('language').notNull(),
+        tmdbId: integer('tmdb_id'),
+        payload: text('payload'),
+        fetchedAt: text('fetched_at').default(sql`CURRENT_TIMESTAMP`),
+    },
+    (table) => ({
+        lookupUnique: uniqueIndex('tmdb_metadata_lookup_unique').on(
+            table.mediaType,
+            table.lookupKey,
+            table.language
+        ),
+    })
+);
+
+export type TmdbMetadata = typeof tmdbMetadata.$inferSelect;
+export type NewTmdbMetadata = typeof tmdbMetadata.$inferInsert;

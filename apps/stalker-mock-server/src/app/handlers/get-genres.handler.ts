@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { getPortalData } from '../data-store.js';
-import { extractMac } from './get-categories.handler.js';
+import { extractMac } from '../request-mac.js';
 
 /**
  * Stalker get_genres — returns genre list for a content type.
@@ -26,7 +26,7 @@ export function handleGetGenres(req: Request, res: Response): void {
         id: cat.id,
         title: cat.title,
         alias: cat.alias,
-        censored: '0',
+        censored: cat.censored ?? '0',
     }));
 
     res.json({ js: genres });

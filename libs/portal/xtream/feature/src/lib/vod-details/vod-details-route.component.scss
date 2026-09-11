@@ -4,6 +4,27 @@
     height: 100%;
     min-height: 0;
 
+    // "Playing from: SharkTV · 1080p · mkv — also found in 2 playlists".
+    // Projected into the hero's action row, which is a flex row, so it claims
+    // a full-width line of its own below the buttons.
+    ::ng-deep .source-caption {
+        flex: 0 0 100%;
+        margin: 10px 0 0;
+        font-size: 0.75rem;
+        line-height: 1.4;
+        color: var(--text-muted);
+
+        .source-caption__source {
+            margin-left: 6px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .source-caption__extra {
+            margin-left: 6px;
+        }
+    }
+
     ::ng-deep .details__tag--status {
         color: var(--text-primary);
         border-color: color-mix(in srgb, var(--accent-color) 28%, transparent);
@@ -42,218 +63,36 @@
             letter-spacing: 0.03em;
         }
     }
-}
 
-.value--links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 8px;
-    align-items: center;
-}
-
-.person-link {
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: var(--text-primary);
-    font: inherit;
-    text-align: left;
-    text-decoration: underline;
-    text-decoration-color: color-mix(
-        in srgb,
-        var(--accent-color) 58%,
-        transparent
-    );
-    text-underline-offset: 3px;
-    cursor: pointer;
-    app-region: no-drag;
-    -webkit-app-region: no-drag;
-
-    &:hover,
-    &:focus-visible {
-        color: var(--accent-color);
-    }
-
-    &:focus-visible {
-        outline: 2px solid var(--accent-color);
-        outline-offset: 2px;
-        border-radius: 3px;
-    }
-}
-
-.similar-movies {
-    margin-top: 28px;
-    max-width: min(100%, 660px);
-
-    &__header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 12px;
-
-        h3 {
-            margin: 0;
-            color: var(--text-primary);
-            font-size: 1rem;
-            font-weight: 700;
-        }
-    }
-
-    &__grid {
+    ::ng-deep .details__similar-strip {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 20px 16px;
+        max-width: 660px;
+        overflow: visible;
         padding: 2px;
     }
-}
 
-.similar-movie {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-    min-width: 0;
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: inherit;
-    text-align: left;
-    cursor: pointer;
-    app-region: no-drag;
-    -webkit-app-region: no-drag;
-
-    &:hover,
-    &:focus-visible {
-        .similar-movie__poster {
-            border-color: color-mix(
-                in srgb,
-                var(--accent-color) 56%,
-                transparent
-            );
-            transform: translateY(-2px);
-        }
-    }
-
-    &:focus-visible {
-        outline: 2px solid var(--accent-color);
-        outline-offset: 3px;
-        border-radius: 8px;
-    }
-
-    &__poster {
-        display: block;
+    ::ng-deep .details__similar-card {
         width: 100%;
-        aspect-ratio: 2 / 3;
-        overflow: hidden;
-        border: 1px solid color-mix(in srgb, var(--tag-border) 82%, transparent);
-        border-radius: 8px;
-        background: color-mix(in srgb, var(--tag-bg) 78%, transparent);
-        transition:
-            border-color 160ms ease,
-            transform 160ms ease;
-
-        img {
-            width: 100%;
-            height: 100%;
-            display: block;
-            object-fit: cover;
-        }
-    }
-
-    &__poster-placeholder {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-        color: var(--text-muted);
-
-        mat-icon {
-            width: 34px;
-            height: 34px;
-            font-size: 34px;
-        }
-    }
-
-    &__body {
-        display: flex;
-        flex-direction: column;
-        gap: 5px;
         min-width: 0;
     }
 
-    &__title {
-        min-height: 34px;
-        color: var(--text-primary);
-        font-size: 0.8125rem;
-        font-weight: 650;
-        line-height: 1.3;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        overflow-wrap: anywhere;
-    }
-
-    &__facts,
-    &__reasons {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-        color: var(--text-muted);
-        font-size: 0.71875rem;
-        line-height: 1.25;
-    }
-
-    &__reason {
-        max-width: 100%;
-        padding: 2px 6px;
-        overflow: hidden;
-        border: 1px solid color-mix(in srgb, var(--tag-border) 80%, transparent);
-        border-radius: 4px;
-        background: color-mix(in srgb, var(--tag-bg) 84%, transparent);
-        color: var(--text-secondary);
-        text-overflow: ellipsis;
-        white-space: nowrap;
-
-        &--link {
-            font: inherit;
-            cursor: pointer;
-            app-region: no-drag;
-            -webkit-app-region: no-drag;
-
-            &:hover,
-            &:focus-visible {
-                border-color: color-mix(
-                    in srgb,
-                    var(--accent-color) 56%,
-                    transparent
-                );
-                color: var(--accent-color);
-            }
-
-            &:focus-visible {
-                outline: 2px solid var(--accent-color);
-                outline-offset: 2px;
-            }
-        }
+    ::ng-deep .details__similar-poster {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 2 / 3;
     }
 }
 
 @media (max-width: 700px) {
-    .similar-movies {
-        margin-top: 22px;
-
-        &__grid {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-        }
+    :host ::ng-deep .details__similar-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 }
 
 @media (max-width: 420px) {
-    .similar-movies {
-        &__grid {
-            grid-template-columns: minmax(0, 1fr);
-        }
+    :host ::ng-deep .details__similar-strip {
+        grid-template-columns: minmax(0, 1fr);
     }
 }

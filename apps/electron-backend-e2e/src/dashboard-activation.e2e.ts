@@ -5,6 +5,7 @@ import {
     clickCategoryByNameExact,
     clickFirstGridListCard,
     closeElectronApp,
+    expectVisibleContentCardTitle,
     defaultXtreamPassword,
     defaultXtreamUsername,
     expectPathname,
@@ -81,14 +82,66 @@ test.describe('Dashboard Activation', () => {
                 seriesFixture.categoryName
             );
             const seriesTitle = await clickFirstGridListCard(app.mainWindow);
+            await addCurrentDetailToFavorites(app.mainWindow);
             await playFirstSeriesEpisode(app.mainWindow);
 
             await goToDashboard(app.mainWindow);
 
-            await expectDashboardRail(app.mainWindow, 'dashboard-global-favorites-rail');
+            // Favorited movies/series are shown as cover cards in their own
+            // rail. The rail's "See all" opens Global Favorites directly on
+            // Movies instead of defaulting back to Live TV.
+            await expectDashboardRail(
+                app.mainWindow,
+                'dashboard-favorite-vod-rail'
+            );
+            await app.mainWindow
+                .getByTestId('dashboard-favorite-vod-rail-manage-all')
+                .click();
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/global-favorites$/
+            );
+            await expectVisibleContentCardTitle(app.mainWindow, movieTitle);
+
+            await app.mainWindow.goBack();
+            await expectPathname(app.mainWindow, /\/workspace\/dashboard$/);
+
             await dashboardRailCardByTitle(
                 app.mainWindow,
-                'dashboard-global-favorites-rail',
+                'dashboard-favorite-vod-rail',
+                movieTitle
+            ).click();
+            await expectInlineCollectionDetail(app.mainWindow, {
+                pathname: /\/workspace\/global-favorites$/,
+                title: movieTitle,
+            });
+
+            await app.mainWindow.goBack();
+            await expectPathname(app.mainWindow, /\/workspace\/dashboard$/);
+
+            await dashboardRailCardByTitle(
+                app.mainWindow,
+                'dashboard-favorite-vod-rail',
+                seriesTitle
+            ).click();
+            await expectInlineCollectionDetail(app.mainWindow, {
+                pathname: /\/workspace\/global-favorites$/,
+                title: seriesTitle,
+            });
+
+            await app.mainWindow.goBack();
+            await expectPathname(app.mainWindow, /\/workspace\/dashboard$/);
+
+            // Live favorites no longer fall back to recent live history.
+            // Clicking a favorited live card still opens the Xtream favorites
+            // collection with the channel playing.
+            await expectDashboardRail(
+                app.mainWindow,
+                'dashboard-live-favorites-rail'
+            );
+            await dashboardRailCardByTitle(
+                app.mainWindow,
+                'dashboard-live-favorites-rail',
                 liveTitle
             ).click();
             await app.mainWindow.waitForURL(
@@ -108,22 +161,38 @@ test.describe('Dashboard Activation', () => {
             await app.mainWindow.goBack();
             await app.mainWindow.waitForURL(/\/workspace\/dashboard$/);
 
+            // Once the live card has been played, the separate recently
+            // watched live rail appears with the same channel layout.
+            await expectDashboardRail(
+                app.mainWindow,
+                'dashboard-recent-live-rail'
+            );
             await dashboardRailCardByTitle(
                 app.mainWindow,
-                'dashboard-global-favorites-rail',
-                movieTitle
+                'dashboard-recent-live-rail',
+                liveTitle
             ).click();
-            await expectInlineCollectionDetail(app.mainWindow, {
-                pathname: /\/workspace\/global-favorites$/,
-                title: movieTitle,
-            });
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/xtreams\/[^/]+\/recent$/
+            );
+            await expect(
+                channelItemByTitle(app.mainWindow, liveTitle).first()
+            ).toBeVisible({ timeout: 20000 });
 
-            await goBackFromDetail(app.mainWindow);
+            await app.mainWindow.goBack();
             await expectPathname(app.mainWindow, /\/workspace\/dashboard$/);
 
+            // Movies and series that were played land in the Continue
+            // Watching rail (formerly "recently-watched"); clicking a card
+            // opens it inline in the global-recent collection detail view.
+            await expectDashboardRail(
+                app.mainWindow,
+                'dashboard-continue-watching-rail'
+            );
             await dashboardRailCardByTitle(
                 app.mainWindow,
-                'dashboard-recently-watched-rail',
+                'dashboard-continue-watching-rail',
                 movieTitle
             ).click();
             await expectInlineCollectionDetail(app.mainWindow, {
@@ -136,7 +205,7 @@ test.describe('Dashboard Activation', () => {
 
             await dashboardRailCardByTitle(
                 app.mainWindow,
-                'dashboard-recently-watched-rail',
+                'dashboard-continue-watching-rail',
                 seriesTitle
             ).click();
             await expectInlineCollectionDetail(app.mainWindow, {
@@ -157,7 +226,10 @@ const xtreamCredentials = {
     password: defaultXtreamPassword,
 };
 
-async function expectDashboardRail(page: Page, railTestId: string): Promise<void> {
+async function expectDashboardRail(
+    page: Page,
+    railTestId: string
+): Promise<void> {
     await expect(page.locator(`[data-test-id="${railTestId}"]`)).toBeVisible({
         timeout: 20000,
     });
@@ -168,15 +240,21 @@ function dashboardRailCardByTitle(
     railTestId: string,
     title: string
 ) {
-    return page.locator(`[data-test-id="${railTestId}-card"]`).filter({
-        hasText: title,
-    }).first();
+    return page
+        .locator(`[data-test-id="${railTestId}-card"]`)
+        .filter({
+            hasText: title,
+        })
+        .first();
 }
 
 async function goBackFromDetail(page: Page): Promise<void> {
+    // Return to the list: browse uses the sticky Back, watch uses the
+    // now-playing bar's direct Back (the sticky watch action is Close player).
     const backButton = page
-        .locator('app-content-hero .hero__back-button')
-        .first();
+        .locator('app-portal-detail-shell')
+        .first()
+        .getByRole('button', { name: 'Back', exact: true });
 
     await expect(backButton).toBeVisible({ timeout: 20000 });
     try {
@@ -188,13 +266,18 @@ async function goBackFromDetail(page: Page): Promise<void> {
     }
 }
 
+// By accessible name, not class: the Xtream movie detail's favorite control is
+// an icon-only button that carries its label in aria-label, while series and
+// Stalker details still use the labeled variant. This matches both.
 async function addCurrentDetailToFavorites(page: Page): Promise<void> {
-    const addButton = page.locator('button.favorite-btn').first();
+    const addButton = page
+        .getByRole('button', { name: /add to favorites/i })
+        .first();
 
     await expect(addButton).toBeVisible({ timeout: 20000 });
     await addButton.click();
     await expect(
-        page.locator('button.favorite-btn--active').first()
+        page.getByRole('button', { name: /remove from favorites/i }).first()
     ).toBeVisible({
         timeout: 20000,
     });
@@ -211,7 +294,7 @@ async function expectInlineCollectionDetail(
     await expect(page.locator('app-workspace-context-panel')).toHaveCount(0);
     await expect(page.locator('app-content-hero')).toContainText(params.title);
     await expect(
-        page.locator('app-content-hero .hero__back-button').first()
+        page.locator('app-portal-detail-shell .shell__back-button').first()
     ).toBeVisible({ timeout: 20000 });
 }
 

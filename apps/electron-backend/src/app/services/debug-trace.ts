@@ -1,3 +1,8 @@
+import {
+    redactSensitiveData,
+    summarizeSqlStatementForTrace,
+} from '@iptvnator/shared/logging';
+
 const TRACE_ENV_TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
 const TRACE_PREFIX = '[IPTVnator Trace]';
 const MAX_TRACE_ARRAY_ITEMS = 5;
@@ -50,6 +55,10 @@ export function isRendererApiTraceEnabled(): boolean {
     return isStartupTraceEnabled() || readFlag('IPTVNATOR_TRACE_IPC');
 }
 
+export function isPerformanceCaptureEnabled(): boolean {
+    return readFlag('IPTVNATOR_PERF_CAPTURE');
+}
+
 export function isDbTraceEnabled(): boolean {
     return isStartupTraceEnabled() || readFlag('IPTVNATOR_TRACE_DB');
 }
@@ -76,10 +85,6 @@ export function isExternalPlayerTraceEnabled(): boolean {
 
 export function roundTraceDuration(durationMs: number): number {
     return Math.round(durationMs * 10) / 10;
-}
-
-export function compactSqlForTrace(sql: string): string {
-    return truncateString(sql.replace(/\s+/g, ' ').trim());
 }
 
 export function summarizeForTrace(value: unknown, depth = 0): unknown {
@@ -146,10 +151,10 @@ export function summarizeForTrace(value: unknown, depth = 0): unknown {
 
 export function safeStringifyForTrace(payload: unknown): string {
     try {
-        return JSON.stringify(payload);
+        return JSON.stringify(redactSensitiveData(payload));
     } catch (error) {
         return JSON.stringify({
-            fallback: summarizeForTrace(payload),
+            fallback: summarizeForTrace(redactSensitiveData(payload)),
             stringifyError:
                 error instanceof Error
                     ? truncateString(error.message)
@@ -166,7 +171,11 @@ export function trace(scope: string, message: string, payload?: unknown): void {
 
     console.log(
         `${TRACE_PREFIX}[${scope}] ${message} ${safeStringifyForTrace(
-            summarizeForTrace(payload)
+            summarizeForTrace(redactSensitiveData(payload))
         )}`
     );
+}
+
+export function traceSqlStatement(scope: string, sql: unknown): void {
+    trace(scope, 'query', summarizeSqlStatementForTrace(sql));
 }

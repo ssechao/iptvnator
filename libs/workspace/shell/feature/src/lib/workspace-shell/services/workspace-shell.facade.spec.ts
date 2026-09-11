@@ -6,10 +6,10 @@ import { Store } from '@ngrx/store';
 import { TranslateService } from '@ngx-translate/core';
 import { of } from 'rxjs';
 import {
-    PlaylistContextFacade,
     PlaylistRefreshActionService,
     type XtreamRefreshPreparationState,
-} from '@iptvnator/playlist/shared/util';
+} from '@iptvnator/playlist/shared/ui';
+import { PlaylistContextFacade } from '@iptvnator/playlist/shared/util';
 import {
     PORTAL_EXTERNAL_PLAYBACK,
     WorkspaceHeaderContextService,
@@ -17,9 +17,15 @@ import {
 } from '@iptvnator/portal/shared/util';
 import { StalkerStore } from '@iptvnator/portal/stalker/data-access';
 import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
-import { PlaylistsService, SettingsStore } from '@iptvnator/services';
+import {
+    DownloadsService,
+    PlaylistsService,
+    RuntimeCapabilitiesService,
+    SettingsStore,
+} from '@iptvnator/services';
 import { PlaylistMeta } from '@iptvnator/shared/interfaces';
 import {
+    WorkspaceShellContextDrawerService,
     WorkspaceStartupPreferencesService,
     WORKSPACE_SHELL_ACTIONS,
 } from '@iptvnator/workspace/shell/util';
@@ -28,6 +34,10 @@ import { WorkspacePlayerCommandsContributor } from '../../workspace-player-comma
 import { WorkspaceShellFacade } from './workspace-shell.facade';
 import { WorkspaceShellXtreamImportService } from './workspace-shell-xtream-import.service';
 import { WorkspaceShellCommandPaletteService } from './workspace-shell-command-palette.service';
+import { WorkspaceShellHeaderService } from './workspace-shell-header.service';
+import { WorkspaceShellRouteStateService } from './workspace-shell-route-state.service';
+import { WorkspaceShellSearchSyncService } from './workspace-shell-search-sync.service';
+import { WorkspaceShellSearchService } from './workspace-shell-search.service';
 
 class MockXtreamStore {
     readonly recentItems = signal<unknown[]>([]);
@@ -63,6 +73,7 @@ class MockXtreamStore {
 class MockStalkerStore {
     readonly searchPhrase = signal('');
     readonly getSelectedCategoryName = signal('All Items');
+    readonly itvFullListActive = signal(false);
 
     setSearchPhrase = jest.fn((term: string) => this.searchPhrase.set(term));
 }
@@ -96,11 +107,20 @@ describe('WorkspaceShellFacade', () => {
     };
 
     let facade: WorkspaceShellFacade;
+    let searchSync: WorkspaceShellSearchSyncService;
     let recentCommands: {
         entries: jest.Mock;
         record: jest.Mock;
         prune: jest.Mock;
     };
+    let contextDrawer: { isOpen: jest.Mock };
+    let playerCommands: {
+        ensureEmbeddedMpvSupportLoaded: jest.Mock;
+    };
+    // Mirrors Navigation.trigger: 'imperative' is the app navigating,
+    // 'popstate' is the user moving through browser history. Mutable so a
+    // test can exercise the history-authoritative branch of the search sync.
+    let navigationTrigger: 'imperative' | 'popstate';
     let router: {
         url: string;
         events: ReturnType<typeof of>;
@@ -109,6 +129,7 @@ describe('WorkspaceShellFacade', () => {
         parseUrl: jest.Mock;
         createUrlTree: jest.Mock;
         isActive: jest.Mock;
+        lastSuccessfulNavigation: () => { trigger: string };
     };
     let playlistsService: {
         clearPortalRecentlyViewed: jest.Mock;
@@ -119,12 +140,14 @@ describe('WorkspaceShellFacade', () => {
         openGlobalSearch: jest.Mock;
         openGlobalRecent: jest.Mock;
         openAccountInfo: jest.Mock;
+        openStalkerAccountInfo: jest.Mock;
     };
     let storeDispatch: jest.Mock;
     let activePlaylistSignal: ReturnType<
         typeof signal<PlaylistSignalMeta | null>
     >;
     let playlistsSignal: ReturnType<typeof signal<PlaylistSignalMeta[]>>;
+    let downloadsActiveCountSignal: ReturnType<typeof signal<number>>;
     let refreshPreparationSignal: ReturnType<
         typeof signal<XtreamRefreshPreparationState | null>
     >;
@@ -135,10 +158,20 @@ describe('WorkspaceShellFacade', () => {
         persistLastRestorablePath: jest.Mock;
         showDashboard: jest.Mock;
     };
+    let runtime: {
+        isElectron: boolean;
+        isMacOS: boolean;
+        supportsDownloads: boolean;
+    };
 
     beforeEach(() => {
-        window.electron = { platform: 'darwin' } as typeof window.electron;
+        navigationTrigger = 'imperative';
         showDashboardSignal = signal(true);
+        runtime = {
+            isElectron: true,
+            isMacOS: true,
+            supportsDownloads: true,
+        };
 
         activePlaylistSignal = signal({
             _id: 'pl-1',
@@ -150,6 +183,7 @@ describe('WorkspaceShellFacade', () => {
             { _id: 'pl-1', serverUrl: 'http://example.com' },
             { _id: 'pl-2', macAddress: '00:11:22:33' },
         ]);
+        downloadsActiveCountSignal = signal(0);
         refreshPreparationSignal = signal<XtreamRefreshPreparationState | null>(
             null
         );
@@ -168,6 +202,7 @@ describe('WorkspaceShellFacade', () => {
             parseUrl: jest.fn((url: string) => createParseUrl(url)),
             createUrlTree: jest.fn(),
             isActive: jest.fn(),
+            lastSuccessfulNavigation: () => ({ trigger: navigationTrigger }),
         };
         playlistsService = {
             clearPortalRecentlyViewed: jest
@@ -182,6 +217,7 @@ describe('WorkspaceShellFacade', () => {
             openGlobalSearch: jest.fn(),
             openGlobalRecent: jest.fn(),
             openAccountInfo: jest.fn(),
+            openStalkerAccountInfo: jest.fn(),
         };
         startupPreferences = {
             getFirstAvailableWorkspacePath: jest.fn((showDashboard: boolean) =>
@@ -197,14 +233,26 @@ describe('WorkspaceShellFacade', () => {
             record: jest.fn(),
             prune: jest.fn(),
         };
+        playerCommands = {
+            ensureEmbeddedMpvSupportLoaded: jest.fn(),
+        };
+        contextDrawer = { isOpen: jest.fn(() => false) };
 
         const selectSignal = jest.fn().mockReturnValue(playlistsSignal);
 
         TestBed.configureTestingModule({
             providers: [
                 WorkspaceShellFacade,
+                WorkspaceShellRouteStateService,
+                WorkspaceShellSearchSyncService,
+                WorkspaceShellSearchService,
+                WorkspaceShellHeaderService,
                 WorkspaceShellXtreamImportService,
                 WorkspaceShellCommandPaletteService,
+                {
+                    provide: WorkspaceShellContextDrawerService,
+                    useValue: contextDrawer,
+                },
                 {
                     provide: Router,
                     useValue: router,
@@ -230,6 +278,7 @@ describe('WorkspaceShellFacade', () => {
                         activeSession: signal(null),
                         visibleSession: signal(null),
                         closeSession: jest.fn(),
+                        dismissActiveSession: jest.fn(),
                     },
                 },
                 {
@@ -255,8 +304,18 @@ describe('WorkspaceShellFacade', () => {
                     },
                 },
                 {
+                    provide: RuntimeCapabilitiesService,
+                    useValue: runtime,
+                },
+                {
                     provide: PlaylistsService,
                     useValue: playlistsService,
+                },
+                {
+                    provide: DownloadsService,
+                    useValue: {
+                        activeCount: downloadsActiveCountSignal,
+                    },
                 },
                 {
                     provide: MatDialog,
@@ -314,12 +373,39 @@ describe('WorkspaceShellFacade', () => {
                 },
                 {
                     provide: WorkspacePlayerCommandsContributor,
-                    useValue: {},
+                    useValue: playerCommands,
                 },
             ],
         });
 
         facade = TestBed.inject(WorkspaceShellFacade);
+        searchSync = TestBed.inject(WorkspaceShellSearchSyncService);
+    });
+
+    it('derives desktop shell flags from runtime capabilities', () => {
+        expect(facade.isElectron).toBe(true);
+        expect(facade.isMacOS).toBe(true);
+
+        runtime.isElectron = false;
+        runtime.isMacOS = false;
+
+        expect(facade.isElectron).toBe(false);
+        expect(facade.isMacOS).toBe(false);
+    });
+
+    it('exposes the global active download count and derives activity when supported', () => {
+        downloadsActiveCountSignal.set(3);
+
+        expect(facade.activeDownloadsCount()).toBe(3);
+        expect(facade.hasActiveDownloads()).toBe(true);
+    });
+
+    it('hides the active download count when downloads are unsupported', () => {
+        runtime.supportsDownloads = false;
+        downloadsActiveCountSignal.set(3);
+
+        expect(facade.activeDownloadsCount()).toBe(0);
+        expect(facade.hasActiveDownloads()).toBe(false);
     });
 
     it('routes dashboard search Enter into the active Xtream playlist search', () => {
@@ -380,6 +466,25 @@ describe('WorkspaceShellFacade', () => {
         );
     });
 
+    it('describes a local-library read while cached content is loading', () => {
+        const xtreamStore = TestBed.inject(
+            XtreamStore
+        ) as unknown as MockXtreamStore;
+        const xtreamImport = TestBed.inject(WorkspaceShellXtreamImportService);
+
+        xtreamStore.currentImportPhase.set('loading-cached');
+
+        expect(xtreamImport.xtreamImportPhaseLabel()).toBe(
+            'WORKSPACE.SHELL.XTREAM_IMPORT_LOADING_CACHED'
+        );
+        expect(xtreamImport.xtreamImportSourceLabel()).toBe(
+            'WORKSPACE.SHELL.XTREAM_IMPORT_LOCAL_BADGE'
+        );
+        expect(xtreamImport.xtreamImportDetailLabel()).toBe(
+            'WORKSPACE.SHELL.XTREAM_IMPORT_DETAIL_CACHED'
+        );
+    });
+
     it('shows the Xtream overlay during refresh preparation for the active playlist', () => {
         refreshPreparationSignal.set({
             playlistId: 'pl-1',
@@ -388,6 +493,18 @@ describe('WorkspaceShellFacade', () => {
         });
 
         expect(facade.showXtreamImportOverlay()).toBe(true);
+    });
+
+    it('keeps a cache-only Xtream import session blocking and cancellable', () => {
+        const xtreamStore = TestBed.inject(
+            XtreamStore
+        ) as unknown as MockXtreamStore;
+        const xtreamImport = TestBed.inject(WorkspaceShellXtreamImportService);
+        xtreamStore.activeImportSessionId.set('xtream-import-session');
+
+        expect(xtreamStore.isImporting()).toBe(false);
+        expect(facade.showXtreamImportOverlay()).toBe(true);
+        expect(xtreamImport.canCancelXtreamImport()).toBe(true);
     });
 
     it('shows the Xtream overlay during refresh preparation on the dashboard', () => {
@@ -531,7 +648,7 @@ describe('WorkspaceShellFacade', () => {
 
     it('exposes loaded-only status for stalker itv searches', () => {
         facade.currentUrl.set('/workspace/stalker/pl-1/itv?q=cnn');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
         TestBed.flushEffects();
 
         expect(stalkerStore.setSearchPhrase).toHaveBeenCalledWith('cnn');
@@ -541,9 +658,19 @@ describe('WorkspaceShellFacade', () => {
         );
     });
 
-    it('treats stalker radio search as a remote section search', () => {
+    it('drops the loaded-only status once the full ITV channel list is cached', () => {
+        stalkerStore.itvFullListActive.set(true);
+        facade.currentUrl.set('/workspace/stalker/pl-1/itv?q=cnn');
+        searchSync.syncSearchFromRoute();
+        TestBed.flushEffects();
+
+        expect(facade.canUseSearch()).toBe(true);
+        expect(facade.searchStatusLabel()).toBe('');
+    });
+
+    it('marks stalker radio search as loaded-only (radio always pages)', () => {
         facade.currentUrl.set('/workspace/stalker/pl-1/radio?q=jazz');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
         TestBed.flushEffects();
 
         expect(stalkerStore.setSearchPhrase).toHaveBeenCalledWith('jazz');
@@ -551,7 +678,11 @@ describe('WorkspaceShellFacade', () => {
         expect(facade.searchScopeLabel()).toBe(
             'WORKSPACE.SHELL.RAIL_RADIO / All Items'
         );
-        expect(facade.searchStatusLabel()).toBe('');
+        // Radio has no full-list cache, so its local search only covers loaded
+        // stations — surface the same "loaded only" hint as degraded ITV.
+        expect(facade.searchStatusLabel()).toBe(
+            'WORKSPACE.SHELL.SEARCH_STATUS_LOADED_ONLY'
+        );
     });
 
     it('applies q to Xtream category search on vod routes', () => {
@@ -560,7 +691,7 @@ describe('WorkspaceShellFacade', () => {
         ) as unknown as MockXtreamStore;
 
         facade.currentUrl.set('/workspace/xtreams/pl-1/vod?q=neo');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
         TestBed.flushEffects();
 
         expect(xtreamStore.setCategorySearchTerm).toHaveBeenCalledWith('neo');
@@ -573,7 +704,7 @@ describe('WorkspaceShellFacade', () => {
         ) as unknown as MockXtreamStore;
 
         facade.currentUrl.set('/workspace/xtreams/pl-1/live?q=world');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
         TestBed.flushEffects();
 
         expect(xtreamStore.setCategorySearchTerm).toHaveBeenCalledWith('world');
@@ -582,7 +713,7 @@ describe('WorkspaceShellFacade', () => {
 
     it('enables local-filter search on playlist favorites routes', () => {
         facade.currentUrl.set('/workspace/playlists/pl-1/favorites?q=news');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
 
         expect(facade.canUseSearch()).toBe(true);
         expect(facade.searchQuery()).toBe('news');
@@ -590,7 +721,7 @@ describe('WorkspaceShellFacade', () => {
 
     it('uses the translated global favorites scope label on the global favorites route', () => {
         facade.currentUrl.set('/workspace/global-favorites?q=news');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
 
         expect(facade.searchScopeLabel()).toBe(
             'HOME.PLAYLISTS.GLOBAL_FAVORITES'
@@ -605,6 +736,12 @@ describe('WorkspaceShellFacade', () => {
                 icon: 'library_books',
                 tooltip: 'WORKSPACE.SHELL.RAIL_SOURCES',
                 path: ['/workspace/sources'],
+            },
+            {
+                icon: 'search',
+                tooltip: 'WORKSPACE.SHELL.RAIL_GLOBAL_SEARCH',
+                path: ['/workspace/search'],
+                exact: true,
             },
             {
                 icon: 'favorite',
@@ -622,6 +759,17 @@ describe('WorkspaceShellFacade', () => {
         expect(facade.brandLink()).toBe('/workspace/sources');
     });
 
+    it('hides the Electron-only global search rail link in the web runtime', () => {
+        runtime.isElectron = false;
+        showDashboardSignal.set(false);
+
+        expect(facade.workspaceLinks().map((link) => link.path)).toEqual([
+            ['/workspace/sources'],
+            ['/workspace/global-favorites'],
+            ['/workspace/global-recent'],
+        ]);
+    });
+
     it('persists the last restorable route from navigation events', () => {
         expect(
             startupPreferences.persistLastRestorablePath
@@ -630,7 +778,7 @@ describe('WorkspaceShellFacade', () => {
 
     it('uses the translated recent scope label on the global recent route', () => {
         facade.currentUrl.set('/workspace/global-recent?q=news');
-        (facade as { syncSearchFromRoute: () => void }).syncSearchFromRoute();
+        searchSync.syncSearchFromRoute();
 
         expect(facade.searchScopeLabel()).toBe('PORTALS.RECENTLY_VIEWED');
     });
@@ -659,7 +807,77 @@ describe('WorkspaceShellFacade', () => {
         expect(commands.every((command) => command.enabled)).toBe(true);
     });
 
-    it('includes M3U navigation, playlist actions, and Multi-EPG on playlist routes', () => {
+    it('shows the global search command for M3U-only sources', () => {
+        activePlaylistSignal.set({
+            _id: 'pl-m3u',
+            title: 'Playlist M3U',
+            count: 10,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+        });
+        playlistsSignal.set([
+            {
+                _id: 'pl-m3u',
+                title: 'Playlist M3U',
+                count: 10,
+                importDate: '2026-04-22T10:00:00.000Z',
+                autoRefresh: false,
+            },
+        ]);
+        facade.currentUrl.set('/workspace/dashboard');
+
+        expect(
+            facade.commandPaletteCommands().map((command) => command.id)
+        ).toContain('global-search');
+    });
+
+    it('does not enable global search for empty invalid playlist metadata', () => {
+        activePlaylistSignal.set(null);
+        playlistsSignal.set([
+            {
+                _id: 'empty-playlist',
+                title: 'Empty playlist',
+            } as PlaylistSignalMeta,
+        ]);
+        facade.currentUrl.set('/workspace/search');
+
+        expect(facade.canUseSearch()).toBe(false);
+        expect(
+            facade.commandPaletteCommands().map((command) => command.id)
+        ).not.toContain('global-search');
+    });
+
+    it('hides the global search command and header capability in the web runtime', () => {
+        runtime.isElectron = false;
+        playlistsSignal.set([
+            {
+                _id: 'pl-m3u',
+                title: 'Playlist M3U',
+                count: 10,
+            } as PlaylistSignalMeta,
+        ]);
+        facade.currentUrl.set('/workspace/search');
+
+        expect(facade.canUseSearch()).toBe(false);
+        expect(
+            facade.commandPaletteCommands().map((command) => command.id)
+        ).not.toContain('global-search');
+    });
+
+    it('hides the downloads command when downloads are unsupported', () => {
+        runtime.supportsDownloads = false;
+        activePlaylistSignal.set(null);
+        playlistsSignal.set([]);
+        facade.currentUrl.set('/workspace/dashboard');
+
+        const commands = facade.commandPaletteCommands();
+
+        expect(commands.map((command) => command.id)).not.toContain(
+            'open-downloads'
+        );
+    });
+
+    it('includes M3U navigation, playlist actions, and the programme guide on playlist routes', () => {
         const headerContext = TestBed.inject(WorkspaceHeaderContextService);
 
         activePlaylistSignal.set({
@@ -671,14 +889,14 @@ describe('WorkspaceShellFacade', () => {
         });
         facade.currentUrl.set('/workspace/playlists/pl-m3u/groups');
         headerContext.setAction({
-            id: 'm3u-multi-epg',
-            icon: 'view_list',
-            tooltipKey: 'TOP_MENU.OPEN_MULTI_EPG',
-            ariaLabelKey: 'TOP_MENU.OPEN_MULTI_EPG',
+            id: 'm3u-epg-guide',
+            icon: 'grid_view',
+            tooltipKey: 'TOP_MENU.OPEN_EPG_GUIDE',
+            ariaLabelKey: 'TOP_MENU.OPEN_EPG_GUIDE',
             palette: {
-                labelKey: 'TOP_MENU.OPEN_MULTI_EPG',
+                labelKey: 'TOP_MENU.OPEN_EPG_GUIDE',
                 descriptionKey:
-                    'WORKSPACE.SHELL.COMMANDS.OPEN_MULTI_EPG_DESCRIPTION',
+                    'WORKSPACE.SHELL.COMMANDS.OPEN_EPG_GUIDE_DESCRIPTION',
                 keywords: ['epg', 'guide', 'schedule'],
                 priority: 10,
             },
@@ -689,7 +907,7 @@ describe('WorkspaceShellFacade', () => {
 
         expect(commands.map((command) => command.id)).toEqual(
             expect.arrayContaining([
-                'm3u-multi-epg',
+                'm3u-epg-guide',
                 'go-to-all',
                 'go-to-favorites',
                 'go-to-recent',
@@ -697,10 +915,137 @@ describe('WorkspaceShellFacade', () => {
             ])
         );
         expect(
-            commands.find((command) => command.id === 'm3u-multi-epg')?.group
+            commands.find((command) => command.id === 'm3u-epg-guide')?.group
         ).toBe('view');
         expect(commands.some((command) => command.id === 'account-info')).toBe(
             false
+        );
+    });
+
+    it('disables the programme guide command while the header action reports disabled', () => {
+        const headerContext = TestBed.inject(WorkspaceHeaderContextService);
+
+        activePlaylistSignal.set({
+            _id: 'pl-m3u',
+            title: 'Playlist M3U',
+            count: 10,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+        });
+        facade.currentUrl.set('/workspace/playlists/pl-m3u/groups');
+        const guideCommandEnabled = () =>
+            facade
+                .commandPaletteCommands()
+                .find((command) => command.id === 'm3u-epg-guide')?.enabled;
+        const registerGuideAction = (disabled: () => boolean) =>
+            headerContext.setAction({
+                id: 'm3u-epg-guide',
+                icon: 'grid_view',
+                tooltipKey: 'TOP_MENU.OPEN_EPG_GUIDE',
+                ariaLabelKey: 'TOP_MENU.OPEN_EPG_GUIDE',
+                disabled,
+                palette: { labelKey: 'TOP_MENU.OPEN_EPG_GUIDE' },
+                run: jest.fn(),
+            });
+
+        registerGuideAction(() => true);
+        expect(guideCommandEnabled()).toBe(false);
+
+        registerGuideAction(() => false);
+        expect(guideCommandEnabled()).toBe(true);
+    });
+
+    it('opens the Xtream account dialog with credentials and session counts for the active playlist', () => {
+        activePlaylistSignal.set({
+            _id: 'pl-xtream',
+            title: 'Xtream One',
+            count: 42,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+            serverUrl: 'https://provider.example.test',
+            username: 'demo',
+            password: 'secret',
+        } as PlaylistSignalMeta);
+
+        facade.openAccountInfo();
+
+        expect(workspaceActions.openAccountInfo).toHaveBeenCalledWith({
+            vodStreamsCount: 1,
+            liveStreamsCount: 1,
+            seriesCount: 1,
+            playlist: expect.objectContaining({
+                id: 'pl-xtream',
+                serverUrl: 'https://provider.example.test',
+                username: 'demo',
+                password: 'secret',
+            }),
+        });
+        expect(workspaceActions.openStalkerAccountInfo).not.toHaveBeenCalled();
+    });
+
+    it('opens the Stalker account dialog for an active stalker playlist', () => {
+        const stalkerPlaylist = {
+            _id: 'pl-stalker',
+            title: 'Stalker Portal',
+            count: 0,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+            macAddress: '00:1A:79:00:00:01',
+            portalUrl: 'http://portal.example/portal.php',
+        } as PlaylistSignalMeta;
+        activePlaylistSignal.set(stalkerPlaylist);
+
+        expect(facade.canOpenAccountInfo()).toBe(true);
+
+        facade.openAccountInfo();
+
+        expect(workspaceActions.openStalkerAccountInfo).toHaveBeenCalledWith({
+            playlist: stalkerPlaylist,
+        });
+        expect(workspaceActions.openAccountInfo).not.toHaveBeenCalled();
+    });
+
+    it('opens the account dialog for a non-active playlist without session counts', () => {
+        activePlaylistSignal.set(null);
+        const otherXtream = {
+            _id: 'pl-other',
+            title: 'Other Xtream',
+            count: 5,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+            serverUrl: 'https://other.example.test',
+            username: 'user2',
+            password: 'pass2',
+        } as PlaylistSignalMeta;
+
+        facade.openAccountInfoFor(otherXtream);
+
+        expect(workspaceActions.openAccountInfo).toHaveBeenCalledWith({
+            playlist: expect.objectContaining({ id: 'pl-other' }),
+        });
+    });
+
+    it('offers the account-info command with a Stalker description on stalker routes', () => {
+        activePlaylistSignal.set({
+            _id: 'pl-stalker',
+            title: 'Stalker Portal',
+            count: 0,
+            importDate: '2026-04-22T10:00:00.000Z',
+            autoRefresh: false,
+            macAddress: '00:1A:79:00:00:01',
+            portalUrl: 'http://portal.example/portal.php',
+        } as PlaylistSignalMeta);
+        facade.currentUrl.set('/workspace/stalker/pl-stalker/itv');
+
+        const accountCommand = facade
+            .commandPaletteCommands()
+            .find((command) => command.id === 'account-info');
+
+        expect(accountCommand).toBeDefined();
+        // TranslateModule.forRoot() has no catalog, so the resolved
+        // description is the raw key — which is exactly what we assert.
+        expect(accountCommand?.description).toBe(
+            'WORKSPACE.SHELL.COMMANDS.ACCOUNT_INFO_DESCRIPTION_STALKER'
         );
     });
 
@@ -733,6 +1078,31 @@ describe('WorkspaceShellFacade', () => {
         unregister();
     });
 
+    it('opens the command palette on Ctrl/Cmd+K only while the context drawer is closed', async () => {
+        const dialog = TestBed.inject(MatDialog) as unknown as {
+            open: jest.Mock;
+        };
+        dialog.open.mockReturnValue({
+            afterClosed: () => of(undefined),
+        });
+
+        // While the phone drawer is modal, Ctrl/Cmd+K must not stack a
+        // second focus-trapped surface on top of it.
+        contextDrawer.isOpen.mockReturnValue(true);
+        document.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'k', metaKey: true })
+        );
+        await Promise.resolve();
+        expect(dialog.open).not.toHaveBeenCalled();
+
+        contextDrawer.isOpen.mockReturnValue(false);
+        document.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'k', metaKey: true })
+        );
+        await Promise.resolve();
+        expect(dialog.open).toHaveBeenCalledTimes(1);
+    });
+
     it('records the executed command id after the palette closes with a selection', () => {
         const dialog = TestBed.inject(MatDialog) as unknown as {
             open: jest.Mock;
@@ -744,6 +1114,47 @@ describe('WorkspaceShellFacade', () => {
         facade.openCommandPalette();
 
         expect(recentCommands.record).toHaveBeenCalledWith('open-settings');
+    });
+
+    it('delegates failed external-session dismissal without closing a player', () => {
+        const externalPlayback = TestBed.inject(PORTAL_EXTERNAL_PLAYBACK);
+
+        facade.dismissActiveExternalSession();
+
+        expect(externalPlayback.dismissActiveSession).toHaveBeenCalledTimes(1);
+        expect(externalPlayback.closeSession).not.toHaveBeenCalled();
+    });
+
+    it('handles a rejected external-session close', async () => {
+        const externalPlayback = TestBed.inject(PORTAL_EXTERNAL_PLAYBACK);
+        const closeSession = externalPlayback.closeSession as jest.Mock;
+        closeSession.mockRejectedValueOnce(new Error('close failed'));
+
+        facade.closeActiveExternalSession();
+        await Promise.resolve();
+
+        expect(closeSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('waits for embedded MPV support preload before opening the palette', async () => {
+        const dialog = TestBed.inject(MatDialog) as unknown as {
+            open: jest.Mock;
+        };
+        let resolveSupport!: () => void;
+        playerCommands.ensureEmbeddedMpvSupportLoaded.mockReturnValueOnce(
+            new Promise<void>((resolve) => {
+                resolveSupport = resolve;
+            })
+        );
+
+        facade.openCommandPalette();
+
+        expect(dialog.open).not.toHaveBeenCalled();
+
+        resolveSupport();
+        await Promise.resolve();
+
+        expect(dialog.open).toHaveBeenCalledTimes(1);
     });
 
     it('does not record when the palette closes without a selection', () => {

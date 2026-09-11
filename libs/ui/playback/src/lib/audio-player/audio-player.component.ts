@@ -9,6 +9,7 @@ import {
     input,
     output,
     signal,
+    untracked,
     viewChild,
 } from '@angular/core';
 import { extractDominantColor } from './extract-color';
@@ -16,7 +17,9 @@ import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import { MatSliderModule } from '@angular/material/slider';
+import { MatTooltip } from '@angular/material/tooltip';
 import { Store } from '@ngrx/store';
+import { TranslatePipe } from '@ngx-translate/core';
 import { ChannelActions } from '@iptvnator/m3u-state';
 
 @Component({
@@ -67,6 +70,12 @@ import { ChannelActions } from '@iptvnator/m3u-state';
                     <button
                         mat-icon-button
                         class="skip-btn"
+                        [matTooltip]="
+                            'AUDIO_PLAYER.PREVIOUS_STATION' | translate
+                        "
+                        [attr.aria-label]="
+                            'AUDIO_PLAYER.PREVIOUS_STATION' | translate
+                        "
                         (click)="switchChannel('previous')"
                     >
                         <mat-icon>skip_previous</mat-icon>
@@ -75,6 +84,18 @@ import { ChannelActions } from '@iptvnator/m3u-state';
                     <button
                         class="play-btn"
                         mat-fab
+                        [matTooltip]="
+                            (playState() === 'play'
+                                ? 'AUDIO_PLAYER.PAUSE'
+                                : 'AUDIO_PLAYER.PLAY'
+                            ) | translate
+                        "
+                        [attr.aria-label]="
+                            (playState() === 'play'
+                                ? 'AUDIO_PLAYER.PAUSE'
+                                : 'AUDIO_PLAYER.PLAY'
+                            ) | translate
+                        "
                         (click)="playState() === 'play' ? stop() : play()"
                     >
                         <mat-icon>{{
@@ -85,6 +106,10 @@ import { ChannelActions } from '@iptvnator/m3u-state';
                     <button
                         mat-icon-button
                         class="skip-btn"
+                        [matTooltip]="'AUDIO_PLAYER.NEXT_STATION' | translate"
+                        [attr.aria-label]="
+                            'AUDIO_PLAYER.NEXT_STATION' | translate
+                        "
                         (click)="switchChannel('next')"
                     >
                         <mat-icon>skip_next</mat-icon>
@@ -92,13 +117,38 @@ import { ChannelActions } from '@iptvnator/m3u-state';
                 </div>
 
                 <div class="volume-row">
-                    <button mat-icon-button class="vol-icon" (click)="mute()">
+                    <button
+                        mat-icon-button
+                        class="vol-icon"
+                        [matTooltip]="
+                            (isMuted() || volume() === 0
+                                ? 'AUDIO_PLAYER.UNMUTE'
+                                : 'AUDIO_PLAYER.MUTE'
+                            ) | translate
+                        "
+                        [attr.aria-label]="
+                            (isMuted() || volume() === 0
+                                ? 'AUDIO_PLAYER.UNMUTE'
+                                : 'AUDIO_PLAYER.MUTE'
+                            ) | translate
+                        "
+                        (click)="mute()"
+                    >
                         <mat-icon>{{ volumeIcon() }}</mat-icon>
                     </button>
-                    <mat-slider class="vol-slider" min="0" max="1" step="0.05">
+                    <mat-slider
+                        class="vol-slider"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        [matTooltip]="'AUDIO_PLAYER.VOLUME' | translate"
+                    >
                         <input
                             matSliderThumb
                             [ngModel]="volume()"
+                            [attr.aria-label]="
+                                'AUDIO_PLAYER.VOLUME' | translate
+                            "
                             (ngModelChange)="setVolume($event)"
                         />
                     </mat-slider>
@@ -109,14 +159,23 @@ import { ChannelActions } from '@iptvnator/m3u-state';
         </div>
     `,
     styleUrls: ['./audio-player.component.scss'],
-    imports: [MatSliderModule, MatIconModule, MatButtonModule, FormsModule],
+    imports: [
+        FormsModule,
+        MatButtonModule,
+        MatIconModule,
+        MatSliderModule,
+        MatTooltip,
+        TranslatePipe,
+    ],
 })
 export class AudioPlayerComponent {
     readonly icon = input<string>('');
     readonly url = input.required<string>();
     readonly channelName = input<string>('');
+    readonly externalVolume = input<number | null>(null, { alias: 'volume' });
     readonly dispatchAdjacentChannelAction = input(true);
     readonly channelSwitchRequested = output<'next' | 'previous'>();
+    readonly volumeChange = output<number>();
 
     readonly playState = signal<'play' | 'paused'>('paused');
     readonly volume = signal(1);
@@ -145,11 +204,18 @@ export class AudioPlayerComponent {
         }
 
         effect(() => {
+            const volume = this.externalVolume();
+            if (volume === null) return;
+
+            this.setVolume(volume, { emitChange: false });
+        });
+
+        effect(() => {
             const url = this.url();
             const audio = this.audioRef()?.nativeElement;
             if (!audio || !url) return;
             audio.src = url;
-            audio.volume = this.volume();
+            audio.volume = untracked(() => this.volume());
             audio.load();
             this.logoError.set(false);
             this.play();
@@ -182,6 +248,12 @@ export class AudioPlayerComponent {
         )
             return;
 
+        // Inside an inert region (e.g. behind the workspace's phone context
+        // drawer) the player is out of the interaction model: inert strips
+        // pointer and Tab access, but this document-level listener still
+        // fires, so it must opt out itself.
+        if (this.hostEl.nativeElement.closest('[inert]')) return;
+
         if (event.key === 'ArrowUp') {
             event.preventDefault();
             this.setVolume(this.volume() + 0.05);
@@ -208,12 +280,18 @@ export class AudioPlayerComponent {
         this.playState.set('paused');
     }
 
-    setVolume(value: number) {
+    setVolume(
+        value: number,
+        options: { emitChange?: boolean } = {}
+    ) {
         const clamped = Math.round(Math.max(0, Math.min(1, value)) * 100) / 100;
         this.volume.set(clamped);
         const audio = this.audioRef()?.nativeElement;
         if (audio) audio.volume = clamped;
         localStorage.setItem('volume', String(clamped));
+        if (options.emitChange !== false) {
+            this.volumeChange.emit(clamped);
+        }
     }
 
     mute() {

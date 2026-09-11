@@ -1,9 +1,5 @@
 <!-- Hero Section with Backdrop -->
 <section class="hero">
-    <!-- Back Button -->
-    <button class="hero__back-button" (click)="onBack()">
-        <mat-icon>arrow_back</mat-icon>
-    </button>
     @if (errorMessage()) {
         <div class="hero__content hero__error">
             <mat-icon class="error-icon">cloud_off</mat-icon>
@@ -91,17 +87,21 @@
         <!-- Backdrop Image -->
         <div
             class="hero__backdrop"
-            [class.hero__backdrop--blurred]="
-                !backdropUrl() && posterUrl() && !posterError()
-            "
+            [class.hero__backdrop--blurred]="usesPosterBackdrop()"
             [style.backgroundImage]="
-                backdropUrl() && !posterError()
-                    ? 'url(' + backdropUrl() + ')'
-                    : posterUrl() && !posterError()
-                      ? 'url(' + posterUrl() + ')'
-                      : fallbackBackdropBackground()
+                backdropImageUrl() ? null : fallbackBackdropBackground()
             "
-        ></div>
+        >
+            @if (backdropImageUrl(); as backdropImage) {
+                <img
+                    class="hero__backdrop-image"
+                    [src]="backdropImage"
+                    (error)="onBackdropError()"
+                    alt=""
+                    aria-hidden="true"
+                />
+            }
+        </div>
 
         <!-- Gradient Vignette Overlay -->
         <div class="hero__vignette"></div>
@@ -184,9 +184,6 @@
                 <div class="action-buttons">
                     <ng-content select="[hero-actions]"></ng-content>
                 </div>
-
-                <!-- Additional Content (Seasons, Trailers, etc.) -->
-                <ng-content></ng-content>
             </div>
         </div>
     }

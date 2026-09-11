@@ -7,6 +7,8 @@ import { Observable } from 'rxjs';
 import { PlaylistsService } from '@iptvnator/services';
 import {
     createStalkerVodItem,
+    isStalkerSeriesFlag,
+    isStalkerSeriesItem,
     StalkerVodDetails,
     StalkerVodInfo,
     VodDetailsItem,
@@ -47,27 +49,15 @@ export interface StalkerFavoriteToggleOptions {
     onComplete?: () => void;
 }
 
-export function isStalkerSeriesFlag(value: unknown): boolean {
-    return value === true || value === 1 || value === '1';
-}
+// Single definition, shared with the activity-item normalizer and the TMDB
+// hints reader: the dashboard has to reproduce the media type this predicate
+// picks here, and a second copy would drift away from it.
+export { isStalkerSeriesFlag, isStalkerSeriesItem };
 
 export function normalizeStalkerSeriesFlag(
     value: unknown
 ): StalkerSeriesFlag | undefined {
-    if (value === true || value === 1 || value === '1') {
-        return true;
-    }
-    return undefined;
-}
-
-export function isStalkerSeriesItem(item: {
-    is_series?: unknown;
-    series?: unknown;
-}): boolean {
-    return (
-        isStalkerSeriesFlag(item?.is_series) ||
-        (Array.isArray(item?.series) && item.series.length > 0)
-    );
+    return isStalkerSeriesFlag(value) ? true : undefined;
 }
 
 export function buildStalkerFavoritePayload(
@@ -154,9 +144,32 @@ export function createStalkerInfo(item: StalkerVodSource): StalkerVodInfo {
         rating_kinopoisk: toStringOrFallback(
             info.rating_kinopoisk ?? item.rating_kinopoisk
         ),
+        // TMDB enrichment fields must survive re-normalization — detail
+        // views normalize the selected item on every render
+        ...(info.tmdb_id ? { tmdb_id: info.tmdb_id } : {}),
+        ...(info.tmdb_cast ? { tmdb_cast: info.tmdb_cast } : {}),
+        ...(info.tmdb_directors
+            ? { tmdb_directors: info.tmdb_directors }
+            : {}),
+        ...(info.tmdb_status ? { tmdb_status: info.tmdb_status } : {}),
+        ...(info.tmdb_backdrop ? { tmdb_backdrop: info.tmdb_backdrop } : {}),
+        ...(info.tmdb_trailer ? { tmdb_trailer: info.tmdb_trailer } : {}),
+        ...(info.tmdb_recommendations
+            ? { tmdb_recommendations: info.tmdb_recommendations }
+            : {}),
     };
 }
 
+/**
+ * Narrows a raw portal row to the fields the detail/playback flows need.
+ *
+ * This is a whitelist, not a spread, so anything not named here is dropped.
+ * `use_http_tmp_link` / `use_load_balancing` MUST stay on the list: playback
+ * and downloads read them to decide whether `create_link` is required, and a
+ * missing flag reads as "no temporary link needed" — it fails OPEN, playing
+ * the portal's non-final URL instead of minting one. See
+ * `docs/architecture/stalker-portal.md`, "Playback Link Resolution".
+ */
 export function buildStalkerSelectedVodItem(
     item: StalkerVodSource,
     forceSeries = false
@@ -166,6 +179,8 @@ export function buildStalkerSelectedVodItem(
         cmd: toStringOrFallback(item.cmd),
         series: item.series,
         has_files: item.has_files,
+        use_http_tmp_link: item.use_http_tmp_link,
+        use_load_balancing: item.use_load_balancing,
         is_series:
             forceSeries || isStalkerSeriesFlag(item?.is_series)
                 ? true

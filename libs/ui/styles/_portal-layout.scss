@@ -1,12 +1,13 @@
 // ─── Shared mixin for live-stream portal layouts ──────────────────────────────
-// Used by: xtream live-stream-layout, stalker live-stream-layout,
-//           portal-collection-live-shell
+// Used by: xtream live-stream-layout and stalker live-stream-layout.
 //
 // Include this mixin in a component's SCSS to get the shared flex host+sidebar
 // skeleton, then add only the component-specific rules underneath.
 //
-// Usage (after adding libs/ui/styles to stylePreprocessorOptions.includePaths):
-//   @use 'portal-layout' as portal;
+// Choose the relative @use path from each consuming stylesheet. Current portal
+// live layouts use the example below; other consumers may need a different
+// depth.
+//   @use '../../../../../../ui/styles/portal-layout' as portal;
 //   @include portal.live-layout;
 
 @mixin live-layout {
@@ -22,6 +23,8 @@
     .sidebar {
         // Width controlled by the resizable directive at runtime
         width: 400px;
+        box-sizing: border-box;
+        padding-inline-end: 8px;
         min-width: 250px;
         max-width: 600px;
         border-right: 1px solid var(--app-separator);
@@ -40,6 +43,7 @@
             // Beats the inline width set by the resizable directive while
             // preserving it so uncollapsing snaps back to the previous size.
             width: 0 !important;
+            padding-inline-end: 0;
             min-width: 0 !important;
             border-right-color: transparent;
         }
@@ -73,10 +77,10 @@
         position: absolute;
         top: 6px;
         left: 6px;
-        // Player internals, including the radio audio stage, may use z-index
-        // 2 inside the content area. Keep the restore affordance above them
-        // for both paint order and hit testing.
-        z-index: 5;
+        // Player internals, including diagnostic overlays, may use z-index 5
+        // inside the content area. Keep the restore affordance above them for
+        // both paint order and hit testing.
+        z-index: 6;
         background: rgba(128, 128, 128, 0.18);
         color: var(--mat-sys-on-surface, rgba(255, 255, 255, 0.75));
         box-shadow: none;
@@ -126,12 +130,28 @@
             flex-basis 0.18s ease,
             min-height 0.18s ease;
 
+        // Inline (player visible): the guide is a compact panel below the
+        // player, not half the screen. The responsive clamp keeps the player
+        // dominant on tall screens and shrinks the panel on short ones.
+        // External player: no .epg--inline → keeps flex:1 above and fills.
+        &.epg--inline {
+            flex: 0 0 var(--epg-inline-height, clamp(180px, 36vh, 264px));
+        }
+
+        // Vertical list view (epgViewMode = 'list'): rows need more height to
+        // be useful — raise the inline clamp only. Sets just the variable, so
+        // the later `.epg-collapsed` flex rule still wins when collapsed.
+        &.epg--list {
+            --epg-inline-height: clamp(280px, 46vh, 430px);
+        }
+
         &.epg-collapsed {
             flex: 0 0 56px;
             min-height: 56px;
         }
 
-        > app-live-epg-panel {
+        > app-epg-timeline,
+        > app-epg-list-view {
             flex: 1;
             min-height: 0;
         }
@@ -144,8 +164,8 @@
         display: flex;
         flex-direction: column;
 
-        > app-epg-view,
-        > app-live-epg-panel {
+        > app-epg-timeline,
+        > app-epg-list-view {
             flex: 1;
             min-height: 0;
         }
@@ -159,6 +179,70 @@
             > .artplayer-container {
             height: 100% !important;
             width: 100% !important;
+        }
+    }
+
+    // ─── Phone layout ────────────────────────────────────────────────────────
+    // Side by side, the 400px channel list leaves nothing for the player on a
+    // phone, so the two stack instead. The width needs `!important` because
+    // ResizableDirective writes the persisted desktop width inline; dragging
+    // is meaningless at full width, so the handle goes too.
+    @media (max-width: 640px) {
+        :host {
+            flex-direction: column;
+        }
+
+        .sidebar {
+            padding-inline-end: 0;
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: none;
+            flex-shrink: 1;
+            max-height: 42vh;
+            // Without a floor of its own the player's minimum can take the
+            // whole body on a short screen and the list vanishes while still
+            // marked expanded, leaving no way to pick another channel.
+            min-height: 72px;
+            border-right: none;
+            border-bottom: 1px solid var(--app-separator);
+
+            &.sidebar-collapsed {
+                max-height: 0;
+                min-height: 0;
+                border-bottom-color: transparent;
+            }
+
+            .resize-handle {
+                display: none;
+            }
+        }
+
+        .content-container {
+            flex: 1 1 auto;
+        }
+
+        // Inside that container the guide is `flex: 0 0 <basis>` while the
+        // video is `flex: 1 1 0`, so shrinking is distributed by basis and
+        // the video — basis zero — absorbed none of it and collapsed. Here
+        // the video keeps a floor and the guide is what gives way.
+        .video-player {
+            min-height: 96px;
+        }
+
+        .epg.epg--inline {
+            flex-shrink: 1;
+            min-height: 0;
+        }
+    }
+
+    // The player's floor, not the list's ceiling, is what has to hold — but
+    // only where the screen can afford it. A landscape phone already spends
+    // 30vh on the stacked categories panel, so claiming 240px more here left
+    // nothing for the channel list; there, the two panes just share what is
+    // left. Keyed on height because that, not width, is what runs out.
+    @media (max-width: 640px) and (min-height: 600px) {
+        .content-container {
+            min-height: 240px;
         }
     }
 }

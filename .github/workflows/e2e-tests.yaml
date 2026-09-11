@@ -4,15 +4,46 @@ on:
     push:
         branches:
             - master
+        paths-ignore:
+            - '**/*.md'
+            - 'docs/**'
+            - '.plans/**'
+            - '.codex/**'
+            - '.claude/**'
+            - 'apps/website/**'
     pull_request:
         branches:
             - master
+        paths-ignore:
+            - '**/*.md'
+            - 'docs/**'
+            - '.plans/**'
+            - '.codex/**'
+            - '.claude/**'
+            - 'apps/website/**'
+    workflow_dispatch:
+
+# Superseded PR pushes cancel their still-running E2E matrix (the most
+# expensive per-PR runner time). Non-PR runs get a unique group (run_id):
+# GitHub keeps at most one pending run per group even with
+# cancel-in-progress: false, so a shared ref group could silently drop a
+# queued master run between two rapid pushes.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+    contents: read
 
 jobs:
     electron-e2e-tests:
         name: Electron E2E on ${{ matrix.os }}
         runs-on: ${{ matrix.os }}
+        # macOS's sequential Electron suite exceeded 45m while still passing
+        # tests; retain the full suite with room for setup and retries.
+        timeout-minutes: ${{ matrix.os == 'macos-latest' && 60 || 45 }}
         env:
+            IPTVNATOR_ALLOW_PRIVATE_NETWORK_URLS: '1'
             NX_SKIP_NX_CACHE: true
         strategy:
             fail-fast: false
@@ -20,13 +51,13 @@ jobs:
                 os: [ubuntu-latest, macos-latest, windows-latest]
 
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: Install pnpm
-              uses: pnpm/action-setup@v4
+              uses: pnpm/action-setup@v6.0.10
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: '22'
                   cache: 'pnpm'
@@ -52,12 +83,19 @@ jobs:
               env:
                   CI: true
 
+            - name: Summarize Electron E2E semantic coverage
+              if: always()
+              run: pnpm run coverage:e2e:summary -- --project=electron-backend-e2e
+
             - name: Upload Electron Test Results
-              if: failure()
-              uses: actions/upload-artifact@v4
+              if: always()
+              uses: actions/upload-artifact@v7
               with:
                   name: playwright-report-electron-${{ matrix.os }}
-                  path: dist/playwright-report/electron-backend-e2e/
+                  path: |
+                      dist/playwright-report/electron-backend-e2e/
+                      dist/test-results/electron-backend-e2e/
+                      coverage/e2e/
                   retention-days: 7
 
     web-e2e-tests:
@@ -67,13 +105,13 @@ jobs:
             NX_SKIP_NX_CACHE: true
 
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
 
             - name: Install pnpm
-              uses: pnpm/action-setup@v4
+              uses: pnpm/action-setup@v6.0.10
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: '22'
                   cache: 'pnpm'
@@ -89,10 +127,17 @@ jobs:
               env:
                   CI: true
 
+            - name: Summarize Web E2E semantic coverage
+              if: always()
+              run: pnpm run coverage:e2e:summary -- --project=web-e2e
+
             - name: Upload Web Test Results
-              if: failure()
-              uses: actions/upload-artifact@v4
+              if: always()
+              uses: actions/upload-artifact@v7
               with:
                   name: playwright-report-web-ubuntu
-                  path: dist/.playwright/apps/web-e2e/playwright-report/
+                  path: |
+                      dist/playwright-report/web-e2e/
+                      dist/test-results/web-e2e/
+                      coverage/e2e/
                   retention-days: 7

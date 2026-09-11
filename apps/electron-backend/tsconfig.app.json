@@ -2,15 +2,20 @@
     "extends": "./tsconfig.json",
     "compilerOptions": {
         "outDir": "../../dist/out-tsc",
-        "types": ["node"]
+        "types": ["node"],
+        "importHelpers": false
     },
     "files": ["../../global.d.ts"],
     "exclude": [
         "**/*.spec.ts",
+        "**/*.spec-data.ts",
         "**/*.test.ts",
+        "**/*.test-helpers.ts",
         "jest.config.ts",
         "src/**/*.spec.ts",
-        "src/**/*.test.ts"
+        "src/**/*.spec-data.ts",
+        "src/**/*.test.ts",
+        "src/**/*.test-helpers.ts"
     ],
     "include": ["**/*.ts"]
 }

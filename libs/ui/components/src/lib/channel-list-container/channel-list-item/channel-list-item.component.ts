@@ -3,6 +3,7 @@ import { DatePipe, NgStyle } from '@angular/common';
 import {
     ChangeDetectionStrategy,
     Component,
+    computed,
     effect,
     inject,
     input,
@@ -14,8 +15,13 @@ import { MatDialog } from '@angular/material/dialog';
 import { MatIcon } from '@angular/material/icon';
 import { MatTooltip } from '@angular/material/tooltip';
 import { TranslatePipe } from '@ngx-translate/core';
-import { EpgItemDescriptionComponent } from '@iptvnator/ui/epg';
+import {
+    EpgItemDescriptionComponent,
+    getProgramTimeMs,
+} from '@iptvnator/ui/epg';
 import { EpgProgram } from '@iptvnator/shared/interfaces';
+import { SettingsStore } from '@iptvnator/services';
+import { applyChannelNameStrip } from '@iptvnator/shared/m3u-utils';
 
 @Component({
     selector: 'app-channel-list-item',
@@ -35,10 +41,18 @@ import { EpgProgram } from '@iptvnator/shared/interfaces';
 export class ChannelListItemComponent {
     private readonly dialog = inject(MatDialog);
     private readonly logoFailed = signal(false);
+    private readonly settingsStore = inject(SettingsStore);
+    readonly epgOffsetMinutes = this.settingsStore.resolvedEpgOffsetMinutes;
 
     readonly isDraggable = input(false);
     readonly logo = input<string | null | undefined>('');
     readonly name = input('');
+    readonly displayName = computed(() =>
+        applyChannelNameStrip(
+            this.name(),
+            this.settingsStore.stripCountryPrefix?.()
+        )
+    );
     readonly showFavoriteButton = input(false);
     readonly showAuxActionButton = input(false);
     readonly showProgramInfoButton = input(true);
@@ -47,6 +61,15 @@ export class ChannelListItemComponent {
     readonly selected = input(false);
     readonly showEpg = input(true);
     readonly isRadio = input(false);
+    /** Shows the provider catch-up (archive) badge next to the channel name */
+    readonly catchupAvailable = input(false);
+    /** Archive window in days for the badge tooltip; 0 hides the day count */
+    readonly catchupDays = input(0);
+    readonly catchupLabelKey = computed(() =>
+        this.catchupDays() > 0
+            ? 'CHANNELS.CATCHUP_AVAILABLE_DAYS'
+            : 'CHANNELS.CATCHUP_AVAILABLE'
+    );
     readonly epgProgram = input<EpgProgram | null | undefined>();
     /** Progress percentage pre-computed by parent for performance */
     readonly progressPercentage = input(0);
@@ -54,7 +77,10 @@ export class ChannelListItemComponent {
     readonly auxActionTooltip = input('');
 
     readonly clicked = output<void>();
+    /** Pointer double click; consumers retain their existing preference gate. */
     readonly activated = output<void>();
+    /** Explicit keyboard playback, independent of the pointer double-click preference. */
+    readonly keyboardActivated = output<void>();
     readonly favoriteToggled = output<MouseEvent>();
     readonly auxActionClicked = output<MouseEvent>();
     readonly contextMenuRequested = output<MouseEvent>();
@@ -78,6 +104,22 @@ export class ChannelListItemComponent {
         });
     }
 
+    /** Guarded click for the reserved (possibly still empty) info slot. */
+    onProgramInfoClick(event: MouseEvent): void {
+        const program = this.epgProgram();
+        if (!program) {
+            event.stopPropagation();
+            return;
+        }
+
+        this.showProgramDescription(program, event);
+    }
+
+    /** Programme boundary in display time (raw time + the EPG display offset). */
+    programDisplayMs(value: string, timestamp?: number | null): number {
+        return getProgramTimeMs(value, timestamp, this.epgOffsetMinutes());
+    }
+
     onFavoriteClick(event: MouseEvent): void {
         event.stopPropagation();
         this.favoriteToggled.emit(event);
@@ -93,7 +135,11 @@ export class ChannelListItemComponent {
             return;
         }
 
-        this.clicked.emit();
+        if (event?.detail === 0) {
+            this.keyboardActivated.emit();
+        } else {
+            this.clicked.emit();
+        }
     }
 
     onDoubleClick(): void {

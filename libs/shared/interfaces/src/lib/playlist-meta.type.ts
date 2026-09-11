@@ -12,6 +12,10 @@ export type PlaylistMeta = Pick<
     | 'referrer'
     | 'origin'
     | 'filePath'
+    | 'epgUrls'
+    | 'detectedEpgUrls'
+    | 'manualEpgUrls'
+    | 'disabledEpgUrls'
     | 'updateDate'
     | 'updateState'
     | 'position'
@@ -25,6 +29,7 @@ export type PlaylistMeta = Pick<
     | 'hiddenGroupTitles'
     | 'portalUrl'
     | 'recentlyViewed'
+    | 'serverTimezone'
     | 'isFullStalkerPortal'
     | 'stalkerSerialNumber'
     | 'stalkerDeviceId1'
@@ -32,3 +37,23 @@ export type PlaylistMeta = Pick<
     | 'stalkerSignature1'
     | 'stalkerSignature2'
 >;
+
+export interface StalkerPlaylistSessionMetadata {
+    stalkerToken: string;
+    stalkerSessionIdentity?: string;
+    stalkerWatchdogTimeout?: number;
+    stalkerTimeslot?: number;
+    stalkerAccountInfo?: Playlist['stalkerAccountInfo'];
+}
+
+/**
+ * Metadata update accepted by the persistence boundary.
+ *
+ * `stalkerSessionPatch` is transient: absence preserves the negotiated
+ * session, `null` clears it, and an object fully replaces it. The patch is
+ * projected onto the existing flat playlist fields and is never persisted as
+ * its own database or backup property.
+ */
+export interface PlaylistMetaUpdate extends PlaylistMeta {
+    stalkerSessionPatch?: StalkerPlaylistSessionMetadata | null;
+}

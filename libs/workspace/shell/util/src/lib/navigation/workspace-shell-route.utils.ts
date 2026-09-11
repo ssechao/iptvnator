@@ -8,17 +8,14 @@ export type WorkspaceShellPageKind =
     | 'downloads'
     | 'global-favorites'
     | 'global-recent'
+    | 'global-search'
     | 'portal'
     | 'settings'
     | 'sources'
     | 'unknown';
 
 export type WorkspaceShellContextPanel =
-    | 'none'
-    | 'sources'
-    | 'settings'
-    | 'category'
-    | 'collection';
+    'none' | 'sources' | 'settings' | 'category' | 'collection';
 
 export interface WorkspacePortalContext {
     provider: PortalProvider;
@@ -26,10 +23,7 @@ export interface WorkspacePortalContext {
 }
 
 export type WorkspaceShellSearchMode =
-    | 'none'
-    | 'local-filter'
-    | 'remote-search'
-    | 'advanced-only';
+    'none' | 'local-filter' | 'remote-search' | 'advanced-only';
 
 export interface WorkspaceShellRoute {
     kind: WorkspaceShellPageKind;
@@ -92,7 +86,8 @@ function normalizePath(url: string): {
     segments: string[];
     queryParams: URLSearchParams;
 } {
-    const [path, query = ''] = url.split('?');
+    const [urlWithoutFragment] = url.split('#');
+    const [path, query = ''] = urlWithoutFragment.split('?');
     return {
         segments: path.split('/').filter(Boolean),
         queryParams: new URLSearchParams(query),
@@ -194,6 +189,10 @@ function resolveRouteSearchMode(
         return 'local-filter';
     }
 
+    if (kind === 'global-search') {
+        return 'remote-search';
+    }
+
     if (kind === 'portal') {
         return resolvePortalSearchMode(context, section);
     }
@@ -261,6 +260,11 @@ export function parseWorkspaceShellRoute(url: string): WorkspaceShellRoute {
             playlistId: segments[2],
         };
         const section = asPortalRailSection(sectionSegment);
+        const isFocusedDownloadDetail =
+            (provider === 'xtreams' || provider === 'stalker') &&
+            section === 'downloads' &&
+            segments.length === 5 &&
+            Boolean(segments[4]);
 
         return {
             kind: 'portal',
@@ -270,9 +274,15 @@ export function parseWorkspaceShellRoute(url: string): WorkspaceShellRoute {
                 section === 'favorites' &&
                 (provider === 'xtreams' || provider === 'stalker') &&
                 queryParams.get('scope') === 'all',
-            searchMode: resolveRouteSearchMode('portal', context, section),
-            usesQuerySearch: usesWorkspaceRouteQuerySearch(context, section),
-            contextPanel: resolveContextPanel('portal', context, section),
+            searchMode: isFocusedDownloadDetail
+                ? 'none'
+                : resolveRouteSearchMode('portal', context, section),
+            usesQuerySearch: isFocusedDownloadDetail
+                ? false
+                : usesWorkspaceRouteQuerySearch(context, section),
+            contextPanel: isFocusedDownloadDetail
+                ? 'none'
+                : resolveContextPanel('portal', context, section),
         };
     }
 
@@ -288,10 +298,25 @@ export function parseWorkspaceShellRoute(url: string): WorkspaceShellRoute {
                   ? 'global-favorites'
                   : page === 'global-recent'
                     ? 'global-recent'
-                  : page === 'downloads'
-                    ? 'downloads'
-                    : 'unknown';
-    const searchMode = resolveRouteSearchMode(kind, null, null);
+                    : page === 'search'
+                      ? 'global-search'
+                      : page === 'downloads'
+                        ? 'downloads'
+                        : 'unknown';
+    // Focused detail pages hide the context panel and route search:
+    // /workspace/downloads/:downloadId (3 segments) and the recording detail
+    // /workspace/downloads/recording/:recordingId (4 segments).
+    const isFocusedDownloadDetail =
+        kind === 'downloads' &&
+        ((segments.length === 3 &&
+            segments[2] !== 'recording' &&
+            Boolean(segments[2])) ||
+            (segments.length === 4 &&
+                segments[2] === 'recording' &&
+                Boolean(segments[3])));
+    const searchMode = isFocusedDownloadDetail
+        ? 'none'
+        : resolveRouteSearchMode(kind, null, null);
 
     return {
         kind,
@@ -301,6 +326,8 @@ export function parseWorkspaceShellRoute(url: string): WorkspaceShellRoute {
         searchMode,
         usesQuerySearch:
             searchMode === 'local-filter' || searchMode === 'remote-search',
-        contextPanel: resolveContextPanel(kind, null, null),
+        contextPanel: isFocusedDownloadDetail
+            ? 'none'
+            : resolveContextPanel(kind, null, null),
     };
 }

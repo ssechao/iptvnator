@@ -43,7 +43,7 @@ import {
 } from './portal-mock-fixtures';
 
 test.describe('Electron Favorites', () => {
-    test('shows M3U favorites in playlist and all-playlists scope, and preserves them after restart', async ({
+    test('@persistence @m3u @electron shows M3U favorites in playlist and all-playlists scope, and preserves them after restart', async ({
         dataDir,
     }) => {
         const playlistTitle = 'm3u-favorites-source.m3u';
@@ -172,7 +172,7 @@ test.describe('Electron Favorites', () => {
         }
     });
 
-    test('shows Xtream live, movie, and series favorites in playlist and all-playlists scope, and preserves them after restart', async ({
+    test('@persistence @xtream @electron shows Xtream live, movie, and series favorites in playlist and all-playlists scope, and preserves them after restart', async ({
         dataDir,
         request,
     }) => {
@@ -351,7 +351,10 @@ test.describe('Electron Favorites', () => {
             });
 
             await goBackFromDetail(app.mainWindow);
-            await expectPathname(app.mainWindow, /\/workspace\/global-favorites$/);
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/global-favorites$/
+            );
             await expectVisibleContentCardTitle(app.mainWindow, movieTitle);
 
             await switchUnifiedCollectionContent(app.mainWindow, 'Series');
@@ -366,7 +369,10 @@ test.describe('Electron Favorites', () => {
             });
 
             await goBackFromDetail(app.mainWindow);
-            await expectPathname(app.mainWindow, /\/workspace\/global-favorites$/);
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/global-favorites$/
+            );
             await switchUnifiedCollectionContent(app.mainWindow, 'Series');
             await expectVisibleContentCardTitle(app.mainWindow, seriesTitle);
         } finally {
@@ -374,7 +380,7 @@ test.describe('Electron Favorites', () => {
         }
     });
 
-    test('shows Stalker live, movie, and series favorites in playlist and all-playlists scope, and preserves them after restart', async ({
+    test('@persistence @stalker @electron shows Stalker live, movie, and series favorites in playlist and all-playlists scope, and preserves them after restart', async ({
         dataDir,
         request,
     }) => {
@@ -545,7 +551,10 @@ test.describe('Electron Favorites', () => {
             await expectInlinePlayerWithoutDialog(app.mainWindow);
 
             await goBackFromDetail(app.mainWindow);
-            await expectPathname(app.mainWindow, /\/workspace\/global-favorites$/);
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/global-favorites$/
+            );
             await expectVisibleContentCardTitle(app.mainWindow, movieTitle);
 
             await switchUnifiedCollectionContent(app.mainWindow, 'Series');
@@ -562,7 +571,10 @@ test.describe('Electron Favorites', () => {
             await expectInlinePlayerWithoutDialog(app.mainWindow);
 
             await goBackFromDetail(app.mainWindow);
-            await expectPathname(app.mainWindow, /\/workspace\/global-favorites$/);
+            await expectPathname(
+                app.mainWindow,
+                /\/workspace\/global-favorites$/
+            );
             await switchUnifiedCollectionContent(app.mainWindow, 'Series');
             await expectVisibleContentCardTitle(app.mainWindow, seriesTitle);
         } finally {
@@ -576,22 +588,30 @@ const xtreamCredentials = {
     password: defaultXtreamPassword,
 };
 
+// By accessible name, not class: the Xtream movie detail's favorite control is
+// an icon-only button that carries its label in aria-label, while series and
+// Stalker details still use the labeled variant. This matches both.
 async function addCurrentDetailToFavorites(page: Page): Promise<void> {
-    const addButton = page.locator('button.favorite-btn').first();
+    const addButton = page
+        .getByRole('button', { name: /add to favorites/i })
+        .first();
 
     await expect(addButton).toBeVisible({ timeout: 20000 });
     await addButton.click();
     await expect(
-        page.locator('button.favorite-btn--active').first()
+        page.getByRole('button', { name: /remove from favorites/i }).first()
     ).toBeVisible({
         timeout: 20000,
     });
 }
 
 async function goBackFromDetail(page: Page): Promise<void> {
+    // Return to the list: browse uses the sticky Back, watch uses the
+    // now-playing bar's direct Back (the sticky watch action is Close player).
     const backButton = page
-        .locator('app-content-hero .hero__back-button')
-        .first();
+        .locator('app-portal-detail-shell')
+        .first()
+        .getByRole('button', { name: 'Back', exact: true });
 
     await expect(backButton).toBeVisible({ timeout: 20000 });
     try {
@@ -618,7 +638,7 @@ async function expectInlineCollectionDetail(
     await expect(page.locator('app-workspace-context-panel')).toHaveCount(0);
     await expect(page.locator('app-content-hero')).toContainText(params.title);
     await expect(
-        page.locator('app-content-hero .hero__back-button').first()
+        page.locator('app-portal-detail-shell .shell__back-button').first()
     ).toBeVisible({ timeout: 20000 });
 }
 

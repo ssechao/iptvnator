@@ -12,8 +12,16 @@ import { BehaviorSubject, firstValueFrom, of, Subject } from 'rxjs';
 import { EpgService } from '@iptvnator/epg/data-access';
 import { PlaylistContextFacade } from '@iptvnator/playlist/shared/util';
 import { ChannelActions, PlaylistActions } from '@iptvnator/m3u-state';
-import { PlaylistsService, SettingsStore } from '@iptvnator/services';
-import { Channel, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    PlaylistsService,
+    RuntimeCapabilitiesService,
+    SettingsStore,
+} from '@iptvnator/services';
+import {
+    Channel,
+    EpgProgram,
+    PlaylistMeta,
+} from '@iptvnator/shared/interfaces';
 import { ChannelListContainerComponent } from './channel-list-container.component';
 
 function createChannel(id: string, url: string): Channel {
@@ -61,12 +69,30 @@ describe('ChannelListContainerComponent', () => {
     let fixture: ComponentFixture<ChannelListContainerComponent>;
     let dispatch: jest.Mock;
     let activePlaylistSignal: ReturnType<typeof signal<PlaylistMeta | null>>;
+    let epgService: {
+        epgAvailable$: BehaviorSubject<boolean>;
+        getChannelMetadataForChannels: jest.Mock;
+        getCurrentProgramsForChannels: jest.Mock;
+    };
     let favoriteChannelIds$: BehaviorSubject<string[]>;
+    let runtimeCapabilities: { supportsEpg: boolean };
+    let storageGet: jest.Mock;
 
     beforeEach(async () => {
         const routerEvents$ = new Subject<NavigationEnd>();
         dispatch = jest.fn();
         favoriteChannelIds$ = new BehaviorSubject<string[]>([]);
+        runtimeCapabilities = { supportsEpg: true };
+        storageGet = jest.fn().mockReturnValue(of({}));
+        epgService = {
+            epgAvailable$: new BehaviorSubject<boolean>(false),
+            getChannelMetadataForChannels: jest
+                .fn()
+                .mockReturnValue(of(new Map())),
+            getCurrentProgramsForChannels: jest
+                .fn()
+                .mockReturnValue(of(new Map())),
+        };
         activePlaylistSignal = signal<PlaylistMeta | null>({
             _id: 'playlist-1',
             title: 'Playlist One',
@@ -102,14 +128,7 @@ describe('ChannelListContainerComponent', () => {
             providers: [
                 {
                     provide: EpgService,
-                    useValue: {
-                        getChannelMetadataForChannels: jest
-                            .fn()
-                            .mockReturnValue(of(new Map())),
-                        getCurrentProgramsForChannels: jest
-                            .fn()
-                            .mockReturnValue(of(new Map())),
-                    },
+                    useValue: epgService,
                 },
                 {
                     provide: PlaylistsService,
@@ -119,13 +138,18 @@ describe('ChannelListContainerComponent', () => {
                     provide: SettingsStore,
                     useValue: {
                         openStreamOnDoubleClick: signal(false),
+                        resolvedEpgOffsetMinutes: signal(0),
                     },
                 },
                 {
                     provide: StorageMap,
                     useValue: {
-                        get: jest.fn().mockReturnValue(of({})),
+                        get: storageGet,
                     },
+                },
+                {
+                    provide: RuntimeCapabilitiesService,
+                    useValue: runtimeCapabilities,
                 },
                 {
                     provide: Store,
@@ -179,6 +203,196 @@ describe('ChannelListContainerComponent', () => {
         expect(dispatch).toHaveBeenCalledWith(
             ChannelActions.resetActiveChannel()
         );
+    });
+
+    it('keeps the active channel on destroy when the host opts out (fullscreen panel copy)', () => {
+        fixture.componentRef.setInput('resetActiveChannelOnDestroy', false);
+        fixture.detectChanges();
+
+        fixture.destroy();
+
+        expect(dispatch).not.toHaveBeenCalledWith(
+            ChannelActions.resetActiveChannel()
+        );
+    });
+
+    it('prefers a host-supplied search term over the route query parameter', () => {
+        fixture.componentRef.setInput('searchTerm', '  News ');
+        fixture.detectChanges();
+
+        expect(fixture.componentInstance.workspaceSearchTerm()).toBe('news');
+
+        fixture.componentRef.setInput('searchTerm', null);
+        fixture.detectChanges();
+
+        expect(fixture.componentInstance.workspaceSearchTerm()).toBe('');
+    });
+
+    it('does not enable EPG rows when runtime EPG support is unavailable', () => {
+        runtimeCapabilities.supportsEpg = false;
+        storageGet.mockReturnValue(
+            of({ epgUrl: ['https://example.com/epg.xml'] })
+        );
+
+        fixture.detectChanges();
+
+        expect(fixture.componentInstance.shouldShowEpg()).toBe(false);
+        expect(fixture.componentInstance.itemSize()).toBe(52);
+        expect(storageGet).not.toHaveBeenCalled();
+    });
+
+    it('enables EPG rows when runtime EPG support and an EPG URL are available', () => {
+        runtimeCapabilities.supportsEpg = true;
+        storageGet.mockReturnValue(
+            of({ epgUrl: ['https://example.com/epg.xml'] })
+        );
+
+        fixture.detectChanges();
+
+        expect(storageGet).toHaveBeenCalled();
+        expect(fixture.componentInstance.shouldShowEpg()).toBe(true);
+        expect(fixture.componentInstance.itemSize()).toBe(68);
+    });
+
+    it('enables EPG rows and scopes lookups when the active M3U playlist has detected EPG URLs', () => {
+        runtimeCapabilities.supportsEpg = true;
+        storageGet.mockReturnValue(of({ epgUrl: [] }));
+        activePlaylistSignal.set({
+            _id: 'playlist-1',
+            title: 'Playlist One',
+            count: 1,
+            importDate: '2026-04-11T00:00:00.000Z',
+            epgUrls: ['https://playlist.example.com/guide.xml'],
+        } as PlaylistMeta);
+
+        fixture.detectChanges();
+        fixture.componentInstance.channelList = [
+            createChannel('guide-news', 'https://example.com/news.m3u8'),
+        ];
+
+        expect(fixture.componentInstance.shouldShowEpg()).toBe(true);
+        expect(epgService.getCurrentProgramsForChannels).toHaveBeenCalledWith(
+            ['guide-news'],
+            { sourceUrls: ['https://playlist.example.com/guide.xml'] }
+        );
+        expect(epgService.getChannelMetadataForChannels).toHaveBeenCalledWith(
+            ['guide-news'],
+            { sourceUrls: ['https://playlist.example.com/guide.xml'] }
+        );
+    });
+
+    it('drops a superseded EPG refresh that completes after the newer one', () => {
+        runtimeCapabilities.supportsEpg = true;
+        storageGet.mockReturnValue(
+            of({ epgUrl: ['https://global.example.com/guide.xml'] })
+        );
+        const first = new Subject<Map<string, EpgProgram | null>>();
+        const program = (title: string): EpgProgram => ({
+            start: '2026-04-11T10:00:00.000Z',
+            stop: '2026-04-11T11:00:00.000Z',
+            channel: 'guide-news',
+            title,
+            desc: null,
+            category: null,
+        });
+        epgService.getCurrentProgramsForChannels
+            .mockReturnValueOnce(first.asObservable())
+            .mockReturnValueOnce(of(new Map([['guide-news', program('Fresh')]])));
+
+        fixture.detectChanges();
+        const channels = [
+            createChannel('guide-news', 'https://example.com/news.m3u8'),
+        ];
+        fixture.componentInstance.channelList = channels;
+        // A second fetch (e.g. the display offset changed) supersedes the first.
+        fixture.componentInstance.channelList = channels;
+        expect(
+            fixture.componentInstance.channelEpgMap().get('guide-news')?.title
+        ).toBe('Fresh');
+
+        // The stale first fetch lands last and must not overwrite the map.
+        first.next(new Map([['guide-news', program('Stale')]]));
+        first.complete();
+
+        expect(
+            fixture.componentInstance.channelEpgMap().get('guide-news')?.title
+        ).toBe('Fresh');
+    });
+
+    it('refreshes visible channel EPG when playlist EPG URLs arrive after channels', () => {
+        runtimeCapabilities.supportsEpg = true;
+        storageGet.mockReturnValue(of({ epgUrl: [] }));
+
+        fixture.detectChanges();
+        fixture.componentInstance.channelList = [
+            createChannel('guide-news', 'https://example.com/news.m3u8'),
+        ];
+        expect(epgService.getCurrentProgramsForChannels).toHaveBeenCalledWith(
+            ['guide-news'],
+            undefined
+        );
+        epgService.getCurrentProgramsForChannels.mockClear();
+        epgService.getChannelMetadataForChannels.mockClear();
+
+        activePlaylistSignal.set({
+            _id: 'playlist-1',
+            title: 'Playlist One',
+            count: 1,
+            importDate: '2026-04-11T00:00:00.000Z',
+            epgUrls: ['https://playlist.example.com/guide.xml'],
+        } as PlaylistMeta);
+        fixture.detectChanges();
+
+        expect(epgService.getCurrentProgramsForChannels).toHaveBeenCalledWith(
+            ['guide-news'],
+            { sourceUrls: ['https://playlist.example.com/guide.xml'] }
+        );
+        expect(epgService.getChannelMetadataForChannels).toHaveBeenCalledWith(
+            ['guide-news'],
+            { sourceUrls: ['https://playlist.example.com/guide.xml'] }
+        );
+    });
+
+    it('debounces visible channel EPG row refreshes after EPG imports complete', () => {
+        jest.useFakeTimers();
+        try {
+            runtimeCapabilities.supportsEpg = true;
+            activePlaylistSignal.set({
+                _id: 'playlist-1',
+                title: 'Playlist One',
+                count: 1,
+                importDate: '2026-04-11T00:00:00.000Z',
+                epgUrls: ['https://playlist.example.com/guide.xml'],
+            } as PlaylistMeta);
+
+            fixture.detectChanges();
+            fixture.componentInstance.channelList = [
+                createChannel('guide-news', 'https://example.com/news.m3u8'),
+            ];
+            epgService.getCurrentProgramsForChannels.mockClear();
+
+            epgService.epgAvailable$.next(true);
+            epgService.epgAvailable$.next(true);
+            jest.advanceTimersByTime(1999);
+
+            expect(
+                epgService.getCurrentProgramsForChannels
+            ).not.toHaveBeenCalled();
+
+            jest.advanceTimersByTime(1);
+
+            expect(
+                epgService.getCurrentProgramsForChannels
+            ).toHaveBeenCalledTimes(1);
+            expect(
+                epgService.getCurrentProgramsForChannels
+            ).toHaveBeenCalledWith(['guide-news'], {
+                sourceUrls: ['https://playlist.example.com/guide.xml'],
+            });
+        } finally {
+            fixture.destroy();
+            jest.useRealTimers();
+        }
     });
 
     it('dispatches playlist meta updates when hidden group titles change', () => {

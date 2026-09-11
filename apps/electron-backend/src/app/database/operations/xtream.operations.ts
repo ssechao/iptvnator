@@ -1,31 +1,35 @@
 import { and, eq, inArray } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
-import type {
-    XtreamBackupFavoriteItem,
-    XtreamBackupCategoryType,
-    XtreamBackupHiddenCategory,
-    XtreamBackupRecentlyViewedItem,
+import {
+    XTREAM_DATABASE_PERFORMANCE_PHASE,
+    type XtreamBackupFavoriteItem,
+    type XtreamBackupHiddenCategory,
+    type XtreamBackupRecentlyViewedItem,
 } from '@iptvnator/shared/interfaces';
 import type { AppDatabase } from '../database.types';
 import { storeHiddenCategoryXtreamIds } from './category.operations';
+import {
+    type CategoryRowCount,
+    countContentRowsByCategory,
+    deleteCategoriesWhere,
+    deleteContentByCategoryGroups,
+    sumCategoryRowCounts,
+} from './catalog-deletion';
 import {
     checkpointOperation,
     chunkValues,
     type OperationControl,
     reportOperationProgress,
 } from './operation-control';
+import type { DatabaseOperationPerformancePhaseCapture } from './performance-phase-capture';
 
+/** Favorites and recently-viewed rows restored per transaction. */
 const DEFAULT_BATCH_SIZE = 100;
 
 type ContentIdentity = {
     id: number;
     xtreamId: number;
     contentType: XtreamBackupFavoriteItem['contentType'];
-};
-
-type CategoryVisibilityScope = {
-    type: XtreamBackupCategoryType;
-    hiddenXtreamIds: number[];
 };
 
 function toContentIdentityKey(
@@ -35,16 +39,20 @@ function toContentIdentityKey(
     return `${contentType}:${xtreamId}`;
 }
 
-export async function deleteXtreamContent(
+interface XtreamDeletionCollection {
+    readonly categoryIds: number[];
+    readonly categoryTypes: Array<'live' | 'movies' | 'series'>;
+    /** Content rows per category, the unit the delete is batched by. */
+    readonly contentRowCounts: CategoryRowCount[];
+    readonly favorites: XtreamBackupFavoriteItem[];
+    readonly hiddenCategories: XtreamBackupHiddenCategory[];
+    readonly recentlyViewed: XtreamBackupRecentlyViewedItem[];
+}
+
+async function collectXtreamDeletionRows(
     db: AppDatabase,
-    playlistId: string,
-    control?: OperationControl
-): Promise<{
-    success: boolean;
-    favorites: XtreamBackupFavoriteItem[];
-    recentlyViewed: XtreamBackupRecentlyViewedItem[];
-    hiddenCategories: XtreamBackupHiddenCategory[];
-}> {
+    playlistId: string
+): Promise<XtreamDeletionCollection> {
     const categories = await db
         .select({
             id: schema.categories.id,
@@ -62,35 +70,10 @@ export async function deleteXtreamContent(
             xtreamId: category.xtreamId,
             categoryType: category.type,
         }));
-    const visibilityScopes = new Map<
-        XtreamBackupCategoryType,
-        CategoryVisibilityScope
-    >();
-
-    for (const category of categories) {
-        const scope = visibilityScopes.get(category.type) ?? {
-            type: category.type,
-            hiddenXtreamIds: [],
-        };
-
-        if (category.hidden) {
-            scope.hiddenXtreamIds.push(category.xtreamId);
-        }
-
-        visibilityScopes.set(category.type, scope);
-    }
-
-    for (const scope of visibilityScopes.values()) {
-        await storeHiddenCategoryXtreamIds(
-            db,
-            playlistId,
-            scope.type,
-            scope.hiddenXtreamIds
-        );
-    }
 
     let favorites: XtreamBackupFavoriteItem[] = [];
     let recentlyViewed: XtreamBackupRecentlyViewedItem[] = [];
+    let contentRowCounts: CategoryRowCount[] = [];
 
     if (categoryIds.length > 0) {
         const favoritedContent = await db
@@ -143,58 +126,123 @@ export async function deleteXtreamContent(
             viewedAt: item.viewedAt || new Date().toISOString(),
         }));
 
-        const contentRows = await db
-            .select({ id: schema.content.id })
-            .from(schema.content)
-            .where(inArray(schema.content.categoryId, categoryIds));
-
-        let deletedContent = 0;
-        const totalContent = contentRows.length;
-
-        for (const chunk of chunkValues(
-            contentRows.map((content) => content.id),
-            DEFAULT_BATCH_SIZE
-        )) {
-            await checkpointOperation(control);
-            await db.transaction((tx) => {
-                tx.delete(schema.content)
-                    .where(inArray(schema.content.id, chunk))
-                    .run();
-            });
-            deletedContent += chunk.length;
-            await reportOperationProgress(control, {
-                phase: 'deleting-content',
-                current: deletedContent,
-                total: totalContent,
-                increment: chunk.length,
-            });
-        }
+        contentRowCounts = await countContentRowsByCategory(
+            db,
+            inArray(schema.categories.id, categoryIds)
+        );
     }
 
-    let deletedCategories = 0;
-    const totalCategories = categoryIds.length;
+    return {
+        categoryIds,
+        categoryTypes: [
+            ...new Set(categories.map((category) => category.type)),
+        ],
+        contentRowCounts,
+        favorites,
+        hiddenCategories,
+        recentlyViewed,
+    };
+}
 
-    for (const chunk of chunkValues(categoryIds, DEFAULT_BATCH_SIZE)) {
+/**
+ * Drops the collected catalog: content in row-budgeted category groups, then
+ * the captured categories in one statement. Both stay scoped to the ids the
+ * collection step read, never to the whole playlist: the worker serves other
+ * requests between commits, so a newer import of the same playlist may have
+ * created categories this refresh must not erase. Returns the number of
+ * deletion candidates (content rows plus categories) for phase metadata.
+ */
+async function deleteCollectedXtreamRows(
+    db: AppDatabase,
+    collection: XtreamDeletionCollection,
+    control?: OperationControl
+): Promise<number> {
+    await deleteContentByCategoryGroups(db, collection.contentRowCounts, {
+        control,
+        phase: 'deleting-content',
+    });
+
+    const totalCategories = collection.categoryIds.length;
+    if (totalCategories > 0) {
         await checkpointOperation(control);
-        await db.transaction((tx) => {
-            tx.delete(schema.categories)
-                .where(inArray(schema.categories.id, chunk))
-                .run();
-        });
-        deletedCategories += chunk.length;
+        const deletedCategories = await deleteCategoriesWhere(
+            db,
+            inArray(schema.categories.id, collection.categoryIds)
+        );
         await reportOperationProgress(control, {
             phase: 'deleting-categories',
             current: deletedCategories,
             total: totalCategories,
-            increment: chunk.length,
+            increment: deletedCategories,
         });
+    }
+
+    return sumCategoryRowCounts(collection.contentRowCounts) + totalCategories;
+}
+
+async function persistCollectedCategoryVisibility(
+    db: AppDatabase,
+    playlistId: string,
+    categoryTypes: Array<'live' | 'movies' | 'series'>,
+    hiddenCategories: XtreamBackupHiddenCategory[]
+): Promise<void> {
+    for (const type of categoryTypes) {
+        await storeHiddenCategoryXtreamIds(
+            db,
+            playlistId,
+            type,
+            hiddenCategories
+                .filter((category) => category.categoryType === type)
+                .map((category) => category.xtreamId)
+        );
+    }
+}
+
+export async function deleteXtreamContent(
+    db: AppDatabase,
+    playlistId: string,
+    control?: OperationControl,
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
+): Promise<{
+    success: boolean;
+    favorites: XtreamBackupFavoriteItem[];
+    recentlyViewed: XtreamBackupRecentlyViewedItem[];
+    hiddenCategories: XtreamBackupHiddenCategory[];
+}> {
+    const collection = capturePhase
+        ? await capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_XTREAM_DELETE_COLLECT_USER_DATA,
+              () => collectXtreamDeletionRows(db, playlistId),
+              (result) => ({
+                  itemCount:
+                      sumCategoryRowCounts(result.contentRowCounts) +
+                      result.categoryIds.length,
+              })
+          )
+        : await collectXtreamDeletionRows(db, playlistId);
+
+    await persistCollectedCategoryVisibility(
+        db,
+        playlistId,
+        collection.categoryTypes,
+        collection.hiddenCategories
+    );
+
+    if (capturePhase) {
+        await capturePhase.captureAsync(
+            XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_XTREAM_DELETE_WRITE_TRANSACTIONS,
+            () => deleteCollectedXtreamRows(db, collection, control),
+            (itemCount) => ({ itemCount })
+        );
+    } else {
+        await deleteCollectedXtreamRows(db, collection, control);
     }
 
     return {
         success: true,
-        favorites,
-        recentlyViewed,
-        hiddenCategories,
+        favorites: collection.favorites,
+        recentlyViewed: collection.recentlyViewed,
+        hiddenCategories: collection.hiddenCategories,
     };
 }
 

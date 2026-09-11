@@ -1,4 +1,6 @@
+import { CdkFixedSizeVirtualScroll } from '@angular/cdk/scrolling';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { By } from '@angular/platform-browser';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
 import { MatDialog } from '@angular/material/dialog';
 import { TranslateModule } from '@ngx-translate/core';
@@ -213,6 +215,26 @@ describe('GroupsViewComponent', () => {
         expect(component.groupChannelSortLabel()).toBe('Playlist Order');
     });
 
+    it('keeps the virtual-scroll item size aligned with row EPG density', () => {
+        setInputs({ shouldShowEpg: false });
+
+        expect(component.itemSize()).toBe(52);
+        expect(
+            fixture.debugElement
+                .query(By.css('cdk-virtual-scroll-viewport'))
+                .injector.get(CdkFixedSizeVirtualScroll).itemSize
+        ).toBe(52);
+
+        setInputs({ shouldShowEpg: true });
+
+        expect(component.itemSize()).toBe(68);
+        expect(
+            fixture.debugElement
+                .query(By.css('cdk-virtual-scroll-viewport'))
+                .injector.get(CdkFixedSizeVirtualScroll).itemSize
+        ).toBe(68);
+    });
+
     it('restores a saved valid sort mode and ignores invalid stored values', () => {
         fixture.destroy();
         localStorage.setItem(GROUP_CHANNEL_SORT_STORAGE_KEY, 'name-asc');
@@ -340,6 +362,23 @@ describe('GroupsViewComponent', () => {
         expect(component.selectedGroupKey()).toBe('Movies');
     });
 
+    it('reports the shown group for auto-selection and manual clicks', () => {
+        const selected: Array<string | null> = [];
+        component.selectedGroupChange.subscribe((key) => selected.push(key));
+
+        setInputs({ activeChannelUrl: worldUpdate.url });
+        expect(selected).toEqual(['News']);
+
+        component.selectGroup('Movies');
+        fixture.detectChanges();
+        expect(selected).toEqual(['News', 'Movies']);
+
+        // Re-selecting the shown group is not a change.
+        component.selectGroup('Movies');
+        fixture.detectChanges();
+        expect(selected).toEqual(['News', 'Movies']);
+    });
+
     it('retains a visible manual selection and falls back to the first visible group', () => {
         component.selectGroup('Movies');
         fixture.detectChanges();
@@ -366,6 +405,39 @@ describe('GroupsViewComponent', () => {
 
         setInputs({ activeChannelUrl: scienceNow.url });
         expect(component.selectedGroupKey()).toBe('Series');
+    });
+
+    it('pins the groups rail and leaves the sidebar width alone in compact mode', () => {
+        // Inside the 400px fullscreen panel a rail the user once dragged to
+        // 320px would leave the channel pane unusable, so the panel instance
+        // neither reads nor writes the sidebar's persisted width.
+        localStorage.setItem('m3u-groups-nav-width', '320');
+        // The rail is sized once, when the resize directive initialises, so
+        // the panel instance is created compact from the start — exactly as
+        // the container binds it.
+        fixture.destroy();
+        fixture = TestBed.createComponent(GroupsViewComponent);
+        component = fixture.componentInstance;
+        fixture.componentRef.setInput('compact', true);
+        setInputs();
+        const sidebarWidthRequested = jest.fn();
+        component.sidebarWidthRequested.subscribe(sidebarWidthRequested);
+
+        const rail = fixture.nativeElement.querySelector(
+            'aside.groups-nav-panel'
+        ) as HTMLElement;
+        expect(rail.classList.contains('groups-nav-panel--compact')).toBe(
+            true
+        );
+        expect(rail.style.width).toBe('148px');
+        expect(localStorage.getItem('m3u-groups-nav-width')).toBe('320');
+
+        component.onGroupsNavWidthChange(300);
+        component.onGroupsNavResizeEnd(300);
+        expect(sidebarWidthRequested).not.toHaveBeenCalled();
+
+        localStorage.removeItem('m3u-groups-nav-width');
+        localStorage.removeItem('m3u-groups-nav-width-fullscreen');
     });
 
     it('keeps group selection behavior unchanged when channel sort mode changes', () => {
@@ -457,6 +529,22 @@ describe('GroupsViewComponent', () => {
             'News',
             'Sports',
         ]);
+    });
+
+    it('drops the selected-group header in compact mode but keeps the groups rail header', () => {
+        fixture.componentRef.setInput('showHeader', false);
+        fixture.detectChanges();
+
+        expect(component.selectedGroupKey()).not.toBeNull();
+        expect(
+            fixture.nativeElement.querySelector('.groups-content-header')
+        ).toBeNull();
+        expect(
+            fixture.nativeElement.querySelector('.groups-nav-header')
+        ).not.toBeNull();
+        expect(
+            fixture.nativeElement.querySelector('.groups-channels-viewport')
+        ).not.toBeNull();
     });
 
     it('toggles the inline group search from the header action and filters the visible groups', () => {

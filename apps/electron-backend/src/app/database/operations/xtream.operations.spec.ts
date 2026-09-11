@@ -27,7 +27,37 @@ function selectJoinWhere(result: unknown[]) {
     };
 }
 
+function selectJoinWhereGroupBy(result: unknown[]) {
+    const groupBy = jest.fn().mockResolvedValue(result);
+    const where = jest.fn().mockReturnValue({ groupBy });
+    const innerJoin = jest.fn().mockReturnValue({ where });
+    const from = jest.fn().mockReturnValue({ innerJoin });
+
+    return { query: { from } };
+}
+
 describe('xtream.operations', () => {
+    it('does not erase stored visibility when an interrupted refresh left no categories', async () => {
+        const categoriesQuery = selectWhere([]);
+        const insert = jest.fn();
+        const transaction = jest.fn();
+        const db = {
+            insert,
+            select: jest.fn().mockReturnValue(categoriesQuery.query),
+            transaction,
+        } as unknown as AppDatabase;
+
+        await expect(deleteXtreamContent(db, 'playlist-1')).resolves.toEqual({
+            success: true,
+            favorites: [],
+            recentlyViewed: [],
+            hiddenCategories: [],
+        });
+
+        expect(insert).not.toHaveBeenCalled();
+        expect(transaction).not.toHaveBeenCalled();
+    });
+
     it('persists category visibility preferences before deleting refresh content', async () => {
         const categoriesQuery = selectWhere([
             {
@@ -57,7 +87,7 @@ describe('xtream.operations', () => {
         ]);
         const favoritesQuery = selectJoinWhere([]);
         const recentlyViewedQuery = selectJoinWhere([]);
-        const contentRowsQuery = selectWhere([]);
+        const contentRowsQuery = selectJoinWhereGroupBy([]);
         const select = jest
             .fn()
             .mockReturnValueOnce(categoriesQuery.query)
@@ -69,7 +99,7 @@ describe('xtream.operations', () => {
             .fn()
             .mockReturnValue({ onConflictDoUpdate });
         const insert = jest.fn().mockReturnValue({ values: appStateValues });
-        const run = jest.fn();
+        const run = jest.fn(() => ({ changes: 4 }));
         const deleteWhere = jest.fn().mockReturnValue({ run });
         const deleteFrom = jest.fn().mockReturnValue({ where: deleteWhere });
         const transaction = jest.fn((callback: (tx: unknown) => unknown) =>

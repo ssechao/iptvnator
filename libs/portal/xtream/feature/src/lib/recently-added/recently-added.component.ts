@@ -1,4 +1,9 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import {
+    ChangeDetectionStrategy,
+    Component,
+    computed,
+    inject,
+} from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, Router } from '@angular/router';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
@@ -7,6 +12,7 @@ import {
     ContentCardComponent,
     ContentRailShellComponent,
 } from '@iptvnator/portal/shared/ui';
+import { toXtreamRecentlyAddedTimestamp } from '@iptvnator/shared/interfaces';
 import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
 import { ContentType } from '@iptvnator/portal/xtream/data-access';
 
@@ -28,6 +34,7 @@ interface RecentlyAddedItem {
 // Three placeholder slots per skeleton rail — enough to suggest a horizontal
 // scroll without taking the whole viewport.
 const SKELETON_CARDS_PER_RAIL = [1, 2, 3, 4, 5, 6] as const;
+const RECENTLY_ADDED_ITEMS_LIMIT = 30;
 
 @Component({
     selector: 'app-recently-added',
@@ -97,9 +104,7 @@ export class RecentlyAddedComponent {
     );
 
     readonly vodSeeAllLink = computed(() => this.buildSectionLink('vod'));
-    readonly seriesSeeAllLink = computed(() =>
-        this.buildSectionLink('series')
-    );
+    readonly seriesSeeAllLink = computed(() => this.buildSectionLink('series'));
     readonly liveSeeAllLink = computed(() => this.buildSectionLink('live'));
 
     readonly vodSeeAllLabel = computed(() =>
@@ -112,7 +117,9 @@ export class RecentlyAddedComponent {
         this.translateWithTick('PORTALS.BROWSE_ALL_LIVE')
     );
 
-    private buildSectionLink(section: 'vod' | 'series' | 'live'): string[] | null {
+    private buildSectionLink(
+        section: 'vod' | 'series' | 'live'
+    ): string[] | null {
         const id = this.playlistId();
         if (!id) return null;
         return ['/workspace', 'xtreams', id, section];
@@ -127,37 +134,101 @@ export class RecentlyAddedComponent {
         items: T[],
         isSeries = false
     ): T[] {
-        return [...items]
+        const nowMs = Date.now();
+
+        return items
+            .map((item) => ({
+                item,
+                sortTimestamp: this.getSortTimestamp(item, isSeries, nowMs),
+            }))
+            .filter(({ sortTimestamp }) => sortTimestamp > 0)
             .sort((a, b) => {
-                const dateA =
-                    parseInt(isSeries ? a.last_modified : a.added) || 0;
-                const dateB =
-                    parseInt(isSeries ? b.last_modified : b.added) || 0;
-                return dateB - dateA;
+                return b.sortTimestamp - a.sortTimestamp;
             })
-            .slice(0, 20);
+            .slice(0, RECENTLY_ADDED_ITEMS_LIMIT)
+            .map(({ item }) => item);
     }
 
-    getDate(item: RecentlyAddedItem): number {
-        const timestamp = item.added || item.last_modified;
-        return parseInt(timestamp) * 1000;
+    getDate(item: RecentlyAddedItem, isSeries = false): number {
+        const nowMs = Date.now();
+        return (
+            toXtreamRecentlyAddedTimestamp(
+                this.getPrimaryTimestamp(item, isSeries),
+                nowMs
+            ) ||
+            toXtreamRecentlyAddedTimestamp(
+                this.getFallbackTimestamp(item, isSeries),
+                nowMs
+            )
+        );
+    }
+
+    private getSortTimestamp(
+        item: RecentlyAddedItem,
+        isSeries: boolean,
+        nowMs: number
+    ): number {
+        return (
+            toXtreamRecentlyAddedTimestamp(
+                this.getPrimaryTimestamp(item, isSeries),
+                nowMs
+            ) ||
+            toXtreamRecentlyAddedTimestamp(
+                this.getFallbackTimestamp(item, isSeries),
+                nowMs
+            )
+        );
+    }
+
+    private getPrimaryTimestamp(
+        item: RecentlyAddedItem,
+        isSeries: boolean
+    ): string | undefined {
+        return isSeries ? item.last_modified : item.added;
+    }
+
+    private getFallbackTimestamp(
+        item: RecentlyAddedItem,
+        isSeries: boolean
+    ): string | undefined {
+        return isSeries ? item.added : item.last_modified;
     }
 
     openItem(item: RecentlyAddedItem, type: ContentType) {
         this.xtreamStore.setSelectedContentType(type);
 
         if (type === 'live') {
+            const itemId = this.getItemId(item, type);
             this.router.navigate(['..', type, item.category_id], {
                 relativeTo: this.activatedRoute,
+                ...(itemId
+                    ? {
+                          state: {
+                              openXtreamLiveItemId: Number(itemId),
+                              openXtreamLiveTitle:
+                                  item.title || item.name || '',
+                              openXtreamLivePoster:
+                                  item.poster_url || item.stream_icon || '',
+                          },
+                      }
+                    : {}),
             });
         } else {
-            const itemId =
-                item.xtream_id ||
-                item.id ||
-                (type === 'series' ? item.series_id : item.stream_id);
+            const itemId = this.getItemId(item, type);
             this.router.navigate(['..', type, item.category_id, itemId], {
                 relativeTo: this.activatedRoute,
             });
         }
+    }
+
+    private getItemId(
+        item: RecentlyAddedItem,
+        type: ContentType
+    ): number | undefined {
+        return (
+            item.xtream_id ||
+            item.id ||
+            (type === 'series' ? item.series_id : item.stream_id)
+        );
     }
 }

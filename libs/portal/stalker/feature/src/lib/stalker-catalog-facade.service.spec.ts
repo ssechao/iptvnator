@@ -2,6 +2,7 @@ import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { StalkerStore } from '@iptvnator/portal/stalker/data-access';
 import { PORTAL_PLAYBACK_POSITIONS } from '@iptvnator/portal/shared/util';
+import { PlaybackPositionRuntimeBridgeService } from '@iptvnator/services';
 import { PlaybackPositionData } from '@iptvnator/shared/interfaces';
 import { StalkerCatalogFacadeService } from './stalker-catalog-facade.service';
 
@@ -17,15 +18,39 @@ describe('StalkerCatalogFacadeService', () => {
     };
     const unsubscribe = jest.fn();
     let playbackUpdateHandler:
-        | ((data: PlaybackPositionData) => void)
-        | undefined;
+        ((data: PlaybackPositionData) => void) | undefined;
+    let playbackPositionBridge: {
+        onPlaybackPositionUpdate: jest.Mock<
+            (() => void) | undefined,
+            [(data: PlaybackPositionData) => void]
+        >;
+    };
     let playbackPositions: {
-        savePlaybackPosition: jest.Mock<Promise<void>, [string, PlaybackPositionData]>;
-        getPlaybackPosition: jest.Mock<Promise<PlaybackPositionData | null>, [string, number, 'vod' | 'episode']>;
-        getSeriesPlaybackPositions: jest.Mock<Promise<PlaybackPositionData[]>, [string, number]>;
+        savePlaybackPosition: jest.Mock<
+            Promise<void>,
+            [string, PlaybackPositionData]
+        >;
+        getPlaybackPosition: jest.Mock<
+            Promise<PlaybackPositionData | null>,
+            [string, number, 'vod' | 'episode']
+        >;
+        getSeriesPlaybackPositions: jest.Mock<
+            Promise<PlaybackPositionData[]>,
+            [string, number]
+        >;
         getRecentPlaybackPositions?: jest.Mock;
-        getAllPlaybackPositions: jest.Mock<Promise<PlaybackPositionData[]>, [string]>;
-        clearPlaybackPosition: jest.Mock<Promise<void>, [string, number, 'vod' | 'episode']>;
+        getAllPlaybackPositions: jest.Mock<
+            Promise<PlaybackPositionData[]>,
+            [string]
+        >;
+        clearPlaybackPosition: jest.Mock<
+            Promise<void>,
+            [string, number, 'vod' | 'episode']
+        >;
+    };
+    let stalkerStoreMock: Record<string, unknown> & {
+        setSearchPhrase: jest.Mock;
+        setSelectedItem: jest.Mock;
     };
 
     beforeEach(() => {
@@ -38,9 +63,7 @@ describe('StalkerCatalogFacadeService', () => {
             getAllPlaybackPositions: jest.fn().mockResolvedValue([]),
             clearPlaybackPosition: jest.fn().mockResolvedValue(undefined),
         };
-
-        (window as Window & { electron?: typeof window.electron }).electron = {
-            ...(window.electron ?? {}),
+        playbackPositionBridge = {
             onPlaybackPositionUpdate: jest.fn(
                 (handler: (data: PlaybackPositionData) => void) => {
                     playbackUpdateHandler = handler;
@@ -48,40 +71,47 @@ describe('StalkerCatalogFacadeService', () => {
                 }
             ),
         };
+        stalkerStoreMock = {
+            selectedContentType: signal<'vod' | 'series' | 'itv'>('vod'),
+            page: signal(0),
+            selectedCategoryId: signal<string | null>('5'),
+            searchPhrase: signal(''),
+            getSelectedCategory: signal(null),
+            getPaginatedContent: signal([]),
+            selectedItem: signal(null),
+            hasMoreContent: signal(false),
+            hasContentAppendError: signal(false),
+            isPaginatedContentLoading: signal(false),
+            currentPlaylist: signal(playlist),
+            getSelectedCategoryName: jest.fn(() => null),
+            setSelectedCategory: jest.fn(),
+            clearSelectedItem: jest.fn(),
+            setSearchPhrase: jest.fn(),
+            nextPage: jest.fn(),
+            retryContentPage: jest.fn(),
+            setSelectedItem: jest.fn(),
+            createLinkToPlayVod: jest.fn(),
+            addToFavorites: jest.fn(),
+            removeFromFavorites: jest.fn(),
+            fetchMovieFileId: jest.fn(),
+            fetchLinkToPlay: jest.fn(),
+            resolveVodPlayback: jest.fn(),
+        };
 
         TestBed.configureTestingModule({
             providers: [
                 StalkerCatalogFacadeService,
                 {
                     provide: StalkerStore,
-                    useValue: {
-                        selectedContentType: signal<'vod' | 'series' | 'itv'>('vod'),
-                        limit: signal(14),
-                        page: signal(0),
-                        getSelectedCategory: signal(null),
-                        getPaginatedContent: signal([]),
-                        selectedItem: signal(null),
-                        getTotalPages: signal(0),
-                        isPaginatedContentLoading: signal(false),
-                        currentPlaylist: signal(playlist),
-                        getSelectedCategoryName: jest.fn(() => null),
-                        setSelectedCategory: jest.fn(),
-                        clearSelectedItem: jest.fn(),
-                        setSearchPhrase: jest.fn(),
-                        setPage: jest.fn(),
-                        setLimit: jest.fn(),
-                        setSelectedItem: jest.fn(),
-                        createLinkToPlayVod: jest.fn(),
-                        addToFavorites: jest.fn(),
-                        removeFromFavorites: jest.fn(),
-                        fetchMovieFileId: jest.fn(),
-                        fetchLinkToPlay: jest.fn(),
-                        resolveVodPlayback: jest.fn(),
-                    },
+                    useValue: stalkerStoreMock,
                 },
                 {
                     provide: PORTAL_PLAYBACK_POSITIONS,
                     useValue: playbackPositions,
+                },
+                {
+                    provide: PlaybackPositionRuntimeBridgeService,
+                    useValue: playbackPositionBridge,
                 },
             ],
         });
@@ -89,14 +119,59 @@ describe('StalkerCatalogFacadeService', () => {
 
     it('delegates category search query updates to the Stalker store', () => {
         const service = TestBed.inject(StalkerCatalogFacadeService);
-        const store = TestBed.inject(StalkerStore) as unknown as {
-            setSearchPhrase: jest.Mock;
-        };
 
         service.setSearchQuery('matrix');
 
-        expect(store.setSearchPhrase).toHaveBeenCalledWith('matrix');
+        expect(stalkerStoreMock.setSearchPhrase).toHaveBeenCalledWith('matrix');
     });
+
+    it.each([true, 1, '1'] as const)(
+        'normalizes supported is_series flag %p when selecting an item',
+        (isSeries) => {
+            const service = TestBed.inject(StalkerCatalogFacadeService);
+
+            service.selectItem({ id: '42', is_series: isSeries });
+
+            expect(stalkerStoreMock.setSelectedItem).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    id: '42',
+                    is_series: true,
+                })
+            );
+        }
+    );
+
+    it.each([true, 1, '1'] as const)(
+        'returns empty series progress for supported is_series flag %p',
+        (isSeries) => {
+            const service = TestBed.inject(StalkerCatalogFacadeService);
+
+            expect(
+                service.getItemProgress({ id: '42', is_series: isSeries })
+            ).toEqual({ hasSeriesProgress: false });
+        }
+    );
+
+    it.each([false, 0] as const)(
+        'keeps non-series flag %p on the ordinary VOD path',
+        (isSeries) => {
+            const service = TestBed.inject(StalkerCatalogFacadeService);
+            const item = { id: '42', is_series: isSeries };
+
+            service.selectItem(item);
+
+            expect(stalkerStoreMock.setSelectedItem).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    id: '42',
+                    is_series: undefined,
+                })
+            );
+            expect(service.getItemProgress(item)).toEqual({
+                progress: 0,
+                isWatched: false,
+            });
+        }
+    );
 
     it('persists matching external playback updates for the current playlist', async () => {
         TestBed.inject(StalkerCatalogFacadeService);
@@ -139,5 +214,96 @@ describe('StalkerCatalogFacadeService', () => {
         await Promise.resolve();
 
         expect(playbackPositions.savePlaybackPosition).not.toHaveBeenCalled();
+    });
+
+    it('splits loading into the initial skeleton and the append tail by portal page', () => {
+        const service = TestBed.inject(StalkerCatalogFacadeService);
+        const loading = stalkerStoreMock['isPaginatedContentLoading'] as ReturnType<
+            typeof signal<boolean>
+        >;
+        const page = stalkerStoreMock['page'] as ReturnType<
+            typeof signal<number>
+        >;
+
+        loading.set(true);
+        page.set(0);
+        expect(service.isPaginatedContentLoading()).toBe(true);
+        expect(service.isAppending()).toBe(false);
+
+        page.set(1);
+        expect(service.isPaginatedContentLoading()).toBe(false);
+        expect(service.isAppending()).toBe(true);
+    });
+
+    it('guards loadMore behind loading, append errors, and hasMore', () => {
+        const service = TestBed.inject(StalkerCatalogFacadeService);
+        const loading = stalkerStoreMock['isPaginatedContentLoading'] as ReturnType<
+            typeof signal<boolean>
+        >;
+        const hasMore = stalkerStoreMock['hasMoreContent'] as ReturnType<
+            typeof signal<boolean>
+        >;
+        const appendError = stalkerStoreMock[
+            'hasContentAppendError'
+        ] as ReturnType<typeof signal<boolean>>;
+        const nextPage = stalkerStoreMock['nextPage'] as jest.Mock;
+
+        service.loadMore();
+        expect(nextPage).not.toHaveBeenCalled();
+
+        hasMore.set(true);
+        loading.set(true);
+        service.loadMore();
+        expect(nextPage).not.toHaveBeenCalled();
+
+        loading.set(false);
+        appendError.set(true);
+        service.loadMore();
+        expect(nextPage).not.toHaveBeenCalled();
+
+        appendError.set(false);
+        service.loadMore();
+        expect(nextPage).toHaveBeenCalledTimes(1);
+
+        service.retryAppend();
+        expect(stalkerStoreMock['retryContentPage']).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps scroll positions per list identity across detours', () => {
+        const service = TestBed.inject(StalkerCatalogFacadeService);
+        const categoryId = stalkerStoreMock['selectedCategoryId'] as ReturnType<
+            typeof signal<string | null>
+        >;
+
+        categoryId.set('5');
+        service.saveScrollPosition(420);
+
+        // A detour through another category saves its own spot without
+        // destroying the first one.
+        categoryId.set('7');
+        service.saveScrollPosition(50);
+        expect(service.consumeSavedScrollPosition()).toBe(50);
+
+        categoryId.set('5');
+        expect(service.consumeSavedScrollPosition()).toBe(420);
+        // One-shot: consumed positions do not restore twice.
+        expect(service.consumeSavedScrollPosition()).toBeNull();
+    });
+
+    it('never restores a saved offset onto another portal', () => {
+        // The route provider (and this facade) survives a same-config portal
+        // switch — the identity must include the playlist.
+        const service = TestBed.inject(StalkerCatalogFacadeService);
+        const currentPlaylist = stalkerStoreMock['currentPlaylist'] as ReturnType<
+            typeof signal<{ _id: string } | undefined>
+        >;
+
+        service.saveScrollPosition(420);
+
+        currentPlaylist.set({ _id: 'portal-b' });
+        expect(service.consumeSavedScrollPosition()).toBeNull();
+
+        currentPlaylist.set(playlist as { _id: string });
+        expect(service.consumeSavedScrollPosition()).toBe(420);
     });
 });

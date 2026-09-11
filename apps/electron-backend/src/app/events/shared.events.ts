@@ -1,4 +1,8 @@
-import { ipcMain, session } from 'electron';
+import { ipcMain } from 'electron';
+import {
+    configureRequestHeaderOverride,
+    type StreamCredentialHeaders,
+} from '../services/request-header-overrides.service';
 
 export default class SharedEvents {
     static bootstrapSharedEvents(): Electron.IpcMain {
@@ -6,34 +10,46 @@ export default class SharedEvents {
     }
 }
 
-ipcMain.handle('set-user-agent', (event, userAgent, referer) => {
-    setUserAgent(userAgent, referer); // TODO: test if defaults needed
-    return true;
-});
+function sanitizeCredentials(value: unknown): StreamCredentialHeaders | null {
+    if (typeof value !== 'object' || value === null) {
+        return null;
+    }
+
+    const { cookie, authorization } = value as Record<string, unknown>;
+    return {
+        authorization:
+            typeof authorization === 'string' ? authorization : undefined,
+        cookie: typeof cookie === 'string' ? cookie : undefined,
+    };
+}
+
+ipcMain.handle(
+    'set-user-agent',
+    (_event, userAgent, referer, scopeUrl, credentials) => {
+        setUserAgent(
+            userAgent,
+            referer,
+            scopeUrl,
+            sanitizeCredentials(credentials)
+        );
+        return true;
+    }
+);
 
 /**
- * Sets the user agent header for all http requests
+ * Sets scoped request headers for the currently selected stream.
  * @param userAgent user agent to use
  * @param referer referer to use
+ * @param scopeUrl stream URL used to limit the override to the active origin
+ * @param credentials portal Cookie/Authorization for auth-gated streams;
+ *   applied only to the exact origin of `scopeUrl` and only while the
+ *   scoped override is active
  */
-export function setUserAgent(userAgent: string, referer?: string): void {
-    if (userAgent === undefined || userAgent === null || userAgent === '') {
-        userAgent = this.defaultUserAgent;
-    }
-
-    // Remove trailing slash from referer if it exists
-    let originURL: string;
-    if (referer?.endsWith('/')) {
-        originURL = referer.slice(0, -1);
-    }
-
-    session.defaultSession.webRequest.onBeforeSendHeaders(
-        (details, callback) => {
-            details.requestHeaders['User-Agent'] = userAgent;
-            details.requestHeaders['Referer'] = referer as string;
-            details.requestHeaders['Origin'] = originURL as string;
-            callback({ requestHeaders: details.requestHeaders });
-        }
-    );
-    console.log(`Success: Set "${userAgent}" as user agent header`);
+export function setUserAgent(
+    userAgent?: string | null,
+    referer?: string | null,
+    scopeUrl?: string | null,
+    credentials?: StreamCredentialHeaders | null
+): void {
+    configureRequestHeaderOverride(userAgent, referer, scopeUrl, credentials);
 }

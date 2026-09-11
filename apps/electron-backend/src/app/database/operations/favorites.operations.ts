@@ -7,7 +7,7 @@ import {
     type OperationControl,
     reportOperationProgress,
 } from './operation-control';
-import { persistContentBackdropIfMissing } from './content-backdrop.operations';
+import { persistContentMetadataIfMissing } from './content-metadata.operations';
 
 const DEFAULT_BATCH_SIZE = 100;
 
@@ -22,7 +22,9 @@ export async function addFavorite(
         playlistId,
     });
 
-    await persistContentBackdropIfMissing(db, contentId, options?.backdropUrl);
+    await persistContentMetadataIfMissing(db, contentId, {
+        backdropUrl: options?.backdropUrl,
+    });
 
     return { success: true };
 }
@@ -73,6 +75,8 @@ export async function getFavorites(db: AppDatabase, playlistId: string) {
             poster_url: schema.content.posterUrl,
             xtream_id: schema.content.xtreamId,
             type: schema.content.type,
+            tv_archive: schema.content.tvArchive,
+            tv_archive_duration: schema.content.tvArchiveDuration,
             added_at: schema.favorites.addedAt,
             position: schema.favorites.position,
         })
@@ -89,40 +93,21 @@ export async function getFavorites(db: AppDatabase, playlistId: string) {
 }
 
 export async function getGlobalFavorites(db: AppDatabase) {
-    return db
-        .select({
-            id: schema.content.id,
-            category_id: schema.content.categoryId,
-            title: schema.content.title,
-            rating: schema.content.rating,
-            added: schema.content.added,
-            poster_url: schema.content.posterUrl,
-            xtream_id: schema.content.xtreamId,
-            type: schema.content.type,
-            playlist_id: schema.playlists.id,
-            playlist_name: schema.playlists.name,
-            added_at: schema.favorites.addedAt,
-            position: schema.favorites.position,
-        })
-        .from(schema.favorites)
-        .innerJoin(
-            schema.content,
-            eq(schema.favorites.contentId, schema.content.id)
-        )
-        .innerJoin(
-            schema.categories,
-            eq(schema.content.categoryId, schema.categories.id)
-        )
-        .innerJoin(
-            schema.playlists,
-            eq(schema.categories.playlistId, schema.playlists.id)
-        )
-        .where(eq(schema.content.type, 'live'))
-        .orderBy(asc(schema.favorites.position), desc(schema.favorites.addedAt))
-        .limit(300);
+    const favorites = await selectGlobalFavoriteRows(db, {
+        includeBackdrop: false,
+    });
+
+    return favorites.filter((favorite) => favorite.type === 'live').slice(0, 300);
 }
 
 export async function getAllGlobalFavorites(db: AppDatabase) {
+    return selectGlobalFavoriteRows(db, { includeBackdrop: true }).limit(500);
+}
+
+function selectGlobalFavoriteRows(
+    db: AppDatabase,
+    options: { includeBackdrop: boolean }
+) {
     return db
         .select({
             id: schema.content.id,
@@ -131,9 +116,18 @@ export async function getAllGlobalFavorites(db: AppDatabase) {
             rating: schema.content.rating,
             added: schema.content.added,
             poster_url: schema.content.posterUrl,
-            backdrop_url: schema.content.backdropUrl,
+            ...(options.includeBackdrop
+                ? {
+                      backdrop_url: schema.content.backdropUrl,
+                      tmdb_id: schema.content.tmdbId,
+                      release_year: schema.content.releaseYear,
+                      original_title: schema.content.originalTitle,
+                  }
+                : {}),
             xtream_id: schema.content.xtreamId,
             type: schema.content.type,
+            tv_archive: schema.content.tvArchive,
+            tv_archive_duration: schema.content.tvArchiveDuration,
             playlist_id: schema.playlists.id,
             playlist_name: schema.playlists.name,
             added_at: schema.favorites.addedAt,
@@ -152,13 +146,12 @@ export async function getAllGlobalFavorites(db: AppDatabase) {
             schema.playlists,
             eq(schema.categories.playlistId, schema.playlists.id)
         )
-        .orderBy(asc(schema.favorites.position), desc(schema.favorites.addedAt))
-        .limit(500);
+        .orderBy(asc(schema.favorites.position), desc(schema.favorites.addedAt));
 }
 
 export async function reorderGlobalFavorites(
     db: AppDatabase,
-    updates: { content_id: number; position: number }[],
+    updates: { content_id: number; playlist_id: string; position: number }[],
     control?: OperationControl
 ): Promise<{ success: boolean }> {
     if (!Array.isArray(updates) || updates.length === 0) {
@@ -170,20 +163,35 @@ export async function reorderGlobalFavorites(
 
     // Drizzle's .set() doesn't accept a bare Placeholder — wrap it in an
     // sql template so the value resolves to SQL<number> at compile time.
+    // Scope by (contentId, playlistId): the favorites table is
+    // playlist-scoped, so filtering by contentId alone would also rewrite
+    // the position of a same-contentId favorite in another playlist.
     const updateFavoritePosition = db
         .update(schema.favorites)
         .set({ position: sql<number>`${sql.placeholder('position')}` })
-        .where(eq(schema.favorites.contentId, sql.placeholder('contentId')))
+        .where(
+            and(
+                eq(schema.favorites.contentId, sql.placeholder('contentId')),
+                eq(schema.favorites.playlistId, sql.placeholder('playlistId'))
+            )
+        )
         .prepare();
 
     for (const chunk of chunkValues(updates, DEFAULT_BATCH_SIZE)) {
         await checkpointOperation(control);
 
         await db.transaction(() => {
-            for (const { content_id, position } of chunk) {
-                updateFavoritePosition.execute({
+            for (const { content_id, playlist_id, position } of chunk) {
+                // Must be .run() (synchronous), NOT .execute(): on the
+                // better-sqlite3 driver .execute() defers the write to a
+                // resolved promise, which never settles inside this
+                // synchronous transaction callback — the UPDATE would be a
+                // silent no-op and the custom favorites order would never
+                // persist (issue #1137).
+                updateFavoritePosition.run({
                     position,
                     contentId: content_id,
+                    playlistId: playlist_id,
                 });
             }
         });

@@ -1,14 +1,17 @@
 import {
     CoverSize,
+    EpgViewMode,
     StartupBehavior,
     Theme,
     VideoPlayer,
 } from '@iptvnator/shared/interfaces';
 import {
     CoverSizeOption,
+    EpgViewModeOption,
     SettingsPlayerOption,
     SettingsSection,
     StartupBehaviorOption,
+    StartupWindowModeOption,
     ThemeOption,
 } from './settings.models';
 
@@ -48,6 +51,19 @@ export const SETTINGS_COVER_SIZE_OPTIONS: CoverSizeOption[] = [
     },
 ];
 
+export const SETTINGS_EPG_VIEW_MODE_OPTIONS: EpgViewModeOption[] = [
+    {
+        value: 'timeline' satisfies EpgViewMode,
+        icon: 'view_timeline',
+        labelKey: 'SETTINGS.EPG_VIEW_MODE_TIMELINE',
+    },
+    {
+        value: 'list' satisfies EpgViewMode,
+        icon: 'view_list',
+        labelKey: 'SETTINGS.EPG_VIEW_MODE_LIST',
+    },
+];
+
 export const SETTINGS_STARTUP_BEHAVIOR_OPTIONS: StartupBehaviorOption[] = [
     {
         value: StartupBehavior.FirstView,
@@ -56,6 +72,21 @@ export const SETTINGS_STARTUP_BEHAVIOR_OPTIONS: StartupBehaviorOption[] = [
     {
         value: StartupBehavior.RestoreLastView,
         labelKey: 'SETTINGS.STARTUP_BEHAVIOR_RESTORE_LAST_VIEW',
+    },
+];
+
+export const SETTINGS_STARTUP_WINDOW_MODE_OPTIONS: StartupWindowModeOption[] = [
+    {
+        value: 'normal',
+        labelKey: 'SETTINGS.STARTUP_WINDOW_MODE_NORMAL',
+    },
+    {
+        value: 'maximized',
+        labelKey: 'SETTINGS.STARTUP_WINDOW_MODE_MAXIMIZED',
+    },
+    {
+        value: 'fullscreen',
+        labelKey: 'SETTINGS.STARTUP_WINDOW_MODE_FULLSCREEN',
     },
 ];
 
@@ -85,9 +116,42 @@ export const SETTINGS_EMBEDDED_PLAYER_OPTIONS: SettingsPlayerOption[] = [
     },
 ];
 
-export function buildSettingsSectionNavItems(
-    isDesktop: boolean
-): SettingsSection[] {
+export interface SettingsPlayerAvailability {
+    supportsEmbeddedMpv: boolean;
+    supportsManagedExternalPlayers: boolean;
+}
+
+/**
+ * Built-in web players are always offered; the OS-backed ones only show up
+ * when the current runtime can actually launch them.
+ */
+export function buildSettingsPlayerOptions({
+    supportsEmbeddedMpv,
+    supportsManagedExternalPlayers,
+}: SettingsPlayerAvailability): SettingsPlayerOption[] {
+    return [
+        ...SETTINGS_EMBEDDED_PLAYER_OPTIONS,
+        ...(supportsEmbeddedMpv
+            ? [
+                  {
+                      id: VideoPlayer.EmbeddedMpv,
+                      labelKey: 'SETTINGS.PLAYER_EMBEDDED_MPV',
+                  },
+              ]
+            : []),
+        ...(supportsManagedExternalPlayers ? SETTINGS_OS_PLAYER_OPTIONS : []),
+    ];
+}
+
+export interface SettingsSectionVisibility {
+    supportsEpg: boolean;
+    supportsRemoteControl: boolean;
+}
+
+export function buildSettingsSectionNavItems({
+    supportsEpg,
+    supportsRemoteControl,
+}: SettingsSectionVisibility): SettingsSection[] {
     return [
         {
             id: 'general',
@@ -105,13 +169,30 @@ export function buildSettingsSectionNavItems(
             id: 'epg',
             label: 'SETTINGS.NAV_EPG',
             icon: 'calendar_month',
-            visible: isDesktop,
+            visible: supportsEpg,
         },
         {
-            id: '@iptvnator/ui/remote-control',
+            id: 'dashboard',
+            label: 'SETTINGS.NAV_DASHBOARD',
+            icon: 'dashboard',
+            visible: true,
+        },
+        {
+            // Must match the section's HTML id (`remote-control`) so the
+            // settings-section-scroll directive can resolve the anchor.
+            // Was previously '@iptvnator/ui/remote-control' (the NX lib
+            // name), which meant clicking the nav item silently no-op'd
+            // because document.getElementById of that string returned null.
+            id: 'remote-control',
             label: 'SETTINGS.NAV_REMOTE',
             icon: 'smartphone',
-            visible: isDesktop,
+            visible: supportsRemoteControl,
+        },
+        {
+            id: 'tmdb',
+            label: 'SETTINGS.NAV_TMDB',
+            icon: 'movie',
+            visible: true,
         },
         {
             id: 'backup',

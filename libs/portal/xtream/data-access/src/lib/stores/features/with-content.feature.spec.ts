@@ -1,13 +1,17 @@
 import { TestBed } from '@angular/core/testing';
-import { patchState, signalStore, withMethods, withState } from '@ngrx/signals';
-import { DatabaseService } from '@iptvnator/services';
-import {
-    XTREAM_DATA_SOURCE,
-    XtreamPlaylistData,
-} from '../../data-sources/xtream-data-source.interface';
-import { XtreamApiService } from '../../services/xtream-api.service';
 import { PortalStatusType } from '../../xtream-state';
-import { withContent } from './with-content.feature';
+import {
+    createAbortError,
+    createContentTestProviders,
+    createContentTestStore,
+    createDeferred,
+    createPendingRestoreServiceMock,
+    PENDING_RESTORE_STATE,
+    readPendingRestoreBlocked,
+    setPerformanceHook,
+    TEST_PLAYLIST,
+    waitForCondition,
+} from './with-content.feature.spec-helpers';
 
 jest.mock('@iptvnator/portal/shared/util', () => ({
     createLogger: () => ({
@@ -20,66 +24,11 @@ jest.mock('@iptvnator/portal/shared/util', () => ({
 
 type ContentType = 'live' | 'movie' | 'series';
 
-const PLAYLIST: XtreamPlaylistData = {
-    id: 'playlist-1',
-    name: 'Test Xtream',
-    serverUrl: 'http://localhost:8080',
-    username: 'demo',
-    password: 'secret',
-    type: 'xtream',
-};
+const PLAYLIST = TEST_PLAYLIST;
 
 let checkPortalStatusMock: jest.Mock<Promise<PortalStatusType>, []>;
 
-const TestContentStore = signalStore(
-    withState({
-        playlistId: PLAYLIST.id,
-        currentPlaylist: PLAYLIST,
-        portalStatus: 'active' as PortalStatusType,
-        selectedContentType: 'vod' as const,
-    }),
-    withMethods((store) => ({
-        async checkPortalStatus(): Promise<PortalStatusType> {
-            const status = await checkPortalStatusMock();
-            patchState(store, { portalStatus: status });
-            return status;
-        },
-    })),
-    withContent()
-);
-
-function createDeferred<T>() {
-    let resolve!: (value: T) => void;
-    let reject!: (reason?: unknown) => void;
-    const promise = new Promise<T>((res, rej) => {
-        resolve = res;
-        reject = rej;
-    });
-
-    return { promise, resolve, reject };
-}
-
-function createAbortError(): Error {
-    const error = new Error('Import cancelled');
-    error.name = 'AbortError';
-    return error;
-}
-
-async function waitForCondition(
-    predicate: () => boolean,
-    attempts = 20
-): Promise<void> {
-    for (let index = 0; index < attempts; index += 1) {
-        if (predicate()) {
-            return;
-        }
-
-        await Promise.resolve();
-        await new Promise((resolve) => setTimeout(resolve, 0));
-    }
-
-    throw new Error('Timed out waiting for test condition');
-}
+const TestContentStore = createContentTestStore(() => checkPortalStatusMock());
 
 describe('withContent import state', () => {
     let store: InstanceType<typeof TestContentStore>;
@@ -103,6 +52,10 @@ describe('withContent import state', () => {
     let xtreamApiService: {
         cancelSession: jest.Mock;
     };
+    let pendingRestoreService: ReturnType<
+        typeof createPendingRestoreServiceMock
+    >;
+    let dataService: { sendIpcEvent: jest.Mock };
 
     beforeEach(() => {
         localStorage.clear();
@@ -120,14 +73,16 @@ describe('withContent import state', () => {
         databaseService = {
             clearXtreamImportCache: jest.fn().mockResolvedValue(true),
             cancelOperation: jest.fn().mockResolvedValue(true),
-            createOperationId: jest.fn().mockImplementation((prefix?: string) => {
-                if (prefix === 'xtream-import-session') {
-                    return 'xtream-import-session';
-                }
+            createOperationId: jest
+                .fn()
+                .mockImplementation((prefix?: string) => {
+                    if (prefix === 'xtream-import-session') {
+                        return 'xtream-import-session';
+                    }
 
-                operationCounter += 1;
-                return `${prefix ?? 'db-op'}-${operationCounter}`;
-            }),
+                    operationCounter += 1;
+                    return `${prefix ?? 'db-op'}-${operationCounter}`;
+                }),
             getXtreamImportStatus: jest.fn().mockResolvedValue('completed'),
             setXtreamImportStatus: jest.fn().mockResolvedValue(true),
             supportsDbOperationCancellation: jest.fn().mockReturnValue(true),
@@ -135,31 +90,129 @@ describe('withContent import state', () => {
         xtreamApiService = {
             cancelSession: jest.fn().mockResolvedValue(true),
         };
+        pendingRestoreService = createPendingRestoreServiceMock();
+        dataService = {
+            sendIpcEvent: jest.fn().mockResolvedValue({ success: true }),
+        };
         checkPortalStatusMock = jest.fn().mockResolvedValue('active');
 
         TestBed.configureTestingModule({
-            providers: [
-                TestContentStore,
-                {
-                    provide: XTREAM_DATA_SOURCE,
-                    useValue: dataSource,
-                },
-                {
-                    provide: DatabaseService,
-                    useValue: databaseService,
-                },
-                {
-                    provide: XtreamApiService,
-                    useValue: xtreamApiService,
-                },
-            ],
+            providers: createContentTestProviders(TestContentStore, {
+                dataSource,
+                databaseService,
+                xtreamApiService,
+                pendingRestoreService,
+                dataService,
+            }),
         });
 
         store = TestBed.inject(TestContentStore);
     });
 
     afterEach(() => {
+        setPerformanceHook(null);
         localStorage.clear();
+    });
+
+    it('emits ordered count-only publication markers for a successful import', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => events.push(event));
+        const categories = {
+            live: [{ category_id: '1' }],
+            vod: [{ category_id: '2' }, { category_id: '3' }],
+            series: [{ category_id: '4' }],
+        };
+        const content = {
+            live: [{ xtream_id: 1 }, { xtream_id: 2 }],
+            movie: [{ xtream_id: 3 }],
+            series: [{ xtream_id: 4 }, { xtream_id: 5 }],
+        };
+        dataSource.getCategories.mockImplementation(
+            (
+                _playlistId: string,
+                _credentials: unknown,
+                type: keyof typeof categories
+            ) => Promise.resolve(categories[type])
+        );
+        dataSource.getContent.mockImplementation(
+            (
+                _playlistId: string,
+                _credentials: unknown,
+                type: keyof typeof content
+            ) => Promise.resolve(content[type])
+        );
+
+        await store.initializeContent();
+
+        expect(
+            events.map(({ boundary, metadata, outcome, phase }) => ({
+                boundary,
+                items: metadata?.items,
+                outcome,
+                phase,
+            }))
+        ).toEqual([
+            {
+                boundary: 'start',
+                items: 4,
+                outcome: undefined,
+                phase: 'store.xtream-publish-categories',
+            },
+            {
+                boundary: 'end',
+                items: 4,
+                outcome: 'success',
+                phase: 'store.xtream-publish-categories',
+            },
+            {
+                boundary: 'start',
+                items: 2,
+                outcome: undefined,
+                phase: 'store.xtream-publish-live',
+            },
+            {
+                boundary: 'end',
+                items: 2,
+                outcome: 'success',
+                phase: 'store.xtream-publish-live',
+            },
+            {
+                boundary: 'start',
+                items: 1,
+                outcome: undefined,
+                phase: 'store.xtream-publish-vod',
+            },
+            {
+                boundary: 'end',
+                items: 1,
+                outcome: 'success',
+                phase: 'store.xtream-publish-vod',
+            },
+            {
+                boundary: 'start',
+                items: 2,
+                outcome: undefined,
+                phase: 'store.xtream-publish-series',
+            },
+            {
+                boundary: 'end',
+                items: 2,
+                outcome: 'success',
+                phase: 'store.xtream-publish-series',
+            },
+            {
+                boundary: 'start',
+                items: 5,
+                outcome: undefined,
+                phase: 'store.xtream-import-terminal',
+            },
+            {
+                boundary: 'end',
+                items: 5,
+                outcome: 'success',
+                phase: 'store.xtream-import-terminal',
+            },
+        ]);
     });
 
     it('tracks aggregated import progress while content is loading', async () => {
@@ -350,11 +403,8 @@ describe('withContent import state', () => {
             ) => pendingCategories[type].promise
         );
         dataSource.getContent.mockImplementation(
-            (
-                _playlistId: string,
-                _credentials: unknown,
-                type: ContentType
-            ) => pending[type].promise
+            (_playlistId: string, _credentials: unknown, type: ContentType) =>
+                pending[type].promise
         );
 
         const initialization = store.initializeContent();
@@ -369,6 +419,9 @@ describe('withContent import state', () => {
         pendingCategories.live.resolve([]);
         pendingCategories.vod.resolve([]);
         pendingCategories.series.resolve([]);
+        await waitForCondition(
+            () => store.vodCategoriesPlaylistId() === PLAYLIST.id
+        );
 
         pending.live.resolve(liveItems);
         await waitForCondition(
@@ -389,6 +442,7 @@ describe('withContent import state', () => {
         );
 
         expect(store.vodStreams()).toEqual(vodItems);
+        expect(store.vodStreamsPlaylistId()).toBe(PLAYLIST.id);
         expect(store.contentLoadStateByType()).toEqual({
             live: 'ready',
             vod: 'ready',
@@ -406,6 +460,21 @@ describe('withContent import state', () => {
             series: 'ready',
         });
         expect(store.isContentInitialized()).toBe(true);
+    });
+
+    it('records the VOD category owner when categories are reloaded', async () => {
+        dataSource.getCategories.mockImplementation(
+            (
+                _playlistId: string,
+                _credentials: unknown,
+                type: 'live' | 'vod' | 'series'
+            ) => Promise.resolve([{ category_id: type }])
+        );
+
+        await store.reloadCategories();
+
+        expect(store.vodCategories()).toEqual([{ category_id: 'vod' }]);
+        expect(store.vodCategoriesPlaylistId()).toBe(PLAYLIST.id);
     });
 
     it('loads categories before starting content import', async () => {
@@ -478,6 +547,63 @@ describe('withContent import state', () => {
         expect(databaseService.getXtreamImportStatus).not.toHaveBeenCalled();
     });
 
+    it('does not expose offline cache while a restore is pending', async () => {
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+        dataSource.hasCategories.mockResolvedValue(true);
+        dataSource.hasContent.mockResolvedValue(true);
+
+        await expect(store.hasUsableOfflineCache('vod')).resolves.toBe(false);
+        await store.hydrateCachedContent('vod');
+
+        expect(dataSource.hasCategories).not.toHaveBeenCalled();
+        expect(dataSource.hasContent).not.toHaveBeenCalled();
+        expect(dataSource.getCachedCategories).not.toHaveBeenCalled();
+        expect(dataSource.getCachedContent).not.toHaveBeenCalled();
+        expect(dataSource.restoreUserData).not.toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
+    });
+
+    it('blocks active initialization when pending restore storage is unreadable', async () => {
+        dataSource.getContent.mockResolvedValue([]);
+        pendingRestoreService.getOrThrow.mockImplementation(() => {
+            throw new Error('storage is locked');
+        });
+
+        await store.initializeContent();
+
+        expect(dataSource.restoreUserData).not.toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
+    });
+
+    it('fails closed when pending restore storage is unreadable', async () => {
+        pendingRestoreService.getOrThrow.mockImplementation(() => {
+            throw new Error('storage is locked');
+        });
+        dataSource.hasCategories.mockResolvedValue(true);
+        dataSource.hasContent.mockResolvedValue(true);
+
+        await expect(store.hasUsableOfflineCache('vod')).resolves.toBe(false);
+        await store.hydrateCachedContent('vod');
+
+        expect(dataSource.hasCategories).not.toHaveBeenCalled();
+        expect(dataSource.hasContent).not.toHaveBeenCalled();
+        expect(dataSource.getCachedContent).not.toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
+
+        pendingRestoreService.getOrThrow.mockReturnValue(null);
+        checkPortalStatusMock.mockResolvedValue('unavailable');
+        dataSource.hasContent.mockResolvedValue(true);
+        await store.retryContentInitialization();
+
+        expect(readPendingRestoreBlocked(store)).toBe(false);
+        expect(dataSource.getCachedContent).toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(true);
+        expect(store.contentInitBlockReason()).toBeNull();
+    });
+
     it('does not require every content type for aggregate cached sections', async () => {
         dataSource.hasContent
             .mockResolvedValueOnce(false)
@@ -536,10 +662,23 @@ describe('withContent import state', () => {
         expect(dataSource.getContent).not.toHaveBeenCalled();
         expect(store.vodCategories()).toHaveLength(1);
         expect(store.vodStreams()).toHaveLength(1);
+        expect(store.vodCategoriesPlaylistId()).toBe(PLAYLIST.id);
+        expect(store.vodStreamsPlaylistId()).toBe(PLAYLIST.id);
         expect(store.contentLoadStateByType().vod).toBe('ready');
         expect(store.isCachedContentScopeReady('vod')).toBe(true);
         expect(store.isContentInitialized()).toBe(true);
         expect(store.contentInitBlockReason()).toBeNull();
+    });
+
+    it('clears VOD catalog owners with the content state', async () => {
+        await store.hydrateCachedContent('vod');
+        expect(store.vodCategoriesPlaylistId()).toBe(PLAYLIST.id);
+        expect(store.vodStreamsPlaylistId()).toBe(PLAYLIST.id);
+
+        store.resetContent();
+
+        expect(store.vodCategoriesPlaylistId()).toBeNull();
+        expect(store.vodStreamsPlaylistId()).toBeNull();
     });
 
     it('exposes loading state while cached section content is hydrating', async () => {
@@ -587,6 +726,33 @@ describe('withContent import state', () => {
         expect(store.isLoadingContent()).toBe(false);
         expect(store.contentLoadStateByType().vod).toBe('ready');
         expect(store.vodStreams()).toHaveLength(1);
+    });
+
+    it('blocks cache publishing when pending state appears during hydration', async () => {
+        const cachedCategories = createDeferred<any[]>();
+        const cachedContent = createDeferred<any[]>();
+        dataSource.getCachedCategories.mockReturnValueOnce(
+            cachedCategories.promise
+        );
+        dataSource.getCachedContent.mockReturnValueOnce(cachedContent.promise);
+
+        const hydration = store.hydrateCachedContent('vod');
+        await waitForCondition(
+            () => dataSource.getCachedContent.mock.calls.length === 1
+        );
+
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+        cachedCategories.resolve([]);
+        cachedContent.resolve([]);
+
+        await hydration;
+
+        expect(dataSource.restoreUserData).not.toHaveBeenCalled();
+        expect(pendingRestoreService.clear).not.toHaveBeenCalled();
+        expect(store.vodStreams()).toEqual([]);
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.isCachedContentScopeReady('vod')).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
     });
 
     it('coalesces concurrent cached hydration calls for the same scope', async () => {
@@ -741,6 +907,8 @@ describe('withContent import state', () => {
     });
 
     it('ignores concurrent initializeContent calls while an import is already running', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => events.push(event));
         const pendingCategories = {
             live: createDeferred<any[]>(),
             vod: createDeferred<any[]>(),
@@ -772,6 +940,11 @@ describe('withContent import state', () => {
 
         expect(dataSource.getCategories).toHaveBeenCalledTimes(3);
         expect(dataSource.getContent).toHaveBeenCalledTimes(3);
+        expect(
+            events.filter(
+                ({ phase }) => phase === 'store.xtream-import-terminal'
+            )
+        ).toHaveLength(2);
     });
 
     it('blocks auto restart after cancelling during category loading until retry is explicit', async () => {
@@ -833,6 +1006,145 @@ describe('withContent import state', () => {
         expect(store.isContentInitialized()).toBe(true);
         expect(dataSource.getCategories).toHaveBeenCalledTimes(6);
         expect(dataSource.getContent).toHaveBeenCalledTimes(3);
+    });
+
+    it('keeps a failed pending restore blocked until an explicit retry succeeds', async () => {
+        dataSource.getContent.mockResolvedValue([]);
+        dataSource.restoreUserData
+            .mockRejectedValueOnce(new Error('database is locked'))
+            .mockResolvedValueOnce(undefined);
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+        pendingRestoreService.clear.mockImplementation(() => {
+            pendingRestoreService.getOrThrow.mockReturnValue(null);
+            return true;
+        });
+
+        await store.initializeContent();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(1);
+        expect(pendingRestoreService.clear).not.toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
+
+        await store.initializeContent();
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(1);
+
+        // Ready cache rows are not safe to expose while replay is pending:
+        // a later full replacement could otherwise erase pins changed in the
+        // meantime.
+        expect(store.isCachedContentScopeReady('vod')).toBe(false);
+        checkPortalStatusMock.mockResolvedValue('unavailable');
+        dataSource.hasContent.mockResolvedValue(true);
+        await store.retryContentInitialization();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(1);
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('unavailable');
+
+        checkPortalStatusMock.mockResolvedValue('active');
+        await store.retryContentInitialization();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(2);
+        expect(pendingRestoreService.clear).toHaveBeenCalledWith(
+            PLAYLIST.id,
+            PENDING_RESTORE_STATE
+        );
+        expect(store.isContentInitialized()).toBe(true);
+        expect(store.contentInitBlockReason()).toBeNull();
+    });
+
+    it('leaves state parked during an active import for the next content generation', async () => {
+        const pendingSeries = createDeferred<any[]>();
+        dataSource.getContent.mockImplementation(
+            (_playlistId: string, _credentials: unknown, type: ContentType) =>
+                type === 'series' ? pendingSeries.promise : Promise.resolve([])
+        );
+
+        const initialization = store.initializeContent();
+        await waitForCondition(
+            () => store.contentLoadStateByType().vod === 'ready'
+        );
+
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+        expect(store.reconcilePendingRestoreBlock()).toBe(true);
+        expect(readPendingRestoreBlocked(store)).toBe(true);
+        expect(store.isImporting()).toBe(false);
+        expect(store.activeImportSessionId()).not.toBeNull();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(dataSource.restoreUserData).not.toHaveBeenCalled();
+
+        pendingSeries.resolve([]);
+        await initialization;
+
+        expect(dataSource.restoreUserData).not.toHaveBeenCalled();
+        expect(readPendingRestoreBlocked(store)).toBe(true);
+        expect(store.isContentInitialized()).toBe(false);
+
+        dataSource.getContent.mockResolvedValue([]);
+        await store.initializeContent();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledWith(
+            PLAYLIST.id,
+            PENDING_RESTORE_STATE,
+            expect.any(Object)
+        );
+        expect(pendingRestoreService.applyAndConsume).toHaveBeenCalledWith(
+            PLAYLIST.id,
+            expect.objectContaining({
+                state: PENDING_RESTORE_STATE,
+            }),
+            expect.any(Function)
+        );
+        expect(pendingRestoreService.clear).toHaveBeenCalledWith(
+            PLAYLIST.id,
+            PENDING_RESTORE_STATE
+        );
+        expect(readPendingRestoreBlocked(store)).toBe(false);
+        expect(store.isContentInitialized()).toBe(true);
+    });
+
+    it('retries when pending state could not be consumed', async () => {
+        dataSource.getContent.mockResolvedValue([]);
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+        pendingRestoreService.clear
+            .mockReturnValueOnce(false)
+            .mockImplementationOnce(() => {
+                pendingRestoreService.getOrThrow.mockReturnValue(null);
+                return true;
+            });
+
+        await store.initializeContent();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(1);
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('error');
+
+        await store.retryContentInitialization();
+
+        expect(dataSource.restoreUserData).toHaveBeenCalledTimes(2);
+        expect(pendingRestoreService.clear).toHaveBeenCalledTimes(2);
+        expect(store.isContentInitialized()).toBe(true);
+        expect(store.contentInitBlockReason()).toBeNull();
+    });
+
+    it('keeps cancellation authoritative while a pending restore finishes', async () => {
+        const pendingRestore = createDeferred<void>();
+        dataSource.getContent.mockResolvedValue([]);
+        dataSource.restoreUserData.mockReturnValueOnce(pendingRestore.promise);
+        pendingRestoreService.getOrThrow.mockReturnValue(PENDING_RESTORE_STATE);
+
+        const initialization = store.initializeContent();
+        await waitForCondition(
+            () => dataSource.restoreUserData.mock.calls.length === 1
+        );
+
+        await store.cancelImport();
+        pendingRestore.reject(new Error('pin replacement failed'));
+        await expect(initialization).resolves.toBeUndefined();
+
+        expect(pendingRestoreService.clear).not.toHaveBeenCalled();
+        expect(store.isContentInitialized()).toBe(false);
+        expect(store.contentInitBlockReason()).toBe('cancelled');
     });
 
     it('stops before content fetch if cancel lands between categories and content phases', async () => {
@@ -936,6 +1248,8 @@ describe('withContent import state', () => {
     });
 
     it('cancels active imports and clears stale progress after worker aborts', async () => {
+        const events: RendererPerformancePhaseEvent[] = [];
+        setPerformanceHook((event) => events.push(event));
         const pendingCategories = {
             live: createDeferred<any[]>(),
             vod: createDeferred<any[]>(),
@@ -1042,5 +1356,17 @@ describe('withContent import state', () => {
         expect(store.activeImportTotalCount()).toBe(0);
         expect(store.importCount()).toBe(0);
         expect(store.itemsToImport()).toBe(0);
+        expect(
+            events
+                .filter(({ phase }) => phase === 'store.xtream-import-terminal')
+                .map(({ boundary, metadata, outcome }) => ({
+                    boundary,
+                    items: metadata?.items,
+                    outcome,
+                }))
+        ).toEqual([
+            { boundary: 'start', items: 0, outcome: undefined },
+            { boundary: 'end', items: 0, outcome: 'success' },
+        ]);
     });
 });

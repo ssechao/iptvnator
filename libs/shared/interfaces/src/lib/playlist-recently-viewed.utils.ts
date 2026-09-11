@@ -1,5 +1,6 @@
 import { PlaylistMeta } from './playlist-meta.type';
 import { PortalRecentItem } from './portal-activity-item.interface';
+import { extractStalkerItemTmdbHints } from './stalker-item-tmdb-hints';
 import {
     extractStalkerItemId,
     extractStalkerItemPoster,
@@ -15,6 +16,10 @@ import {
 interface PlaylistRecentLabels {
     stalker: string;
     m3u: string;
+}
+
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+    return values.map((value) => value?.trim()).find(Boolean);
 }
 
 function getPlaylistRecentItems(
@@ -48,6 +53,10 @@ function mapStalkerPlaylistRecentItems(
                 category_id: String(item['category_id'] ?? ''),
                 xtream_id: id,
                 poster_url: extractStalkerItemPoster(item),
+                // Stalker has no `content` row to back-fill, so the backdrop
+                // travels inside the stored entry itself — present once the
+                // detail view has enriched the item.
+                backdrop_url: extractStalkerItemTmdbHints(item).backdropUrl,
                 source: 'stalker',
                 stalker_item: rawItem,
             });
@@ -76,9 +85,11 @@ function mapM3uPlaylistRecentItems(
             acc.push({
                 id: rawItem.id || channelUrl,
                 title:
-                    rawItem.title?.trim() ||
-                    rawItem.tvg_name?.trim() ||
-                    rawItem.channel_id ||
+                    firstNonEmpty(
+                        rawItem.title,
+                        rawItem.tvg_name,
+                        rawItem.channel_id
+                    ) ||
                     channelUrl,
                 type: 'live',
                 playlist_id: playlist._id,
@@ -87,6 +98,12 @@ function mapM3uPlaylistRecentItems(
                 category_id: rawItem.category_id || 'live',
                 xtream_id: channelUrl,
                 poster_url: rawItem.poster_url || undefined,
+                epg_lookup_key: firstNonEmpty(
+                    rawItem.tvg_id,
+                    rawItem.tvg_name,
+                    rawItem.title,
+                    rawItem.channel_id
+                ),
                 source: 'm3u',
             });
 

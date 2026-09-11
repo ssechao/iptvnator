@@ -38,6 +38,8 @@ interface XtreamGlobalFavoriteRow {
     readonly position?: number | null;
     readonly poster_url?: string | null;
     readonly title: string;
+    readonly tv_archive?: number | null;
+    readonly tv_archive_duration?: number | null;
     readonly xtream_id: number;
 }
 
@@ -86,17 +88,11 @@ export class GlobalFavoritesService {
     async removeFavorite(channel: UnifiedFavoriteChannel): Promise<void> {
         switch (channel.sourceType) {
             case 'm3u': {
-                const playlist = await firstValueFrom(
-                    this.playlistsService.getPlaylistById(channel.playlistId)
-                );
-                const currentFavs = (playlist.favorites as string[]) ?? [];
-                const filtered = currentFavs.filter(
-                    (f) => f !== channel.streamUrl
-                );
                 await firstValueFrom(
-                    this.playlistsService.setFavorites(
+                    this.playlistsService.transformPlaylistFavorites(
                         channel.playlistId,
-                        filtered
+                        (current) =>
+                            current.filter((f) => f !== channel.streamUrl)
                     )
                 );
                 break;
@@ -134,13 +130,14 @@ export class GlobalFavoritesService {
         // Persist xtream positions to DB
         const xtreamUpdates = channels
             .filter(
-                (
-                    ch
-                ): ch is UnifiedFavoriteChannel & { contentId: number } =>
+                (ch): ch is UnifiedFavoriteChannel & { contentId: number } =>
                     ch.sourceType === 'xtream' && ch.contentId != null
             )
             .map((ch, index) => ({
                 content_id: ch.contentId,
+                // The backend UPDATE is scoped by (contentId, playlistId) —
+                // without the playlist id the write matches no rows.
+                playlist_id: ch.playlistId,
                 position: index,
             }));
 
@@ -225,6 +222,8 @@ export class GlobalFavoritesService {
             playlistId: item.playlist_id,
             playlistName: item.playlist_name,
             xtreamId: item.xtream_id,
+            tvArchive: item.tv_archive ?? null,
+            tvArchiveDuration: item.tv_archive_duration ?? null,
             tvgId: String(item.xtream_id),
             addedAt: item.added_at ?? new Date(0).toISOString(),
             position: item.position ?? 0,

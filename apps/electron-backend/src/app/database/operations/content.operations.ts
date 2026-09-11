@@ -1,32 +1,627 @@
-import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
+import {
+    Channel,
+    GLOBAL_SEARCH_CONTENT_TYPES,
+    GLOBAL_SEARCH_RESULT_SOURCES,
+    GlobalSearchContentType,
+    GlobalSearchPaginationOptions,
+    GlobalSearchResult,
+    GlobalSearchResultSource,
+    M3uGlobalSearchResult,
+    XTREAM_DATABASE_PERFORMANCE_PHASE,
+    getXtreamRecentlyAddedMaxEpochSeconds,
+    toXtreamRecentlyAddedEpochSeconds,
+    XtreamGlobalSearchResult,
+} from '@iptvnator/shared/interfaces';
 import type { AppDatabase } from '../database.types';
 import { storeHiddenCategoryXtreamIds } from './category.operations';
 import {
-    checkpointOperation,
-    chunkValues,
-    type OperationControl,
-    reportOperationProgress,
-} from './operation-control';
+    countContentRowsByCategory,
+    sumCategoryRowCounts,
+} from './catalog-deletion';
+import {
+    buildCompoundFtsMatchQuery,
+    buildCompoundLikePatterns,
+    buildContentTitleFtsMatchQuery,
+    buildGlobPrefixPatterns,
+    buildLikePatterns,
+    buildM3uPayloadCompoundPatterns,
+    buildM3uPayloadTextFieldPatterns,
+    getCompoundResidualTokenGroups,
+    getSearchWordPlans,
+    getSqlSearchTokenGroups,
+    isShortSearchTokenGroup,
+    normalizeSearchMatchText,
+    scoreSearchTextMatch,
+    shouldUseContentTitleFts,
+    shouldUseContentTitlePrefixIndex,
+} from './content-search.util';
+import type { OperationControl } from './operation-control';
+import type { DatabaseOperationPerformancePhaseCapture } from './performance-phase-capture';
+import {
+    deleteXtreamCacheRows,
+    normalizeXtreamContentValues,
+    rankSearchCandidates,
+    writeXtreamContentValues,
+    type XtreamContentValue,
+} from './xtream-content-operation-steps';
 
-function escapeLikePattern(term: string): string {
-    return term.replace(/[%_\\]/g, '\\$&');
+export { scoreSearchTextMatch } from './content-search.util';
+
+const DEFAULT_GLOBAL_SEARCH_LIMIT = 50;
+const MAX_GLOBAL_SEARCH_LIMIT = 500;
+const MAX_GLOBAL_SEARCH_CANDIDATE_LIMIT = 5000;
+const M3U_PLAYLIST_TYPES = ['m3u-file', 'm3u-text', 'm3u-url'] as const;
+
+interface NormalizedGlobalSearchPagination {
+    limit: number;
+    offset: number;
 }
 
-function buildLikePatterns(term: string): string[] {
-    const variants = new Set<string>();
-    const titleCase =
-        term.length > 0
-            ? term.charAt(0).toLocaleUpperCase() +
-              term.slice(1).toLocaleLowerCase()
-            : term;
+interface ScoredGlobalSearchResult<
+    T extends GlobalSearchResult = GlobalSearchResult,
+> {
+    result: T;
+    score: number;
+}
 
-    variants.add(term);
-    variants.add(term.toLocaleLowerCase());
-    variants.add(term.toLocaleUpperCase());
-    variants.add(titleCase);
+interface M3uPlaylistSearchRow {
+    id: string;
+    name: string;
+    payload: string | null;
+}
 
-    return [...variants].map((value) => `%${escapeLikePattern(value)}%`);
+interface XtreamGlobalSearchCandidate {
+    id: number;
+    category_id: number;
+    title: string;
+    rating: string | null;
+    added: string | null;
+    poster_url: string | null;
+    epg_channel_id: string | null;
+    tv_archive: number | null;
+    tv_archive_duration: number | null;
+    direct_source: string | null;
+    xtream_id: number;
+    type: string;
+    playlist_id: string;
+    playlist_name: string;
+}
+
+interface ParsedM3uPlaylistItems {
+    items?: unknown;
+}
+
+interface ParsedM3uPlaylistPayload {
+    hiddenGroupTitles?: unknown;
+    playlist?: ParsedM3uPlaylistItems;
+    items?: unknown;
+}
+
+function normalizeSearchText(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeGlobalSearchPagination(
+    options?: GlobalSearchPaginationOptions | number
+): NormalizedGlobalSearchPagination {
+    const limitValue = typeof options === 'number' ? options : options?.limit;
+    const offsetValue = typeof options === 'number' ? 0 : options?.offset;
+    const limit = Number.isFinite(limitValue)
+        ? Math.min(
+              Math.max(Math.trunc(Number(limitValue)), 1),
+              MAX_GLOBAL_SEARCH_LIMIT
+          )
+        : DEFAULT_GLOBAL_SEARCH_LIMIT;
+    const offset = Number.isFinite(offsetValue)
+        ? Math.max(Math.trunc(Number(offsetValue)), 0)
+        : 0;
+
+    return { limit, offset };
+}
+
+function compareScoredGlobalSearchResults(
+    first: ScoredGlobalSearchResult,
+    second: ScoredGlobalSearchResult
+): number {
+    const scoreCompare = first.score - second.score;
+    if (scoreCompare !== 0) {
+        return scoreCompare;
+    }
+
+    const playlistCompare = first.result.playlist_name.localeCompare(
+        second.result.playlist_name
+    );
+    if (playlistCompare !== 0) {
+        return playlistCompare;
+    }
+
+    const playlistIdCompare = first.result.playlist_id.localeCompare(
+        second.result.playlist_id
+    );
+    if (playlistIdCompare !== 0) {
+        return playlistIdCompare;
+    }
+
+    const titleCompare = first.result.title.localeCompare(second.result.title);
+    if (titleCompare !== 0) {
+        return titleCompare;
+    }
+
+    return String(first.result.id).localeCompare(String(second.result.id));
+}
+
+function paginateScoredResults<T extends GlobalSearchResult>(
+    results: ScoredGlobalSearchResult<T>[],
+    pagination: NormalizedGlobalSearchPagination
+): T[] {
+    return results
+        .sort(compareScoredGlobalSearchResults)
+        .slice(pagination.offset, pagination.offset + pagination.limit)
+        .map((item) => item.result);
+}
+
+function getGlobalSearchCandidateLimit(): number {
+    return MAX_GLOBAL_SEARCH_CANDIDATE_LIMIT;
+}
+
+/**
+ * Per-word title conditions, AND-ed by the caller. A word's condition is the
+ * AND of its token-group LIKE conditions; a punctuation-joined word ("A&E")
+ * additionally matches as an intact contains pattern anywhere in the title
+ * (issue #1161). Composing per word keeps the other words' constraints on
+ * the compound arm, so "A&E HD" cannot fill the SQL candidate limit with
+ * titles that only contain "A&E".
+ */
+function buildContentTitleSearchConditions(searchTerm: string) {
+    let groupIndex = 0;
+
+    return getSearchWordPlans(searchTerm)
+        .map((plan) => {
+            const tokenConditions = plan.tokenGroups
+                .map((tokens) => {
+                    const mode =
+                        groupIndex === 0 && isShortSearchTokenGroup(tokens)
+                            ? 'prefix'
+                            : 'contains';
+                    groupIndex += 1;
+                    const likeConditions = tokens.flatMap((token) =>
+                        buildLikePatterns(token, mode).map(
+                            (pattern) =>
+                                sql`${schema.content.title} LIKE ${pattern} ESCAPE '\\'`
+                        )
+                    );
+                    return or(...likeConditions);
+                })
+                .filter((condition) => condition !== undefined);
+
+            const tokenArm =
+                tokenConditions.length > 0
+                    ? and(...tokenConditions)
+                    : undefined;
+            if (plan.compound === null) {
+                return tokenArm;
+            }
+
+            const compoundConditions = buildCompoundLikePatterns(
+                plan.compound
+            ).map(
+                (pattern) =>
+                    sql`${schema.content.title} LIKE ${pattern} ESCAPE '\\'`
+            );
+            return tokenArm === undefined
+                ? or(...compoundConditions)
+                : or(tokenArm, ...compoundConditions);
+        })
+        .filter((condition) => condition !== undefined);
+}
+
+function buildRawContentTitleSearchSql(searchTerm: string): SQL[] {
+    return getSqlSearchTokenGroups(searchTerm).map((tokens, index) => {
+        if (index === 0 && isShortSearchTokenGroup(tokens)) {
+            return sql`(${sql.join(
+                tokens.flatMap((token) =>
+                    buildGlobPrefixPatterns(token).map(
+                        (pattern) => sql`c.title GLOB ${pattern}`
+                    )
+                ),
+                sql` OR `
+            )})`;
+        }
+
+        return sql`(${sql.join(
+            tokens.flatMap((token) =>
+                buildLikePatterns(token).map(
+                    (pattern) => sql`c.title LIKE ${pattern} ESCAPE '\\'`
+                )
+            ),
+            sql` OR `
+        )})`;
+    });
+}
+
+/**
+ * Contains-mode LIKE conditions for the non-compound words of the term,
+ * applied on top of the compound FTS lookup so `A&E HD` only surfaces
+ * candidates that also contain `hd` (the FTS phrase can only express the
+ * compound word — trigram tokens need >= 3 chars).
+ */
+function buildCompoundResidualTitleSql(searchTerm: string): SQL[] {
+    return getCompoundResidualTokenGroups(searchTerm).map(
+        (tokens) =>
+            sql`(${sql.join(
+                tokens.flatMap((token) =>
+                    buildLikePatterns(token).map(
+                        (pattern) => sql`c.title LIKE ${pattern} ESCAPE '\\'`
+                    )
+                ),
+                sql` OR `
+            )})`
+    );
+}
+
+function dedupeXtreamCandidatesById(
+    candidates: XtreamGlobalSearchCandidate[]
+): XtreamGlobalSearchCandidate[] {
+    const seenIds = new Set<number>();
+
+    return candidates.filter((candidate) => {
+        if (seenIds.has(candidate.id)) {
+            return false;
+        }
+        seenIds.add(candidate.id);
+        return true;
+    });
+}
+
+async function selectXtreamGlobalSearchCandidatesWithTitleIndex(
+    db: AppDatabase,
+    searchTerm: string,
+    types: string[],
+    excludeHidden: boolean,
+    candidateLimit: number
+): Promise<XtreamGlobalSearchCandidate[]> {
+    const titleConditions = buildRawContentTitleSearchSql(searchTerm);
+    if (titleConditions.length === 0 || types.length === 0) {
+        return [];
+    }
+
+    return (await db.all(sql`
+        SELECT
+            c.id AS id,
+            c.category_id AS category_id,
+            c.title AS title,
+            c.rating AS rating,
+            c.added AS added,
+            c.poster_url AS poster_url,
+            c.epg_channel_id AS epg_channel_id,
+            c.tv_archive AS tv_archive,
+            c.tv_archive_duration AS tv_archive_duration,
+            c.direct_source AS direct_source,
+            c.xtream_id AS xtream_id,
+            c.type AS type,
+            cat.playlist_id AS playlist_id,
+            p.name AS playlist_name
+        FROM content AS c INDEXED BY idx_content_title
+        INNER JOIN categories AS cat ON c.category_id = cat.id
+        INNER JOIN playlists AS p ON cat.playlist_id = p.id
+        WHERE c.type IN (${sql.join(
+            types.map((type) => sql`${type}`),
+            sql`, `
+        )})
+        AND ${sql.join(titleConditions, sql` AND `)}
+        ${excludeHidden ? sql`AND cat.hidden = 0` : sql``}
+        ORDER BY c.title
+        LIMIT ${candidateLimit}
+    `)) as XtreamGlobalSearchCandidate[];
+}
+
+async function selectXtreamGlobalSearchCandidatesWithFts(
+    db: AppDatabase,
+    matchQuery: string,
+    types: string[],
+    excludeHidden: boolean,
+    candidateLimit: number,
+    residualTitleConditions: SQL[] = []
+): Promise<XtreamGlobalSearchCandidate[]> {
+    if (!matchQuery || types.length === 0) {
+        return [];
+    }
+
+    return (await db.all(sql`
+        SELECT
+            c.id AS id,
+            c.category_id AS category_id,
+            c.title AS title,
+            c.rating AS rating,
+            c.added AS added,
+            c.poster_url AS poster_url,
+            c.epg_channel_id AS epg_channel_id,
+            c.tv_archive AS tv_archive,
+            c.tv_archive_duration AS tv_archive_duration,
+            c.direct_source AS direct_source,
+            c.xtream_id AS xtream_id,
+            c.type AS type,
+            cat.playlist_id AS playlist_id,
+            p.name AS playlist_name
+        FROM content_title_fts
+        INNER JOIN content AS c ON c.id = content_title_fts.rowid
+        INNER JOIN categories AS cat ON c.category_id = cat.id
+        INNER JOIN playlists AS p ON cat.playlist_id = p.id
+        WHERE content_title_fts MATCH ${matchQuery}
+        AND c.type IN (${sql.join(
+            types.map((type) => sql`${type}`),
+            sql`, `
+        )})
+        ${
+            residualTitleConditions.length > 0
+                ? sql`AND ${sql.join(residualTitleConditions, sql` AND `)}`
+                : sql``
+        }
+        ${excludeHidden ? sql`AND cat.hidden = 0` : sql``}
+        ORDER BY rank, c.title
+        LIMIT ${candidateLimit}
+    `)) as XtreamGlobalSearchCandidate[];
+}
+
+async function selectXtreamGlobalSearchCandidatesWithContentScan(
+    db: AppDatabase,
+    searchTerm: string,
+    types: string[],
+    excludeHidden: boolean,
+    candidateLimit: number
+): Promise<XtreamGlobalSearchCandidate[]> {
+    const conditions = [
+        inArray(
+            schema.content.type,
+            types as Array<'live' | 'movie' | 'series'>
+        ),
+        ...buildContentTitleSearchConditions(searchTerm),
+    ];
+
+    if (excludeHidden) {
+        conditions.push(eq(schema.categories.hidden, false));
+    }
+
+    return db
+        .select({
+            ...selectContentFields(),
+            playlist_id: schema.categories.playlistId,
+            playlist_name: schema.playlists.name,
+        })
+        .from(schema.content)
+        .innerJoin(
+            schema.categories,
+            eq(schema.content.categoryId, schema.categories.id)
+        )
+        .innerJoin(
+            schema.playlists,
+            eq(schema.categories.playlistId, schema.playlists.id)
+        )
+        .where(and(...conditions))
+        .orderBy(schema.content.title)
+        .limit(candidateLimit);
+}
+
+/**
+ * Per-word M3U payload prefilter conditions, AND-ed by the caller — the same
+ * compound-word composition as `buildContentTitleSearchConditions`: "A&E"
+ * must reach channel names like "US: A&E" (issue #1161), while the other
+ * words of the query keep constraining the candidate playlists.
+ */
+function buildM3uPayloadSearchConditions(searchTerm: string) {
+    let groupIndex = 0;
+
+    return getSearchWordPlans(searchTerm)
+        .map((plan) => {
+            const tokenConditions = plan.tokenGroups
+                .map((tokens) => {
+                    const mode =
+                        groupIndex === 0 && isShortSearchTokenGroup(tokens)
+                            ? 'prefix'
+                            : 'contains';
+                    groupIndex += 1;
+                    const patterns = tokens.flatMap((token) =>
+                        buildM3uPayloadTextFieldPatterns(token, mode)
+                    );
+                    const likeConditions = patterns.map(
+                        (pattern) =>
+                            sql`${schema.playlists.payload} LIKE ${pattern} ESCAPE '\\'`
+                    );
+                    return or(...likeConditions);
+                })
+                .filter((condition) => condition !== undefined);
+
+            const tokenArm =
+                tokenConditions.length > 0
+                    ? and(...tokenConditions)
+                    : undefined;
+            if (plan.compound === null) {
+                return tokenArm;
+            }
+
+            const compoundConditions = buildM3uPayloadCompoundPatterns(
+                plan.compound
+            ).map(
+                (pattern) =>
+                    sql`${schema.playlists.payload} LIKE ${pattern} ESCAPE '\\'`
+            );
+            return tokenArm === undefined
+                ? or(...compoundConditions)
+                : or(tokenArm, ...compoundConditions);
+        })
+        .filter((condition) => condition !== undefined);
+}
+
+function asStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    return value
+        .map((item) => normalizeSearchText(item))
+        .filter((item) => item.length > 0);
+}
+
+function hasGlobalSearchSource(
+    sources: readonly GlobalSearchResultSource[] | undefined,
+    source: GlobalSearchResultSource
+): boolean {
+    return !sources || sources.length === 0 || sources.includes(source);
+}
+
+function parseM3uPlaylistPayload(
+    payload: string | null
+): ParsedM3uPlaylistPayload | null {
+    if (!payload) {
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(payload) as unknown;
+        return parsed && typeof parsed === 'object'
+            ? (parsed as ParsedM3uPlaylistPayload)
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeM3uChannel(value: unknown): Channel | null {
+    if (!value || typeof value !== 'object') {
+        return null;
+    }
+
+    const source = value as Partial<Channel>;
+    const url = normalizeSearchText(source.url);
+    const name = normalizeSearchText(source.name);
+    if (!url || !name) {
+        return null;
+    }
+
+    return {
+        id: normalizeSearchText(source.id) || url,
+        url,
+        name,
+        group: {
+            title: normalizeSearchText(source.group?.title),
+        },
+        tvg: {
+            id: normalizeSearchText(source.tvg?.id),
+            name: normalizeSearchText(source.tvg?.name),
+            url: normalizeSearchText(source.tvg?.url),
+            logo: normalizeSearchText(source.tvg?.logo),
+            rec: normalizeSearchText(source.tvg?.rec),
+        },
+        epgParams: source.epgParams,
+        timeshift: source.timeshift,
+        catchup: source.catchup,
+        http: {
+            referrer: normalizeSearchText(source.http?.referrer),
+            'user-agent': normalizeSearchText(source.http?.['user-agent']),
+            origin: normalizeSearchText(source.http?.origin),
+        },
+        radio: normalizeSearchText(source.radio),
+    };
+}
+
+function getM3uPayloadChannels(payload: ParsedM3uPlaylistPayload): Channel[] {
+    const items = Array.isArray(payload.playlist?.items)
+        ? payload.playlist?.items
+        : Array.isArray(payload.items)
+          ? payload.items
+          : [];
+
+    return items
+        .map((item) => normalizeM3uChannel(item))
+        .filter((item): item is Channel => item !== null);
+}
+
+function scoreM3uChannel(channel: Channel, searchTerm: string): number | null {
+    const scores = [
+        scoreSearchTextMatch(channel.name, searchTerm),
+        scoreSearchTextMatch(channel.tvg.name, searchTerm),
+        scoreSearchTextMatch(channel.group.title, searchTerm),
+    ].filter((score): score is number => score !== null);
+
+    return scores.length > 0 ? Math.min(...scores) : null;
+}
+
+function toM3uGlobalSearchResult(
+    row: M3uPlaylistSearchRow,
+    channel: Channel
+): M3uGlobalSearchResult {
+    return {
+        source_type: GLOBAL_SEARCH_RESULT_SOURCES.M3u,
+        content_type: GLOBAL_SEARCH_CONTENT_TYPES.Live,
+        playlist_id: row.id,
+        playlist_name: row.name,
+        channel_id: channel.id,
+        stream_url: channel.url,
+        group_title: channel.group.title,
+        radio: channel.radio,
+        poster_url: channel.tvg.logo || null,
+        channel,
+        id: `${row.id}::${channel.id || channel.url}`,
+        category_id: 'm3u',
+        title: channel.name || channel.tvg.name || channel.url,
+        rating: null,
+        added: null,
+        xtream_id: -1,
+        type: GLOBAL_SEARCH_CONTENT_TYPES.Live,
+    };
+}
+
+function buildScoredM3uGlobalSearchResults(
+    rows: readonly M3uPlaylistSearchRow[],
+    searchTerm: string,
+    excludeHidden = false,
+    maxResults = MAX_GLOBAL_SEARCH_CANDIDATE_LIMIT
+): ScoredGlobalSearchResult<M3uGlobalSearchResult>[] {
+    const results: ScoredGlobalSearchResult<M3uGlobalSearchResult>[] = [];
+
+    for (const row of rows) {
+        const payload = parseM3uPlaylistPayload(row.payload);
+        if (!payload) {
+            continue;
+        }
+
+        const hiddenGroups = new Set(asStringArray(payload.hiddenGroupTitles));
+        for (const channel of getM3uPayloadChannels(payload)) {
+            if (excludeHidden && hiddenGroups.has(channel.group.title)) {
+                continue;
+            }
+
+            const score = scoreM3uChannel(channel, searchTerm);
+            if (score === null) {
+                continue;
+            }
+
+            results.push({
+                result: toM3uGlobalSearchResult(row, channel),
+                score,
+            });
+
+            if (results.length >= maxResults) {
+                return results;
+            }
+        }
+    }
+
+    return results;
+}
+
+export function buildM3uGlobalSearchResults(
+    rows: readonly M3uPlaylistSearchRow[],
+    searchTerm: string,
+    excludeHidden = false,
+    options?: GlobalSearchPaginationOptions | number
+): M3uGlobalSearchResult[] {
+    return paginateScoredResults(
+        buildScoredM3uGlobalSearchResults(rows, searchTerm, excludeHidden),
+        normalizeGlobalSearchPagination(options)
+    );
 }
 
 export type GlobalRecentlyAddedKind = 'all' | 'vod' | 'series';
@@ -87,7 +682,8 @@ export async function hasContent(
 export async function getContent(
     db: AppDatabase,
     playlistId: string,
-    type: 'live' | 'movie' | 'series'
+    type: 'live' | 'movie' | 'series',
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ) {
     const baseQuery = db
         .select(selectContentFields())
@@ -103,17 +699,22 @@ export async function getContent(
             )
         );
 
-    return type === 'live'
-        ? baseQuery.orderBy(asc(schema.content.id))
-        : baseQuery.orderBy(desc(schema.content.added));
+    const query =
+        type === 'live'
+            ? baseQuery.orderBy(asc(schema.content.id))
+            : baseQuery.orderBy(desc(schema.content.added));
+
+    return capturePhase
+        ? capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_CONTENT_READ,
+              async () => query,
+              (rows) => ({ itemCount: rows.length })
+          )
+        : query;
 }
 
 export type RecentlyAddedPlaylistType =
-    | 'xtream'
-    | 'stalker'
-    | 'm3u-file'
-    | 'm3u-text'
-    | 'm3u-url';
+    'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url';
 
 export async function getGlobalRecentlyAdded(
     db: AppDatabase,
@@ -121,27 +722,74 @@ export async function getGlobalRecentlyAdded(
     limit = 200,
     playlistType?: RecentlyAddedPlaylistType
 ) {
-    const contentTypes = getRecentlyAddedContentTypes(kind);
     const normalizedLimit = Number.isFinite(limit)
         ? Math.min(Math.max(Math.trunc(limit), 1), 200)
         : 200;
 
+    const contentTypes = getRecentlyAddedContentTypes(kind);
+
+    if (contentTypes.length > 1) {
+        const rows = await Promise.all(
+            contentTypes.map((type) =>
+                getGlobalRecentlyAddedByType(
+                    db,
+                    type,
+                    normalizedLimit,
+                    playlistType
+                )
+            )
+        );
+
+        return rows
+            .flat()
+            .sort(
+                (left, right) =>
+                    getRecentlyAddedSortValue(right) -
+                    getRecentlyAddedSortValue(left)
+            )
+            .slice(0, normalizedLimit);
+    }
+
+    return getGlobalRecentlyAddedByType(
+        db,
+        contentTypes[0],
+        normalizedLimit,
+        playlistType
+    );
+}
+
+function getRecentlyAddedSortValue(item: {
+    added?: string | null;
+    added_at?: string | null;
+}): number {
+    const value = Number(item.added_at || item.added || 0);
+
+    return Number.isFinite(value) ? value : 0;
+}
+
+function getGlobalRecentlyAddedByType(
+    db: AppDatabase,
+    type: 'movie' | 'series',
+    limit: number,
+    playlistType?: RecentlyAddedPlaylistType
+) {
     const whereConditions = [
-        inArray(schema.content.type, contentTypes),
+        eq(schema.content.type, type),
         eq(schema.categories.hidden, false),
         sql`${schema.content.added} <> ''`,
+        sql`${schema.content.added} <= ${getXtreamRecentlyAddedMaxEpochSeconds()}`,
     ];
 
     if (playlistType) {
         whereConditions.push(eq(schema.playlists.type, playlistType));
     }
 
-    // Sort by `added` directly. Xtream stores Unix-epoch timestamps as
-    // 10-digit numeric strings (since 2001-09-09), so lexicographic sort
-    // is equivalent to numeric sort. Wrapping the column in CAST(... AS
-    // INTEGER) — as we used to — blocks SQLite from using
-    // idx_content_type_added and forces a full table scan + sort on the
-    // entire content table (often 100k+ rows) on every dashboard load.
+    // Sort by `added` directly. Xtream import and DB startup migrations
+    // normalize recently-added epochs to 10-digit seconds strings, so
+    // lexicographic sort is equivalent to numeric sort. Wrapping the column in
+    // CAST(... AS INTEGER) blocks SQLite from using idx_content_type_added and
+    // forces a full table scan + sort on the entire content table (often 100k+
+    // rows) on every dashboard load.
     return db
         .select({
             ...selectContentFields(),
@@ -160,22 +808,8 @@ export async function getGlobalRecentlyAdded(
         )
         .where(and(...whereConditions))
         .orderBy(desc(schema.content.added))
-        .limit(normalizedLimit);
+        .limit(limit);
 }
-
-type XtreamContentValue = {
-    categoryId: number;
-    title: string;
-    rating: string;
-    added: string;
-    posterUrl: string;
-    epgChannelId?: string | null;
-    tvArchive?: number | null;
-    tvArchiveDuration?: number | null;
-    directSource?: string | null;
-    xtreamId: number;
-    type: 'live' | 'movie' | 'series';
-};
 
 type XtreamContentSource = Record<string, unknown> & {
     category_id?: string | number;
@@ -225,10 +859,11 @@ function toXtreamContentValue(
         categoryId,
         title,
         rating: String(source.rating || source.rating_imdb || ''),
-        added:
+        added: toXtreamRecentlyAddedEpochSeconds(
             type === 'series'
-                ? String(source.last_modified || '')
-                : String(source.added || ''),
+                ? source.last_modified || source.added
+                : source.added || source.last_modified
+        ),
         posterUrl: String(
             source.stream_icon || source.poster || source.cover || ''
         ),
@@ -264,7 +899,8 @@ export async function saveContent(
     playlistId: string,
     streams: Array<Record<string, unknown>>,
     type: 'live' | 'movie' | 'series',
-    control?: OperationControl
+    control?: OperationControl,
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ): Promise<{ success: boolean; count: number }> {
     const dbType =
         type === 'series' ? 'series' : type === 'movie' ? 'movies' : 'live';
@@ -288,7 +924,7 @@ export async function saveContent(
         return { success: true, count: existingContent[0].count };
     }
 
-    const categories = await db
+    const categoriesQuery = db
         .select({
             id: schema.categories.id,
             xtreamId: schema.categories.xtreamId,
@@ -301,49 +937,46 @@ export async function saveContent(
             )
         );
 
-    const categoryMap = new Map(
-        categories.map((category) => [category.xtreamId, category.id])
-    );
+    const categories = capturePhase
+        ? await capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_CONTENT_CATEGORY_MAP_READ,
+              async () => categoriesQuery,
+              (rows) => ({ itemCount: rows.length })
+          )
+        : await categoriesQuery;
+    const values = capturePhase
+        ? capturePhase.captureSync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.NORMALIZE_CONTENT,
+              () =>
+                  normalizeXtreamContentValues(
+                      streams,
+                      type,
+                      categories,
+                      toXtreamContentValue
+                  ),
+              (result) => ({ itemCount: result.length })
+          )
+        : normalizeXtreamContentValues(
+              streams,
+              type,
+              categories,
+              toXtreamContentValue
+          );
 
-    const values = streams
-        .map((stream) => toXtreamContentValue(stream, type, categoryMap))
-        .filter((value): value is XtreamContentValue => value !== null);
-
-    const total = values.length;
-    const chunkSize = 100;
-    let totalInserted = 0;
-
-    for (let index = 0; index < values.length; index += chunkSize) {
-        await checkpointOperation(control);
-        const chunk = values.slice(index, index + chunkSize);
-        await db.transaction((tx) => {
-            tx.insert(schema.content)
-                .values(chunk)
-                .onConflictDoNothing({
-                    target: [
-                        schema.content.categoryId,
-                        schema.content.type,
-                        schema.content.xtreamId,
-                    ],
-                })
-                .run();
-        });
-        totalInserted += chunk.length;
-        await reportOperationProgress(control, {
-            phase: 'saving-content',
-            current: totalInserted,
-            total,
-            increment: chunk.length,
-        });
-    }
-
-    return { success: true, count: totalInserted };
+    return capturePhase
+        ? capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_CONTENT_WRITE_TRANSACTIONS,
+              () => writeXtreamContentValues(db, values, control),
+              (result) => ({ itemCount: result.count })
+          )
+        : writeXtreamContentValues(db, values, control);
 }
 
 export async function clearXtreamImportCache(
     db: AppDatabase,
     playlistId: string,
-    type: 'live' | 'movie' | 'series'
+    type: 'live' | 'movie' | 'series',
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ): Promise<{ success: boolean }> {
     const dbType =
         type === 'series' ? 'series' : type === 'movie' ? 'movies' : 'live';
@@ -362,6 +995,17 @@ export async function clearXtreamImportCache(
             )
         );
 
+    const categoryIds = categoryRows.map((category) => category.id);
+    if (categoryIds.length === 0) {
+        return capturePhase
+            ? capturePhase.captureAsync(
+                  XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_XTREAM_CACHE_CLEAR_WRITE_TRANSACTIONS,
+                  async () => ({ success: true }),
+                  () => ({ itemCount: 0 })
+              )
+            : { success: true };
+    }
+
     await storeHiddenCategoryXtreamIds(
         db,
         playlistId,
@@ -371,36 +1015,25 @@ export async function clearXtreamImportCache(
             .map((category) => category.xtreamId)
     );
 
-    const categoryIds = categoryRows.map((category) => category.id);
-    if (categoryIds.length === 0) {
-        return { success: true };
-    }
+    // Count and delete stay scoped to the captured ids, not to the
+    // playlist/type predicate, so a category a concurrent import creates
+    // between the read and the delete survives.
+    const contentRowCounts = await countContentRowsByCategory(
+        db,
+        inArray(schema.categories.id, categoryIds)
+    );
 
-    const contentRows = await db
-        .select({ id: schema.content.id })
-        .from(schema.content)
-        .where(inArray(schema.content.categoryId, categoryIds));
-
-    for (const chunk of chunkValues(
-        contentRows.map((row) => row.id),
-        100
-    )) {
-        await db.transaction((tx) => {
-            tx.delete(schema.content)
-                .where(inArray(schema.content.id, chunk))
-                .run();
-        });
-    }
-
-    for (const chunk of chunkValues(categoryIds, 100)) {
-        await db.transaction((tx) => {
-            tx.delete(schema.categories)
-                .where(inArray(schema.categories.id, chunk))
-                .run();
-        });
-    }
-
-    return { success: true };
+    return capturePhase
+        ? capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_XTREAM_CACHE_CLEAR_WRITE_TRANSACTIONS,
+              () => deleteXtreamCacheRows(db, contentRowCounts, categoryIds),
+              () => ({
+                  itemCount:
+                      sumCategoryRowCounts(contentRowCounts) +
+                      categoryIds.length,
+              })
+          )
+        : deleteXtreamCacheRows(db, contentRowCounts, categoryIds);
 }
 
 export async function getContentByXtreamId(
@@ -436,17 +1069,12 @@ export async function searchContent(
     playlistId: string,
     searchTerm: string,
     types: string[],
-    excludeHidden = false
+    excludeHidden = false,
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ) {
-    if (!types || types.length === 0) {
+    if (!types || types.length === 0 || !normalizeSearchMatchText(searchTerm)) {
         return [];
     }
-
-    const searchTermLower = searchTerm.toLocaleLowerCase();
-    const likePatterns = buildLikePatterns(searchTerm);
-    const likeConditions = likePatterns.map(
-        (pattern) => sql`${schema.content.title} LIKE ${pattern} ESCAPE '\\'`
-    );
 
     const conditions = [
         eq(schema.categories.playlistId, playlistId),
@@ -454,14 +1082,14 @@ export async function searchContent(
             schema.content.type,
             types as Array<'live' | 'movie' | 'series'>
         ),
-        or(...likeConditions),
+        ...buildContentTitleSearchConditions(searchTerm),
     ];
 
     if (excludeHidden) {
         conditions.push(eq(schema.categories.hidden, false));
     }
 
-    const candidates = await db
+    const query = db
         .select(selectContentFields())
         .from(schema.content)
         .innerJoin(
@@ -471,63 +1099,180 @@ export async function searchContent(
         .where(and(...conditions))
         .limit(200);
 
-    return candidates
-        .filter((item) =>
-            item.title?.toLocaleLowerCase().includes(searchTermLower)
-        )
-        .slice(0, 50);
+    const candidates = capturePhase
+        ? await capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_SEARCH_QUERY,
+              async () => query,
+              (rows) => ({ itemCount: rows.length })
+          )
+        : await query;
+
+    return capturePhase
+        ? capturePhase.captureSync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.NORMALIZE_SEARCH_RANK,
+              () => rankSearchCandidates(candidates, searchTerm),
+              (result) => ({ itemCount: result.length })
+          )
+        : rankSearchCandidates(candidates, searchTerm);
 }
 
 export async function globalSearch(
     db: AppDatabase,
     searchTerm: string,
     types: string[],
-    excludeHidden = false
-) {
-    if (!types || types.length === 0) {
+    excludeHidden = false,
+    sources?: GlobalSearchResultSource[],
+    options?: GlobalSearchPaginationOptions
+): Promise<GlobalSearchResult[]> {
+    if (!types || types.length === 0 || !normalizeSearchMatchText(searchTerm)) {
         return [];
     }
 
-    const searchTermLower = searchTerm.toLocaleLowerCase();
-    const likePatterns = buildLikePatterns(searchTerm);
-    const likeConditions = likePatterns.map(
-        (pattern) => sql`${schema.content.title} LIKE ${pattern} ESCAPE '\\'`
-    );
+    const pagination = normalizeGlobalSearchPagination(options);
+    const candidateLimit = getGlobalSearchCandidateLimit();
+    const results: ScoredGlobalSearchResult[] = [];
 
-    const conditions = [
-        inArray(
-            schema.content.type,
-            types as Array<'live' | 'movie' | 'series'>
-        ),
-        or(...likeConditions),
-    ];
+    if (hasGlobalSearchSource(sources, GLOBAL_SEARCH_RESULT_SOURCES.Xtream)) {
+        let candidates: XtreamGlobalSearchCandidate[];
 
-    if (excludeHidden) {
-        conditions.push(eq(schema.categories.hidden, false));
+        if (shouldUseContentTitlePrefixIndex(searchTerm)) {
+            candidates = await selectXtreamGlobalSearchCandidatesWithTitleIndex(
+                db,
+                searchTerm,
+                types,
+                excludeHidden,
+                candidateLimit
+            );
+
+            // The prefix arm only sees titles that start with the short first
+            // token ("A&E" -> GLOB 'a*'), so a compound word like "a&e" is
+            // additionally looked up as a trigram FTS substring to reach
+            // titles such as "US: A&E" (issue #1161). The non-compound words
+            // of the query stay applied as LIKE conditions so this arm cannot
+            // fill the candidate limit with compound-only matches.
+            const compoundMatchQuery = buildCompoundFtsMatchQuery(searchTerm);
+            if (compoundMatchQuery) {
+                try {
+                    const compoundCandidates =
+                        await selectXtreamGlobalSearchCandidatesWithFts(
+                            db,
+                            compoundMatchQuery,
+                            types,
+                            excludeHidden,
+                            candidateLimit,
+                            buildCompoundResidualTitleSql(searchTerm)
+                        );
+                    candidates = dedupeXtreamCandidatesById([
+                        ...candidates,
+                        ...compoundCandidates,
+                    ]);
+                } catch {
+                    candidates =
+                        await selectXtreamGlobalSearchCandidatesWithContentScan(
+                            db,
+                            searchTerm,
+                            types,
+                            excludeHidden,
+                            candidateLimit
+                        );
+                }
+            }
+        } else if (shouldUseContentTitleFts(searchTerm)) {
+            try {
+                candidates = await selectXtreamGlobalSearchCandidatesWithFts(
+                    db,
+                    buildContentTitleFtsMatchQuery(searchTerm),
+                    types,
+                    excludeHidden,
+                    candidateLimit
+                );
+            } catch {
+                candidates =
+                    await selectXtreamGlobalSearchCandidatesWithContentScan(
+                        db,
+                        searchTerm,
+                        types,
+                        excludeHidden,
+                        candidateLimit
+                    );
+            }
+        } else {
+            candidates =
+                await selectXtreamGlobalSearchCandidatesWithContentScan(
+                    db,
+                    searchTerm,
+                    types,
+                    excludeHidden,
+                    candidateLimit
+                );
+        }
+
+        results.push(
+            ...candidates
+                .map(
+                    (
+                        item
+                    ): ScoredGlobalSearchResult<XtreamGlobalSearchResult> | null => {
+                        const score = scoreSearchTextMatch(
+                            item.title ?? '',
+                            searchTerm
+                        );
+                        if (score === null) {
+                            return null;
+                        }
+
+                        return {
+                            score,
+                            result: {
+                                ...item,
+                                source_type:
+                                    GLOBAL_SEARCH_RESULT_SOURCES.Xtream,
+                                content_type:
+                                    item.type as GlobalSearchContentType,
+                                type: item.type as GlobalSearchContentType,
+                            },
+                        };
+                    }
+                )
+                .filter(
+                    (
+                        item
+                    ): item is ScoredGlobalSearchResult<XtreamGlobalSearchResult> =>
+                        item !== null
+                )
+        );
     }
 
-    const candidates = await db
-        .select({
-            ...selectContentFields(),
-            playlist_id: schema.categories.playlistId,
-            playlist_name: schema.playlists.name,
-        })
-        .from(schema.content)
-        .innerJoin(
-            schema.categories,
-            eq(schema.content.categoryId, schema.categories.id)
-        )
-        .innerJoin(
-            schema.playlists,
-            eq(schema.categories.playlistId, schema.playlists.id)
-        )
-        .where(and(...conditions))
-        .orderBy(schema.content.title)
-        .limit(200);
+    if (
+        types.includes(GLOBAL_SEARCH_CONTENT_TYPES.Live) &&
+        hasGlobalSearchSource(sources, GLOBAL_SEARCH_RESULT_SOURCES.M3u)
+    ) {
+        const rows = await db
+            .select({
+                id: schema.playlists.id,
+                name: schema.playlists.name,
+                payload: schema.playlists.payload,
+            })
+            .from(schema.playlists)
+            .where(
+                and(
+                    inArray(schema.playlists.type, [...M3U_PLAYLIST_TYPES]),
+                    sql`${schema.playlists.payload} IS NOT NULL`,
+                    ...buildM3uPayloadSearchConditions(searchTerm)
+                )
+            )
+            .orderBy(schema.playlists.name)
+            .limit(candidateLimit);
 
-    return candidates
-        .filter((item) =>
-            item.title?.toLocaleLowerCase().includes(searchTermLower)
-        )
-        .slice(0, 50);
+        results.push(
+            ...buildScoredM3uGlobalSearchResults(
+                rows,
+                searchTerm,
+                excludeHidden,
+                candidateLimit
+            )
+        );
+    }
+
+    return paginateScoredResults(results, pagination);
 }

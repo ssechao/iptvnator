@@ -66,6 +66,20 @@ describe('catchup.utils', () => {
         ).toBe(7);
     });
 
+    it('skips a blank tvg-rec and uses a real timeshift value', () => {
+        // `tvg-rec=""` is a common parser default; a nullish (`??`) chain would
+        // stop on it and yield 0 (unbounded window). The non-blank helper skips
+        // it and returns the real timeshift days.
+        expect(
+            getM3uArchiveDays({
+                ...baseChannel,
+                catchup: undefined,
+                timeshift: '7',
+                tvg: { ...baseChannel.tvg, rec: '' },
+            })
+        ).toBe(7);
+    });
+
     it('supports legacy same-stream shift playback when catchup type is shift', () => {
         expect(isM3uCatchupPlaybackSupported(baseChannel)).toBe(true);
         expect(resolveM3uCatchupUrl(baseChannel, archivedProgram, 1_775_820_000))
@@ -194,6 +208,74 @@ describe('catchup.utils', () => {
                 {
                     ...archivedProgram,
                     start: '202604100800 +0000',
+                    startTimestamp: null,
+                },
+                1_775_820_000
+            )
+        ).toBe(
+            'https://streams.example.com/live/channel-1.m3u8?utc=1775808000&lutc=1775820000'
+        );
+    });
+
+    it('applies negative sub-hour XMLTV offsets such as -0030', () => {
+        // Regression: Number('-00') === -0, so a Math.sign()-based conversion
+        // dropped the minutes' sign and treated -0030 as UTC.
+        expect(
+            resolveM3uCatchupUrl(
+                baseChannel,
+                {
+                    ...archivedProgram,
+                    start: '202604100800 -0030',
+                    startTimestamp: null,
+                },
+                1_775_820_000
+            )
+        ).toBe(
+            'https://streams.example.com/live/channel-1.m3u8?utc=1775809800&lutc=1775820000'
+        );
+    });
+
+    it('applies positive offsets with minutes such as +0530', () => {
+        expect(
+            resolveM3uCatchupUrl(
+                baseChannel,
+                {
+                    ...archivedProgram,
+                    start: '202604100800 +0530',
+                    startTimestamp: null,
+                },
+                1_775_820_000
+            )
+        ).toBe(
+            'https://streams.example.com/live/channel-1.m3u8?utc=1775788200&lutc=1775820000'
+        );
+    });
+
+    it('applies positive sub-hour XMLTV offsets such as +0030', () => {
+        // Regression: Number('+00') === 0, so a Math.sign()-based conversion
+        // dropped the minutes and treated +0030 as UTC.
+        expect(
+            resolveM3uCatchupUrl(
+                baseChannel,
+                {
+                    ...archivedProgram,
+                    start: '202604100800 +0030',
+                    startTimestamp: null,
+                },
+                1_775_820_000
+            )
+        ).toBe(
+            'https://streams.example.com/live/channel-1.m3u8?utc=1775806200&lutc=1775820000'
+        );
+    });
+
+    it('treats a -0000 offset as UTC', () => {
+        expect(
+            resolveM3uCatchupUrl(
+                baseChannel,
+                {
+                    ...archivedProgram,
+                    start: '202604100800 -0000',
                     startTimestamp: null,
                 },
                 1_775_820_000

@@ -1,13 +1,146 @@
-import { app, BrowserWindow, Menu, screen, shell } from 'electron';
-import { join } from 'path';
+import { app, BrowserWindow, Menu, screen, session, shell } from 'electron';
+import {
+    ElectronBridgeWindowState,
+    WINDOW_STATE_CHANGED,
+} from '@iptvnator/shared/interfaces';
+import { join, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import { rendererAppName, rendererAppPort } from './constants';
 import {
+    isStartupTraceEnabled,
     isRendererConsoleTraceEnabled,
     isWindowTraceEnabled,
     trace,
 } from './services/debug-trace';
-import { removeLegacyServiceWorkerData } from './services/electron-web-cache.service';
-import { store, WINDOW_BOUNDS } from './services/store.service';
+import {
+    STARTUP_WINDOW_MODE,
+    store,
+    WINDOW_BOUNDS,
+} from './services/store.service';
+import { isFrameCopyRuntimeUsable } from './services/embedded-mpv-frame-copy-platform.util';
+import { isEmbeddedMpvFeatureEnabled } from './services/embedded-mpv-runtime-policy.util';
+import {
+    FULLSCREEN_LAUNCH_SWITCH,
+    resolveStartupWindowMode,
+} from './services/startup-window-mode';
+import {
+    requestFullScreen,
+    trackNativeFullScreen,
+} from './services/native-fullscreen-transitions';
+
+const externalBrowserProtocols = new Set(['http:', 'https:']);
+const trustedDevRendererHosts = new Set([
+    'localhost',
+    '127.0.0.1',
+    '[::1]',
+    '::1',
+]);
+
+function parseUrl(url: string): URL | null {
+    try {
+        return new URL(url);
+    } catch {
+        return null;
+    }
+}
+
+function getPackagedRendererIndexPath(): string {
+    return resolve(__dirname, '..', rendererAppName, 'index.html');
+}
+
+function getFilePathFromUrl(url: URL): string | null {
+    try {
+        return fileURLToPath(url);
+    } catch {
+        return null;
+    }
+}
+
+export function isExternalBrowserUrl(url: string): boolean {
+    const parsedUrl = parseUrl(url);
+    return Boolean(
+        parsedUrl && externalBrowserProtocols.has(parsedUrl.protocol)
+    );
+}
+
+export function isTrustedRendererNavigationUrl(
+    url: string,
+    isDevelopmentMode: boolean,
+    packagedRendererIndexPath = getPackagedRendererIndexPath()
+): boolean {
+    const parsedUrl = parseUrl(url);
+
+    if (!parsedUrl) {
+        return false;
+    }
+
+    if (parsedUrl.protocol === 'file:') {
+        const filePath = getFilePathFromUrl(parsedUrl);
+
+        if (isDevelopmentMode || !filePath) {
+            return false;
+        }
+
+        return resolve(filePath) === resolve(packagedRendererIndexPath);
+    }
+
+    if (!isDevelopmentMode) {
+        return false;
+    }
+
+    return (
+        parsedUrl.protocol === 'http:' &&
+        trustedDevRendererHosts.has(parsedUrl.hostname) &&
+        parsedUrl.port === String(rendererAppPort)
+    );
+}
+
+export function getMainWindowWebPreferences(): Electron.BrowserWindowConstructorOptions['webPreferences'] {
+    // The frame-copy embedded MPV experiment needs the preload script to
+    // load the shm frame-reader native addon, which the renderer sandbox
+    // forbids. Only that opt-in flag relaxes the sandbox; context isolation
+    // and nodeIntegration:false stay on either way, so page code never
+    // gains Node access. Revisit before the engine can become a default.
+    const frameCopyExperiment =
+        isEmbeddedMpvFeatureEnabled() &&
+        ['1', 'true', 'yes', 'on'].includes(
+            (process.env.IPTVNATOR_ENABLE_EMBEDDED_MPV_FRAME_COPY ?? '')
+                .trim()
+                .toLowerCase()
+        ) && isFrameCopyRuntimeUsable();
+    return {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: !frameCopyExperiment,
+        webSecurity: true,
+        backgroundThrottling: false,
+        preload: join(__dirname, 'main.preload.js'),
+    };
+}
+
+export async function clearElectronServiceWorkerStorage(
+    electronSession: Pick<Electron.Session, 'clearStorageData'> = session.defaultSession
+): Promise<void> {
+    try {
+        await electronSession.clearStorageData({
+            storages: ['serviceworkers', 'cachestorage'],
+        });
+
+        if (isStartupTraceEnabled()) {
+            trace('startup', 'electron-service-worker-storage:cleared');
+        }
+    } catch (error) {
+        console.warn('Failed to clear Electron service worker storage:', error);
+
+        if (isStartupTraceEnabled()) {
+            trace(
+                'startup',
+                'electron-service-worker-storage:clear-failed',
+                error
+            );
+        }
+    }
+}
 
 function attachWindowTrace(mainWindow: Electron.BrowserWindow): void {
     if (!isWindowTraceEnabled()) {
@@ -94,9 +227,22 @@ function attachWindowTrace(mainWindow: Electron.BrowserWindow): void {
 export default class App {
     // Keep a global reference of the window object, if you don't, the window will
     // be closed automatically when the JavaScript object is garbage collected.
-    static mainWindow: Electron.BrowserWindow;
+    static mainWindow: Electron.BrowserWindow | null = null;
+    private static readonly mainWindowListeners: Array<
+        (mainWindow: Electron.BrowserWindow) => void
+    > = [];
     static application: Electron.App;
     static BrowserWindow;
+    private static loadedMainWindow: Electron.BrowserWindow | null = null;
+    private static mainWindowLoadPromise: Promise<void> | null = null;
+    /**
+     * Whether the `--fullscreen` launch switch has already shaped a window.
+     * See initMainWindow: the switch is consumed by the first window so a
+     * window re-created later in the same process (macOS Dock) follows the
+     * stored setting instead.
+     */
+    private static launchFullscreenSwitchConsumed = false;
+    private static rendererLoadingEnabled = false;
 
     private static shouldOpenDevTools() {
         return process.env.ELECTRON_OPEN_DEVTOOLS === '1';
@@ -126,12 +272,10 @@ export default class App {
         App.mainWindow = null;
     }
 
-    private static onRedirect(event: any, url: string) {
-        if (url !== App.mainWindow.webContents.getURL()) {
-            // this is a normal external redirect, open it in a new browser window
-            event.preventDefault();
-            shell.openExternal(url);
-        }
+    private static startMainWindowLoad(): void {
+        void App.loadMainWindow().catch((error) => {
+            console.error('Failed to load main window:', error);
+        });
     }
 
     private static onReady() {
@@ -139,33 +283,171 @@ export default class App {
         // initialization and is ready to create browser windows.
         // Some APIs can only be used after this event occurs.
         if (rendererAppName) {
-            if (!App.isDevelopmentMode()) {
-                try {
-                    removeLegacyServiceWorkerData(
-                        App.application.getPath('userData')
-                    );
-                    if (isWindowTraceEnabled()) {
-                        trace('window', 'legacy-service-worker-data-removed');
-                    }
-                } catch (error) {
-                    console.warn(
-                        'Failed to remove legacy service worker data:',
-                        error
-                    );
-                }
-            }
-
             App.initMainWindow();
-            App.loadMainWindow();
+            if (App.rendererLoadingEnabled) {
+                App.startMainWindowLoad();
+            }
+        }
+    }
+
+    /**
+     * Registers a listener that needs the current main window, and re-runs it
+     * whenever a new one is created.
+     *
+     * The main window is not created once per process: on macOS the window can
+     * be closed and rebuilt (dock `activate`, or a second launch handed over by
+     * the single-instance guard) while the process lives on. Anything that
+     * caches the window — `download-broadcast`'s module-level reference, for
+     * one — would otherwise keep pointing at a destroyed window and silently
+     * stop delivering to the renderer. Fires immediately when a window already
+     * exists, so callers registering after startup do not miss the first one.
+     */
+    static onMainWindowCreated(
+        listener: (mainWindow: Electron.BrowserWindow) => void
+    ): void {
+        App.mainWindowListeners.push(listener);
+
+        if (App.mainWindow && !App.mainWindow.isDestroyed()) {
+            listener(App.mainWindow);
+        }
+    }
+
+    private static notifyMainWindowCreated(
+        mainWindow: Electron.BrowserWindow
+    ): void {
+        for (const listener of App.mainWindowListeners) {
+            listener(mainWindow);
+        }
+    }
+
+    /**
+     * Brings the app back to a windowed state, re-creating the main window if
+     * it is gone.
+     *
+     * On macOS closing the last window deliberately keeps the process alive
+     * (`onWindowAllClosed`), so this is the recovery path for both the dock
+     * `activate` event and a second launch that the single-instance guard
+     * hands over to this process.
+     */
+    static ensureMainWindow() {
+        if (App.mainWindow === null) {
+            App.onReady();
+        }
+        if (App.rendererLoadingEnabled) {
+            App.startMainWindowLoad();
         }
     }
 
     private static onActivate() {
         // On macOS it's common to re-create a window in the app when the
         // dock icon is clicked and there are no other windows open.
-        if (App.mainWindow === null) {
-            App.onReady();
+        App.ensureMainWindow();
+    }
+
+    private static handleRendererNavigation(
+        event: Electron.Event,
+        url: string
+    ): void {
+        if (isTrustedRendererNavigationUrl(url, App.isDevelopmentMode())) {
+            return;
         }
+
+        event.preventDefault();
+
+        if (isExternalBrowserUrl(url)) {
+            shell.openExternal(url);
+        }
+    }
+
+    /**
+     * Hide the native title bar on every desktop platform. macOS keeps the
+     * system traffic lights (overlay), while Windows/Linux rely on the
+     * renderer-drawn window controls (`app-window-controls`) wired up via the
+     * WINDOW:* IPC channels. `frame` stays untouched so native resize borders
+     * and snapping keep working.
+     */
+    private static getPlatformTitleBarOptions(): Electron.BrowserWindowConstructorOptions {
+        if (process.platform === 'darwin') {
+            return {
+                titleBarStyle: 'hidden',
+                titleBarOverlay: true,
+                trafficLightPosition: { x: 16, y: 20 },
+            };
+        }
+
+        return { titleBarStyle: 'hidden' };
+    }
+
+    private static attachWindowStateEvents(win: Electron.BrowserWindow): void {
+        // Only Windows/Linux render custom window controls that subscribe
+        // to these pushes; macOS keeps the native traffic lights, so
+        // sending state updates there would be dead IPC traffic.
+        if (process.platform === 'darwin') {
+            return;
+        }
+
+        // Window state is never re-read at event time: on Windows both
+        // isFullScreen() and isMaximized() can still report the
+        // pre-transition value while the matching event fires (notably for
+        // HTML-element fullscreen, i.e. the video player). Since the
+        // renderer replaces both flags on every push and no later event
+        // corrects a stale one, polling left the controls hidden forever
+        // after leaving fullscreen — and, for the companion flag, the
+        // maximize/restore glyph stuck on the wrong icon.
+        //
+        // Instead the state is seeded once here (window creation, so no
+        // transition is in flight) and each event patches only the flag it
+        // names.
+        const state: ElectronBridgeWindowState = {
+            isMaximized: win.isMaximized(),
+            isFullScreen: win.isFullScreen(),
+        };
+
+        // Native (OS-level) and HTML-element fullscreen are tracked apart
+        // and OR-ed into the pushed flag. Electron remembers when the window
+        // was already natively fullscreen before the player entered HTML
+        // fullscreen and then leaves ONLY the HTML state on exit — no
+        // 'leave-full-screen' fires and the window stays fullscreen. A single
+        // flag cleared by 'leave-html-full-screen' would un-hide the window
+        // controls over a window that is still fullscreen, which a fullscreen
+        // launch or F11 followed by the player's F → Esc makes routine.
+        const fullscreen = { native: state.isFullScreen, html: false };
+
+        const push = (patch: Partial<ElectronBridgeWindowState>) => {
+            Object.assign(state, patch);
+
+            if (win.isDestroyed()) {
+                return;
+            }
+
+            // A copy per push: the renderer must not observe later
+            // mutations of the tracked state.
+            win.webContents.send(WINDOW_STATE_CHANGED, { ...state });
+        };
+        const pushFullScreen = () =>
+            push({ isFullScreen: fullscreen.native || fullscreen.html });
+
+        win.on('maximize', () => push({ isMaximized: true }));
+        win.on('unmaximize', () => push({ isMaximized: false }));
+        // The html variants cover HTML-element fullscreen; not every
+        // platform/trigger emits both pairs, and duplicate pushes with the
+        // same payload are harmless.
+        win.on('enter-full-screen', () => {
+            fullscreen.native = true;
+            pushFullScreen();
+        });
+        win.on('leave-full-screen', () => {
+            fullscreen.native = false;
+            pushFullScreen();
+        });
+        win.on('enter-html-full-screen', () => {
+            fullscreen.html = true;
+            pushFullScreen();
+        });
+        win.on('leave-html-full-screen', () => {
+            fullscreen.html = false;
+            pushFullScreen();
+        });
     }
 
     private static initMainWindow() {
@@ -174,6 +456,17 @@ export default class App {
         const height = Math.min(720, workAreaSize.height || 720);
 
         const savedWindowBounds = store.get(WINDOW_BOUNDS);
+        const startupWindowMode = resolveStartupWindowMode({
+            // One-shot: the switch describes the launch, not every window
+            // this process ever opens. On macOS the process outlives its
+            // last window and the Dock re-creates it through this same
+            // path, which must then follow the stored setting only.
+            cliHasFullscreenSwitch:
+                !App.launchFullscreenSwitchConsumed &&
+                app.commandLine.hasSwitch(FULLSCREEN_LAUNCH_SWITCH),
+            storedMode: store.get(STARTUP_WINDOW_MODE),
+        });
+        App.launchFullscreenSwitchConsumed = true;
 
         // Create the browser window.
         App.mainWindow = new BrowserWindow({
@@ -181,40 +474,70 @@ export default class App {
             width: width,
             height: height,
             show: false,
-            webPreferences: {
-                contextIsolation: true,
-                backgroundThrottling: false,
-                preload: join(__dirname, 'main.preload.js'),
-            },
+            webPreferences: getMainWindowWebPreferences(),
             ...savedWindowBounds,
+            // Fullscreen is a constructor option: the window is created
+            // hidden and enters fullscreen before its first paint. The saved
+            // bounds stay spread in above — they are the normal bounds the
+            // window returns to, and the close handler keeps persisting
+            // getNormalBounds(), so a fullscreen session never corrupts them.
+            ...(startupWindowMode === 'fullscreen' ? { fullscreen: true } : {}),
             minHeight: 600,
             minWidth: 900,
-            ...(process.platform === 'darwin'
-                ? {
-                      titleBarStyle: 'hidden',
-                      titleBarOverlay: true,
-                      trafficLightPosition: { x: 16, y: 20 },
-                  }
-                : {}),
+            ...App.getPlatformTitleBarOptions(),
         });
         App.mainWindow.setMenu(null);
         attachWindowTrace(App.mainWindow);
+        App.attachWindowStateEvents(App.mainWindow);
+        // Seeds the F11 tracker's fullscreen state now, while no transition
+        // can be in flight; from here on it follows the window's events.
+        trackNativeFullScreen(App.mainWindow);
+        App.notifyMainWindowCreated(App.mainWindow);
         if (!savedWindowBounds) {
             App.mainWindow.center();
         }
 
         // if main window is ready to show, close the splash window and show the main window
         App.mainWindow.once('ready-to-show', () => {
+            // maximize() on a hidden window shows it (Electron docs), so it
+            // has to wait for ready-to-show like show() does — any earlier
+            // and a blank window flashes before the renderer paints.
+            if (startupWindowMode === 'maximized') {
+                App.mainWindow.maximize();
+            }
             App.mainWindow.show();
+            // macOS ignores the constructor's `fullscreen` while the window
+            // is hidden — an NSWindow can only toggle fullscreen once it is
+            // on screen — so the request is repeated after show() wherever
+            // it has not taken yet. Windows/Linux honoured it at creation
+            // (before the first paint) and are left alone. It goes through
+            // the transition tracker so an F11 pressed during the animation
+            // reads the pending target and leaves fullscreen instead of
+            // asking for it again.
+            if (
+                startupWindowMode === 'fullscreen' &&
+                !App.mainWindow.isFullScreen()
+            ) {
+                requestFullScreen(App.mainWindow, true);
+            }
         });
 
         // Route target="_blank" / window.open() to the OS default browser
         App.mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-            if (/^https?:\/\//.test(url)) {
+            if (isExternalBrowserUrl(url)) {
                 shell.openExternal(url);
             }
             return { action: 'deny' };
         });
+
+        App.mainWindow.webContents.on(
+            'will-navigate',
+            App.handleRendererNavigation
+        );
+        App.mainWindow.webContents.on(
+            'will-redirect',
+            App.handleRendererNavigation
+        );
 
         // Emitted when the window is closed.
         App.mainWindow.on('closed', () => {
@@ -222,6 +545,8 @@ export default class App {
             // in an array if your app supports multi windows, this is the time
             // when you should delete the corresponding element.
             App.mainWindow = null;
+            App.loadedMainWindow = null;
+            App.mainWindowLoadPromise = null;
         });
 
         App.mainWindow.on('close', () => {
@@ -268,18 +593,47 @@ export default class App {
         });
     }
 
-    private static loadMainWindow() {
+    private static async loadMainWindowContent(
+        mainWindow: Electron.BrowserWindow
+    ): Promise<void> {
         // load the index.html of the app.
         if (App.isDevelopmentMode()) {
-            App.mainWindow.loadURL(`http://localhost:${rendererAppPort}`);
-            if (App.shouldOpenDevTools()) {
-                App.mainWindow.webContents.openDevTools();
-            }
-        } else {
-            App.mainWindow.loadFile(
-                join(__dirname, '..', rendererAppName, 'index.html')
+            const loadPromise = mainWindow.loadURL(
+                `http://localhost:${rendererAppPort}`
             );
+            if (App.shouldOpenDevTools()) {
+                mainWindow.webContents.openDevTools();
+            }
+            await loadPromise;
+        } else {
+            await clearElectronServiceWorkerStorage();
+            await mainWindow.loadFile(getPackagedRendererIndexPath());
         }
+    }
+
+    static async loadMainWindow(): Promise<void> {
+        App.rendererLoadingEnabled = true;
+
+        if (!rendererAppName || !App.mainWindow) {
+            return;
+        }
+
+        if (App.loadedMainWindow === App.mainWindow) {
+            return;
+        }
+
+        if (!App.mainWindowLoadPromise) {
+            const mainWindow = App.mainWindow;
+            App.mainWindowLoadPromise = App.loadMainWindowContent(mainWindow)
+                .then(() => {
+                    App.loadedMainWindow = mainWindow;
+                })
+                .finally(() => {
+                    App.mainWindowLoadPromise = null;
+                });
+        }
+
+        await App.mainWindowLoadPromise;
     }
 
     static main(app: Electron.App, browserWindow: typeof BrowserWindow) {
@@ -292,7 +646,11 @@ export default class App {
         App.application = app;
 
         App.application.on('window-all-closed', App.onWindowAllClosed); // Quit when all windows are closed.
-        App.application.on('ready', App.onReady); // App is ready to load data
+        if (App.application.isReady()) {
+            App.onReady();
+        } else {
+            App.application.on('ready', App.onReady); // App is ready to load data
+        }
         App.application.on('activate', App.onActivate); // App is activated
         App.application.on('before-quit', () => {
             if (App.mainWindow)

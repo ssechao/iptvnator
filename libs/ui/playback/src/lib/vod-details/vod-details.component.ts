@@ -1,25 +1,47 @@
 import {
     Component,
     computed,
+    effect,
     inject,
     input,
     output,
+    signal,
+    untracked,
 } from '@angular/core';
 import { MatIcon } from '@angular/material/icon';
 import { TranslatePipe } from '@ngx-translate/core';
 import { SafePipe } from '@iptvnator/pipes';
-import { PORTAL_EXTERNAL_PLAYBACK } from '@iptvnator/portal/shared/util';
-import { ContentHeroComponent } from '@iptvnator/ui/components';
+import {
+    PORTAL_EXTERNAL_PLAYBACK,
+    createDiscoverFacetNavigation,
+    createExternalPlaybackButtonState,
+} from '@iptvnator/portal/shared/util';
+import {
+    DetailActionsTemplateDirective,
+    DetailMetaTemplateDirective,
+    DetailTagsTemplateDirective,
+    PortalDetailShellComponent,
+    ViewInPortalActionComponent,
+} from '@iptvnator/ui/components';
+import { Router } from '@angular/router';
 import {
     ExternalPlayerSession,
     ResolvedPortalPlayback,
+    TmdbEnrichedCastMember,
     VodDetailsItem,
     getVodNumericId,
     normalizeVodDetails,
+    youtubeEmbedUrl,
 } from '@iptvnator/shared/interfaces';
-import { DownloadsService } from '@iptvnator/services';
-import type { PlaybackFallbackRequest } from '../playback-diagnostics/playback-diagnostics.util';
+import {
+    CrossPortalSimilarItem,
+    CrossPortalSimilarService,
+    DownloadsService,
+    TmdbEnrichmentService,
+} from '@iptvnator/services';
+import type { PlaybackFallbackRequest } from '@iptvnator/playback/util';
 import { PortalInlinePlayerComponent } from '../portal-inline-player/portal-inline-player.component';
+import { createVodDownloadState } from './vod-download-state.util';
 
 /**
  * Unified VOD details component for both Xtream and Stalker portals.
@@ -45,8 +67,12 @@ import { PortalInlinePlayerComponent } from '../portal-inline-player/portal-inli
     templateUrl: './vod-details.component.html',
     styleUrls: ['../styles/detail-view.scss'],
     imports: [
-        ContentHeroComponent,
+        DetailActionsTemplateDirective,
+        DetailMetaTemplateDirective,
+        DetailTagsTemplateDirective,
         MatIcon,
+        PortalDetailShellComponent,
+        ViewInPortalActionComponent,
         PortalInlinePlayerComponent,
         SafePipe,
         TranslatePipe,
@@ -57,6 +83,7 @@ export class VodDetailsComponent {
 
     /** VOD item with discriminated union type */
     readonly item = input.required<VodDetailsItem>();
+    readonly playbackSessionKey = input.required<string>();
 
     /** Whether this item is in favorites (managed by parent) */
     readonly isFavorite = input<boolean>(false);
@@ -70,16 +97,25 @@ export class VodDetailsComponent {
     /** Active external playback session for launch state */
     readonly externalPlayback = input<ExternalPlayerSession | null>(null);
 
+    /** Provider detail handoff hides local/download presentation only. */
+    readonly providerOnly = input(false);
+
     // ============ Outputs ============
 
     /** Emitted when play button is clicked */
     readonly playClicked = output<VodDetailsItem>();
 
     /** Emitted when resume button is clicked (includes position) */
-    readonly resumeClicked = output<{ item: VodDetailsItem; positionSeconds: number }>();
+    readonly resumeClicked = output<{
+        item: VodDetailsItem;
+        positionSeconds: number;
+    }>();
 
     /** Emitted when favorite toggle is clicked */
-    readonly favoriteToggled = output<{ item: VodDetailsItem; isFavorite: boolean }>();
+    readonly favoriteToggled = output<{
+        item: VodDetailsItem;
+        isFavorite: boolean;
+    }>();
 
     /** Emitted when back button is clicked */
     readonly backClicked = output<void>();
@@ -106,7 +142,9 @@ export class VodDetailsComponent {
     // ============ Services ============
 
     private readonly downloadsService = inject(DownloadsService);
+    private readonly crossPortalSimilar = inject(CrossPortalSimilarService);
     private readonly externalPlaybackActions = inject(PORTAL_EXTERNAL_PLAYBACK);
+    private readonly router = inject(Router);
 
     // ============ Computed State ============
 
@@ -117,6 +155,45 @@ export class VodDetailsComponent {
     readonly normalizedMeta = computed(() => {
         return normalizeVodDetails(this.item());
     });
+
+    readonly trailerEmbedUrl = computed(() =>
+        youtubeEmbedUrl(this.normalizedMeta().youtubeTrailer)
+    );
+
+    /**
+     * TMDB recommendations found in the user's OTHER portals (batched DB
+     * match, Electron only). Loaded async — the section appears when
+     * resolved; staleness-guarded against item changes in flight.
+     */
+    readonly similarInPortals = signal<CrossPortalSimilarItem[]>([]);
+
+    private readonly loadSimilarInPortals = effect(() => {
+        const meta = this.normalizedMeta();
+        const recommendations = meta.tmdbRecommendations;
+        untracked(() => {
+            this.similarInPortals.set([]);
+            if (
+                !recommendations?.length ||
+                !this.crossPortalSimilar.isAvailable
+            ) {
+                return;
+            }
+            void this.crossPortalSimilar
+                .matchRecommendations(recommendations, 'movie')
+                .then((items) => {
+                    if (
+                        this.normalizedMeta().tmdbRecommendations ===
+                        recommendations
+                    ) {
+                        this.similarInPortals.set(items);
+                    }
+                });
+        });
+    });
+
+    openSimilarInPortals(item: CrossPortalSimilarItem): void {
+        void this.router.navigate(this.crossPortalSimilar.buildLink(item));
+    }
 
     /** Whether there's a playback position to resume from */
     readonly hasPlaybackPosition = computed(() => {
@@ -139,94 +216,35 @@ export class VodDetailsComponent {
         return `${minutes}:${seconds.toString().padStart(2, '0')}`;
     });
 
-    /** Whether VOD is already downloaded */
-    readonly isDownloaded = computed(() => {
-        const item = this.item();
-        // Access signal to create reactive dependency
-        this.downloadsService.downloads();
-        const vodId = getVodNumericId(item);
-        return this.downloadsService.isDownloaded(vodId, item.playlistId, 'vod');
-    });
-
-    /** Whether VOD is currently downloading */
-    readonly isDownloading = computed(() => {
-        const item = this.item();
-        // Access signal to create reactive dependency
-        this.downloadsService.downloads();
-        const vodId = getVodNumericId(item);
-        return this.downloadsService.isDownloading(vodId, item.playlistId, 'vod');
-    });
-
-    readonly matchedExternalPlayback = computed(() => {
-        const session = this.externalPlayback();
-        const item = this.item();
-        if (
-            !session?.contentInfo ||
-            session.status === 'closed' ||
-            session.status === 'error'
-        ) {
-            return null;
-        }
-
-        const contentInfo = session.contentInfo;
-        if (
-            contentInfo.playlistId !== item.playlistId ||
-            contentInfo.contentType !== 'vod' ||
-            contentInfo.contentXtreamId !== getVodNumericId(item)
-        ) {
-            return null;
-        }
-
-        return session;
-    });
-
-    readonly externalPrimaryLabel = computed(() => {
-        const session = this.matchedExternalPlayback();
-        if (!session) {
-            return null;
-        }
-
-        const player = session.player.toUpperCase();
-        switch (session.status) {
-            case 'launching':
-                return `Opening in ${player}...`;
-            case 'opened':
-            case 'playing':
-                return `Stop ${player}`;
-            default:
-                return null;
-        }
-    });
-
-    readonly externalPrimaryIcon = computed(() => {
-        const session = this.matchedExternalPlayback();
-        switch (session?.status) {
-            case 'launching':
-                return 'hourglass_top';
-            case 'opened':
-            case 'playing':
-                return 'stop_circle';
-            default:
-                return 'play_arrow';
-        }
-    });
-
-    readonly isExternalLaunchPending = computed(
-        () => this.matchedExternalPlayback()?.status === 'launching'
+    private readonly downloadState = createVodDownloadState(
+        this.downloadsService,
+        this.item
+    );
+    readonly isDownloaded = computed(
+        () => !this.providerOnly() && this.downloadState.isDownloaded()
+    );
+    readonly isDownloading = computed(
+        () => !this.providerOnly() && this.downloadState.isDownloading()
+    );
+    readonly isPausedDownload = computed(
+        () => !this.providerOnly() && this.downloadState.isPausedDownload()
     );
 
-    readonly isExternalStopAction = computed(() => {
-        const status = this.matchedExternalPlayback()?.status;
-        return status === 'opened' || status === 'playing';
+    private readonly externalButton = createExternalPlaybackButtonState({
+        session: this.externalPlayback,
+        playlistId: computed(() => this.item().playlistId),
+        contentId: computed(() => getVodNumericId(this.item())),
     });
-
-    readonly externalPrimaryButtonState = computed(() => {
-        if (this.isExternalLaunchPending()) {
-            return 'launching';
-        }
-
-        return this.isExternalStopAction() ? 'stop' : 'idle';
-    });
+    readonly matchedExternalPlayback = this.externalButton.matchedSession;
+    readonly externalPrimaryLabel = this.externalButton.primaryLabel;
+    readonly externalPrimaryIcon = this.externalButton.primaryIcon;
+    readonly isExternalLaunchPending = this.externalButton.isLaunchPending;
+    readonly isExternalStopAction = this.externalButton.isStopAction;
+    readonly externalPrimaryButtonState = this.externalButton.buttonState;
+    readonly isOfflinePrimary = computed(
+        () =>
+            this.isDownloaded() && this.externalPrimaryButtonState() === 'idle'
+    );
 
     // ============ Actions ============
 
@@ -235,12 +253,25 @@ export class VodDetailsComponent {
         this.playClicked.emit(this.item());
     }
 
-    onPrimaryAction(): void {
+    async onPrimaryAction(): Promise<void> {
         if (this.isExternalStopAction()) {
-            void this.stopExternalPlayback();
+            try {
+                await this.stopExternalPlayback();
+            } catch {
+                // The dock stays visible when process teardown is unconfirmed.
+            }
             return;
         }
 
+        if (this.isDownloaded()) {
+            await this.playFromLocal();
+            return;
+        }
+
+        this.onProviderAction();
+    }
+
+    onProviderAction(): void {
         if (this.hasPlaybackPosition()) {
             this.onResume();
             return;
@@ -269,19 +300,61 @@ export class VodDetailsComponent {
     }
 
     /** Handle back navigation - emit event for parent to handle */
+    openActor(member: TmdbEnrichedCastMember): void {
+        if (!member.tmdbPersonId) {
+            return;
+        }
+        const item = this.item();
+        const basePath =
+            item.type === 'stalker'
+                ? '/workspace/stalker'
+                : '/workspace/xtreams';
+        void this.router.navigate([
+            basePath,
+            item.playlistId,
+            'actor',
+            member.tmdbPersonId,
+        ]);
+    }
+
     goBack(): void {
         this.backClicked.emit();
     }
+
+    /** Clickable year/genre/country chips (Discover pages) */
+    private readonly tmdbEnrichment = inject(TmdbEnrichmentService);
+
+    readonly discover = createDiscoverFacetNavigation(() => {
+        const item = this.item();
+        // Discover reads its results from TMDB, so a chip must not offer a
+        // page that enrichment cannot fill
+        return item.playlistId && this.tmdbEnrichment.isEnabled()
+            ? {
+                  portal: item.type === 'stalker' ? 'stalker' : 'xtream',
+                  // Stalker embedded-VOD series render here but are matched
+                  // as tv, so the merge's verdict decides — not the route
+                  mediaType: this.normalizedMeta().tmdbMediaType ?? 'movie',
+                  playlistId: item.playlistId,
+              }
+            : null;
+    });
 
     /** Handle download request */
     onDownload(): void {
         this.downloadRequested.emit(this.item());
     }
 
-    onInlineTimeUpdate(event: {
-        currentTime: number;
-        duration: number;
-    }): void {
+    /** Resume the paused download of this VOD */
+    async resumePausedDownload(): Promise<void> {
+        const item = this.item();
+        await this.downloadsService.resumeDownloadByContent(
+            getVodNumericId(item),
+            item.playlistId,
+            'vod'
+        );
+    }
+
+    onInlineTimeUpdate(event: { currentTime: number; duration: number }): void {
         this.inlineTimeUpdated.emit(event);
     }
 
@@ -293,9 +366,7 @@ export class VodDetailsComponent {
         this.streamUrlCopied.emit();
     }
 
-    onInlineExternalFallbackRequested(
-        request: PlaybackFallbackRequest
-    ): void {
+    onInlineExternalFallbackRequested(request: PlaybackFallbackRequest): void {
         this.inlineExternalFallbackRequested.emit(request);
     }
 

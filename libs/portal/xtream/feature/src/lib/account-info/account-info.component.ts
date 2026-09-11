@@ -15,7 +15,12 @@ import {
     XtreamStore,
 } from '@iptvnator/portal/xtream/data-access';
 import { createLogger } from '@iptvnator/portal/shared/util';
-import type { XtreamAccountInfoDialogData } from '@iptvnator/shared/interfaces';
+import { DataService, resetHostConnectivityGuard } from '@iptvnator/services';
+import {
+    isHostConnectivityFastFailMessage,
+    resolveXtreamPortalStatus,
+    type XtreamAccountInfoDialogData,
+} from '@iptvnator/shared/interfaces';
 
 type AccountLoadState = 'loading' | 'ready' | 'error';
 
@@ -51,6 +56,7 @@ export class AccountInfoComponent {
         inject<XtreamAccountInfoDialogData | null>(MAT_DIALOG_DATA, {
             optional: true,
         }) ?? {};
+    private readonly dataService = inject(DataService);
     private readonly xtreamApiService = inject(XtreamApiService);
     private readonly xtreamStore = inject(XtreamStore);
     private readonly logger = createLogger('XtreamAccountInfo');
@@ -59,12 +65,13 @@ export class AccountInfoComponent {
         () => this.data.playlist ?? this.xtreamStore.currentPlaylist()
     );
     readonly loadState = signal<AccountLoadState>('loading');
+    readonly requestsPaused = signal(false);
     readonly accountInfo = signal<XtreamAccountInfo | null>(null);
     readonly skeletonStats = [1, 2, 3, 4];
     readonly skeletonPanels = [1, 2];
 
     readonly isActive = computed(
-        () => this.accountInfo()?.user_info?.status === 'Active'
+        () => resolveXtreamPortalStatus(this.accountInfo()) === 'active'
     );
     readonly isTrial = computed(
         () => this.accountInfo()?.user_info?.is_trial === '1'
@@ -214,10 +221,26 @@ export class AccountInfoComponent {
     ]);
 
     constructor() {
-        void this.reload();
+        void this.load();
     }
 
+    /**
+     * The template's Retry button. Clears the main process' connectivity guard
+     * first: the account request is exactly what a tripped guard fast-fails, so
+     * without this the button would do nothing for the guard's whole window.
+     * The automatic first load deliberately does not reset — only an explicit
+     * user action means "contact this host now".
+     */
     async reload(): Promise<void> {
+        await resetHostConnectivityGuard(
+            this.dataService,
+            this.currentPlaylist()?.serverUrl
+        );
+        await this.load();
+    }
+
+    private async load(): Promise<void> {
+        this.requestsPaused.set(false);
         const playlist = this.currentPlaylist();
 
         if (!playlist?.serverUrl || !playlist.username || !playlist.password) {
@@ -238,6 +261,11 @@ export class AccountInfoComponent {
             this.accountInfo.set(accountInfo);
             this.loadState.set('ready');
         } catch (error) {
+            this.requestsPaused.set(
+                isHostConnectivityFastFailMessage(
+                    error instanceof Error ? error.message : error
+                )
+            );
             this.logger.error('Failed to fetch account info', error);
             this.accountInfo.set(null);
             this.loadState.set('error');

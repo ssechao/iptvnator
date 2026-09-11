@@ -4,7 +4,12 @@
  */
 
 import { Injectable } from '@angular/core';
-import {
+import { normalizeContentMetadataPatch } from '@iptvnator/shared/interfaces';
+import type {
+    ContentMetadataPatch,
+    GlobalSearchPaginationOptions,
+    GlobalSearchResult,
+    GlobalSearchResultSource,
     PlaylistMeta,
     XtreamBackupFavoriteItem,
     XtreamBackupHiddenCategory,
@@ -29,6 +34,11 @@ export interface XtreamContent {
     added: string;
     poster_url: string;
     backdrop_url?: string | null;
+    // Identity a detail view recorded on the row; absent until one has been
+    // opened. See ContentMetadataPatch in @iptvnator/shared/interfaces.
+    tmdb_id?: number | null;
+    release_year?: number | null;
+    original_title?: string | null;
     epg_channel_id?: string | null;
     tv_archive?: number | null;
     tv_archive_duration?: number | null;
@@ -47,6 +57,8 @@ export interface XtreamPlaylist {
     username: string;
     password: string;
     type: string;
+    /** Projected from the row payload by `DB_GET_PLAYLIST` (issue #1562). */
+    serverTimezone?: string;
 }
 
 type XtreamDatabasePlaylistUpdate = {
@@ -80,10 +92,7 @@ type XtreamContentStream =
       }
     | Record<string, unknown>;
 
-export interface GlobalSearchResult extends XtreamContent {
-    playlist_id: string;
-    playlist_name: string;
-}
+export type { GlobalSearchResult };
 
 export interface GlobalRecentItem extends XtreamContent {
     playlist_id: string;
@@ -115,11 +124,7 @@ export interface DbOperationOptions {
 }
 
 export type XtreamImportStatus =
-    | 'idle'
-    | 'importing'
-    | 'completed'
-    | 'cancelled'
-    | 'failed';
+    'idle' | 'importing' | 'completed' | 'cancelled' | 'failed';
 
 export function isDbAbortError(error: unknown): boolean {
     return error instanceof Error && error.name === 'AbortError';
@@ -128,11 +133,7 @@ export function isDbAbortError(error: unknown): boolean {
 export type GlobalRecentlyAddedKind = 'all' | 'vod' | 'series';
 
 export type GlobalRecentlyAddedPlaylistType =
-    | 'xtream'
-    | 'stalker'
-    | 'm3u-file'
-    | 'm3u-text'
-    | 'm3u-url';
+    'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url';
 
 export interface GlobalRecentlyAddedItem extends XtreamContent {
     playlist_id: string;
@@ -159,11 +160,11 @@ export class DatabaseService {
     }
 
     supportsDbOperationEvents(): boolean {
-        return typeof window.electron.onDbOperationEvent === 'function';
+        return typeof window.electron?.onDbOperationEvent === 'function';
     }
 
     supportsDbOperationCancellation(): boolean {
-        return typeof window.electron.dbCancelOperation === 'function';
+        return typeof window.electron?.dbCancelOperation === 'function';
     }
 
     async cancelOperation(operationId: string): Promise<boolean> {
@@ -382,6 +383,34 @@ export class DatabaseService {
     }
 
     /**
+     * Records the panel clock a successful account-info check learned, as
+     * one conditional UPDATE on the row payload (issue #1562). A no-op when
+     * the row no longer points at the given connection or already carries
+     * the value; never reads before writing, so it cannot undo a concurrent
+     * edit or upsert. Resolves `true` when the row now carries the clock.
+     */
+    async setXtreamPlaylistServerTimezone(
+        playlistId: string,
+        connection: { serverUrl: string; username: string; password: string },
+        serverTimezone: string
+    ): Promise<boolean> {
+        if (!window.electron?.dbSetPlaylistServerTimezone) {
+            return false;
+        }
+        try {
+            await window.electron.dbSetPlaylistServerTimezone(
+                playlistId,
+                connection,
+                serverTimezone
+            );
+            return true;
+        } catch (error) {
+            console.error('Error persisting the portal timezone:', error);
+            return false;
+        }
+    }
+
+    /**
      * Check if categories exist
      */
     async hasXtreamCategories(
@@ -505,6 +534,10 @@ export class DatabaseService {
         playlistId: string,
         type: 'live' | 'movie' | 'series'
     ): Promise<boolean> {
+        if (typeof window.electron?.dbClearXtreamImportCache !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbClearXtreamImportCache(playlistId, type);
             return true;
@@ -515,6 +548,10 @@ export class DatabaseService {
     }
 
     async getAppState(key: string): Promise<string | null> {
+        if (typeof window.electron?.dbGetAppState !== 'function') {
+            return null;
+        }
+
         try {
             return await window.electron.dbGetAppState(key);
         } catch (error) {
@@ -524,6 +561,10 @@ export class DatabaseService {
     }
 
     async setAppState(key: string, value: string): Promise<boolean> {
+        if (typeof window.electron?.dbSetAppState !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbSetAppState(key, value);
             return true;
@@ -587,12 +628,16 @@ export class DatabaseService {
     async globalSearchContent(
         searchTerm: string,
         types: string[],
-        excludeHidden?: boolean
+        excludeHidden?: boolean,
+        sources?: GlobalSearchResultSource[],
+        options?: GlobalSearchPaginationOptions
     ): Promise<GlobalSearchResult[]> {
         return await window.electron.dbGlobalSearch(
             searchTerm,
             types,
-            excludeHidden
+            excludeHidden,
+            sources,
+            options
         );
     }
 
@@ -624,6 +669,10 @@ export class DatabaseService {
      * Get recently viewed items
      */
     async getGlobalRecentlyViewed(): Promise<GlobalRecentItem[]> {
+        if (typeof window.electron?.dbGetRecentlyViewed !== 'function') {
+            return [];
+        }
+
         try {
             const items = await window.electron.dbGetRecentlyViewed();
             return items || [];
@@ -637,6 +686,10 @@ export class DatabaseService {
      * Get global favorites across all playlists
      */
     async getGlobalFavorites(): Promise<GlobalFavoriteItem[]> {
+        if (typeof window.electron?.dbGetGlobalFavorites !== 'function') {
+            return [];
+        }
+
         try {
             const items = await window.electron.dbGetGlobalFavorites();
             return items || [];
@@ -650,6 +703,10 @@ export class DatabaseService {
      * Get global favorites across all playlists (all content types)
      */
     async getAllGlobalFavorites(): Promise<GlobalFavoriteItem[]> {
+        if (typeof window.electron?.dbGetAllGlobalFavorites !== 'function') {
+            return [];
+        }
+
         try {
             const items = await window.electron.dbGetAllGlobalFavorites();
             return items || [];
@@ -663,6 +720,10 @@ export class DatabaseService {
      * Clear recently viewed items
      */
     async clearGlobalRecentlyViewed(): Promise<void> {
+        if (typeof window.electron?.dbClearRecentlyViewed !== 'function') {
+            return;
+        }
+
         try {
             await window.electron.dbClearRecentlyViewed();
         } catch (error) {
@@ -703,6 +764,10 @@ export class DatabaseService {
         playlistId: string,
         backdropUrl?: string
     ): Promise<boolean> {
+        if (typeof window.electron?.dbAddFavorite !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbAddFavorite(
                 contentId,
@@ -723,6 +788,10 @@ export class DatabaseService {
         contentId: number,
         playlistId: string
     ): Promise<boolean> {
+        if (typeof window.electron?.dbRemoveFavorite !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbRemoveFavorite(contentId, playlistId);
             return true;
@@ -736,6 +805,10 @@ export class DatabaseService {
      * Check if content is favorited
      */
     async isFavorite(contentId: number, playlistId: string): Promise<boolean> {
+        if (typeof window.electron?.dbIsFavorite !== 'function') {
+            return false;
+        }
+
         try {
             return await window.electron.dbIsFavorite(contentId, playlistId);
         } catch (error) {
@@ -748,6 +821,10 @@ export class DatabaseService {
      * Get all favorites for a playlist
      */
     async getFavorites(playlistId: string): Promise<XtreamContent[]> {
+        if (typeof window.electron?.dbGetFavorites !== 'function') {
+            return [];
+        }
+
         try {
             return await window.electron.dbGetFavorites(playlistId);
         } catch (error) {
@@ -760,6 +837,10 @@ export class DatabaseService {
      * Get recently viewed items for a specific playlist
      */
     async getRecentItems(playlistId: string): Promise<XtreamContent[]> {
+        if (typeof window.electron?.dbGetRecentItems !== 'function') {
+            return [];
+        }
+
         try {
             return await window.electron.dbGetRecentItems(playlistId);
         } catch (error) {
@@ -776,6 +857,10 @@ export class DatabaseService {
         playlistId: string,
         backdropUrl?: string
     ): Promise<boolean> {
+        if (typeof window.electron?.dbAddRecentItem !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbAddRecentItem(
                 contentId,
@@ -790,30 +875,31 @@ export class DatabaseService {
     }
 
     /**
-     * Persist a backdrop URL onto an Xtream content row without touching
-     * recently viewed ordering or timestamps.
+     * Persist what a detail view learned onto an Xtream content row — the
+     * backdrop, and the identity that lets the dashboard repeat this view's
+     * TMDB lookup — without touching recently viewed ordering or timestamps.
      */
-    async setContentBackdropIfMissing(
+    async setContentMetadataIfMissing(
         contentId: number,
-        backdropUrl?: string
+        patch?: ContentMetadataPatch
     ): Promise<boolean> {
-        const normalizedBackdropUrl = backdropUrl?.trim();
-        if (!normalizedBackdropUrl) {
+        const normalized = normalizeContentMetadataPatch(patch);
+        if (!normalized) {
             return true;
         }
 
-        if (!window.electron?.dbSetContentBackdropIfMissing) {
+        if (!window.electron?.dbSetContentMetadataIfMissing) {
             return true;
         }
 
         try {
-            await window.electron.dbSetContentBackdropIfMissing(
+            await window.electron.dbSetContentMetadataIfMissing(
                 contentId,
-                normalizedBackdropUrl
+                normalized
             );
             return true;
         } catch (error) {
-            console.error('Error backfilling content backdrop:', error);
+            console.error('Error backfilling content metadata:', error);
             return false;
         }
     }
@@ -822,6 +908,10 @@ export class DatabaseService {
      * Clear recently viewed for a specific playlist
      */
     async clearPlaylistRecentItems(playlistId: string): Promise<boolean> {
+        if (typeof window.electron?.dbClearPlaylistRecentItems !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbClearPlaylistRecentItems(playlistId);
             return true;
@@ -838,6 +928,10 @@ export class DatabaseService {
         contentId: number,
         playlistId: string
     ): Promise<boolean> {
+        if (typeof window.electron?.dbRemoveRecentItem !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbRemoveRecentItem(contentId, playlistId);
             return true;
@@ -853,6 +947,10 @@ export class DatabaseService {
         if (items.length === 0) {
             return true;
         }
+        if (typeof window.electron?.dbRemoveRecentItemsBatch !== 'function') {
+            return false;
+        }
+
         try {
             await window.electron.dbRemoveRecentItemsBatch(items);
             return true;
@@ -870,6 +968,10 @@ export class DatabaseService {
         playlistId: string,
         contentType?: 'live' | 'movie' | 'series'
     ): Promise<XtreamContent | null> {
+        if (typeof window.electron?.dbGetContentByXtreamId !== 'function') {
+            return null;
+        }
+
         try {
             return await window.electron.dbGetContentByXtreamId(
                 xtreamId,

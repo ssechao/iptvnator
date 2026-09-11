@@ -9,6 +9,8 @@ export interface ConfirmDialogData {
     width?: string;
     confirmLabel?: string;
     cancelLabel?: string;
+    /** Run the action in the dialog; only Close/backdrop/Escape dismiss it. */
+    keepOpenOnConfirm?: boolean;
     onConfirm: () => void;
 }
 
@@ -22,12 +24,26 @@ export interface ConfirmDialogData {
             {{ dialogData.message }}
         </mat-dialog-content>
         <mat-dialog-actions align="end">
-            <button mat-button mat-dialog-close cdkFocusInitial color="accent">
+            <button mat-button mat-dialog-close cdkFocusInitial>
                 {{ dialogData.cancelLabel || 'NO' | translate }}
             </button>
-            <button mat-flat-button [mat-dialog-close]="true" color="accent">
-                {{ dialogData.confirmLabel || 'YES' | translate }}
-            </button>
+            @if (dialogData.keepOpenOnConfirm) {
+                <button
+                    mat-flat-button
+                    (click)="dialogData.onConfirm()"
+                    color="primary"
+                >
+                    {{ dialogData.confirmLabel || 'YES' | translate }}
+                </button>
+            } @else {
+                <button
+                    mat-flat-button
+                    [mat-dialog-close]="true"
+                    color="primary"
+                >
+                    {{ dialogData.confirmLabel || 'YES' | translate }}
+                </button>
+            }
         </mat-dialog-actions>
     `,
 })

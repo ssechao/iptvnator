@@ -32,7 +32,7 @@
             >
                 @for (item of recentlyAddedVod(); track item.xtream_id) {
                     <app-content-card
-                        [title]="item.title || item.name"
+                        [title]="item.title || item.name || ''"
                         [posterUrl]="item.poster_url || item.stream_icon"
                         [type]="'movie'"
                         [date]="getDate(item)"
@@ -52,10 +52,10 @@
             >
                 @for (item of recentlyAddedSeries(); track item.xtream_id) {
                     <app-content-card
-                        [title]="item.title || item.name"
+                        [title]="item.title || item.name || ''"
                         [posterUrl]="item.poster_url || item.cover"
                         [type]="'series'"
-                        [date]="getDate(item)"
+                        [date]="getDate(item, true)"
                         (cardClick)="openItem(item, 'series')"
                     />
                 }
@@ -72,7 +72,7 @@
             >
                 @for (item of recentlyAddedLive(); track item.xtream_id) {
                     <app-content-card
-                        [title]="item.title || item.name"
+                        [title]="item.title || item.name || ''"
                         [posterUrl]="item.poster_url || item.stream_icon"
                         [type]="'live'"
                         [date]="getDate(item)"

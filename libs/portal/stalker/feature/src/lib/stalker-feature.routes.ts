@@ -11,6 +11,11 @@ const loadDownloadsComponent: ComponentLoader = () =>
         (c) => c.DownloadsComponent
     );
 
+const loadDownloadOfflineDetailComponent: ComponentLoader = () =>
+    import('@iptvnator/portal/downloads/feature').then(
+        (c) => c.DownloadOfflineDetailComponent
+    );
+
 const loadStalkerLiveStreamLayoutComponent: ComponentLoader = () =>
     import('./stalker-live-stream-layout/stalker-live-stream-layout.component').then(
         (c) => c.StalkerLiveStreamLayoutComponent
@@ -29,6 +34,16 @@ const loadStalkerCollectionRouteComponent: ComponentLoader = () =>
 const loadStalkerSearchComponent: ComponentLoader = () =>
     import('./stalker-search/stalker-search.component').then(
         (c) => c.StalkerSearchComponent
+    );
+
+const loadStalkerActorRouteComponent: ComponentLoader = () =>
+    import('./stalker-actor-route.component').then(
+        (c) => c.StalkerActorRouteComponent
+    );
+
+const loadStalkerDiscoverRouteComponent: ComponentLoader = () =>
+    import('./stalker-discover-route.component').then(
+        (c) => c.StalkerDiscoverRouteComponent
     );
 
 export function createStalkerRoutes(): Route[] {
@@ -119,6 +134,18 @@ export function createStalkerRoutes(): Route[] {
                 {
                     path: 'search',
                     loadComponent: loadStalkerSearchComponent,
+                },
+                {
+                    path: 'actor/:personId',
+                    loadComponent: loadStalkerActorRouteComponent,
+                },
+                {
+                    path: 'discover',
+                    loadComponent: loadStalkerDiscoverRouteComponent,
+                },
+                {
+                    path: 'downloads/:downloadId',
+                    loadComponent: loadDownloadOfflineDetailComponent,
                 },
                 {
                     path: 'downloads',

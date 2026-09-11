@@ -1,16 +1,30 @@
 import { on } from '@ngrx/store';
 import { Channel } from '@iptvnator/shared/interfaces';
+import { resolvePlaylistEpgSourceState } from '@iptvnator/shared/m3u-utils';
 import { PlaylistActions } from '../actions';
 import { playlistsAdapter } from '../playlists.state';
 import { PlaylistState } from '../state';
 
 export const playlistReducers = [
+    on(PlaylistActions.loadPlaylists, (state): PlaylistState => ({
+        ...state,
+        playlists: {
+            ...state.playlists,
+            allPlaylistsLoaded: false,
+            loadFailed: false,
+        },
+    })),
+    on(PlaylistActions.loadPlaylistsFailure, (state): PlaylistState => ({
+        ...state,
+        playlists: { ...state.playlists, loadFailed: true },
+    })),
     on(PlaylistActions.loadPlaylistsSuccess, (state, action): PlaylistState => {
         return {
             ...state,
             playlists: playlistsAdapter.addMany(action.playlists, {
                 ...state.playlists,
                 allPlaylistsLoaded: true,
+                loadFailed: false,
             }),
         };
     }),
@@ -34,6 +48,17 @@ export const playlistReducers = [
         const isActivePlaylist =
             state.playlists.selectedId === action.playlistId;
         const currentPlaylist = state.playlists.entities[action.playlistId];
+        const epgSourceState = resolvePlaylistEpgSourceState({
+            detectedEpgUrls:
+                action.playlist.detectedEpgUrls ??
+                currentPlaylist?.detectedEpgUrls,
+            enabledEpgUrls: action.playlist.epgUrls ?? currentPlaylist?.epgUrls,
+            manualEpgUrls:
+                action.playlist.manualEpgUrls ?? currentPlaylist?.manualEpgUrls,
+            disabledEpgUrls:
+                action.playlist.disabledEpgUrls ??
+                currentPlaylist?.disabledEpgUrls,
+        });
         return {
             ...state,
             channels: isActivePlaylist
@@ -48,8 +73,14 @@ export const playlistReducers = [
                         _id: action.playlistId,
                         updateDate: Date.now(),
                         count: action.playlist.playlist.items.length,
-                        userAgent: action.playlist.userAgent,
+                        userAgent:
+                            action.playlist.userAgent ??
+                            currentPlaylist?.userAgent,
                         favorites: currentPlaylist?.favorites ?? [],
+                        epgUrls: epgSourceState.epgUrls,
+                        detectedEpgUrls: epgSourceState.detectedEpgUrls,
+                        manualEpgUrls: epgSourceState.manualEpgUrls,
+                        disabledEpgUrls: epgSourceState.disabledEpgUrls,
                         autoRefresh:
                             currentPlaylist?.autoRefresh ??
                             action.playlist.autoRefresh,
@@ -142,6 +173,39 @@ export const playlistReducers = [
                                   isFullStalkerPortal: p.isFullStalkerPortal,
                               }
                             : {}),
+                        ...(p.stalkerSerialNumber !== undefined
+                            ? {
+                                  stalkerSerialNumber: p.stalkerSerialNumber,
+                              }
+                            : {}),
+                        ...(p.stalkerDeviceId1 !== undefined
+                            ? { stalkerDeviceId1: p.stalkerDeviceId1 }
+                            : {}),
+                        ...(p.stalkerDeviceId2 !== undefined
+                            ? { stalkerDeviceId2: p.stalkerDeviceId2 }
+                            : {}),
+                        ...(p.stalkerSignature1 !== undefined
+                            ? { stalkerSignature1: p.stalkerSignature1 }
+                            : {}),
+                        ...(p.stalkerSignature2 !== undefined
+                            ? { stalkerSignature2: p.stalkerSignature2 }
+                            : {}),
+                        ...(p.stalkerSessionPatch !== undefined
+                            ? {
+                                  stalkerToken:
+                                      p.stalkerSessionPatch?.stalkerToken,
+                                  stalkerSessionIdentity:
+                                      p.stalkerSessionPatch
+                                          ?.stalkerSessionIdentity,
+                                  stalkerWatchdogTimeout:
+                                      p.stalkerSessionPatch
+                                          ?.stalkerWatchdogTimeout,
+                                  stalkerTimeslot:
+                                      p.stalkerSessionPatch?.stalkerTimeslot,
+                                  stalkerAccountInfo:
+                                      p.stalkerSessionPatch?.stalkerAccountInfo,
+                              }
+                            : {}),
                         ...(p.favorites != null
                             ? { favorites: p.favorites }
                             : {}),
@@ -150,6 +214,16 @@ export const playlistReducers = [
                             : {}),
                         ...(p.hiddenGroupTitles != null
                             ? { hiddenGroupTitles: p.hiddenGroupTitles }
+                            : {}),
+                        ...(p.epgUrls != null ? { epgUrls: p.epgUrls } : {}),
+                        ...(p.detectedEpgUrls != null
+                            ? { detectedEpgUrls: p.detectedEpgUrls }
+                            : {}),
+                        ...(p.manualEpgUrls != null
+                            ? { manualEpgUrls: p.manualEpgUrls }
+                            : {}),
+                        ...(p.disabledEpgUrls != null
+                            ? { disabledEpgUrls: p.disabledEpgUrls }
                             : {}),
                         ...(p.updateDate !== undefined
                             ? { updateDate: p.updateDate }

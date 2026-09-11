@@ -11,7 +11,10 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { TranslatePipe } from '@ngx-translate/core';
-import { EpgProgressService } from '@iptvnator/epg/data-access';
+import {
+    EpgProgressService,
+    EpgRuntimeBridgeService,
+} from '@iptvnator/epg/data-access';
 
 type BadgeStatus =
     | 'loading'
@@ -37,6 +40,7 @@ export class EpgSourceStatusComponent implements OnInit {
     readonly url = input.required<string>();
 
     private readonly epgProgress = inject(EpgProgressService);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
 
     private readonly freshnessLoaded = signal(false);
     private readonly isFresh = signal(false);
@@ -78,14 +82,14 @@ export class EpgSourceStatusComponent implements OnInit {
     }
 
     async ngOnInit(): Promise<void> {
-        if (!window.electron?.checkEpgFreshness) {
+        if (!this.epgBridge.supportsSourceFreshness) {
             return;
         }
         const url = this.url();
         if (!url) return;
 
-        const result = await window.electron.checkEpgFreshness([url], 12);
-        this.isFresh.set(result.freshUrls.includes(url));
+        const result = await this.epgBridge.checkFreshness([url], 12);
+        this.isFresh.set(result?.freshUrls.includes(url) ?? false);
         this.freshnessLoaded.set(true);
     }
 }

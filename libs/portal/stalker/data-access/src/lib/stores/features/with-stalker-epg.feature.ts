@@ -3,13 +3,25 @@ import {
     patchState,
     signalStoreFeature,
     withComputed,
+    withHooks,
     withMethods,
     withState,
 } from '@ngrx/signals';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
 import { createLogger } from '@iptvnator/portal/shared/util';
-import { DataService } from '@iptvnator/services';
-import { EpgItem, EpgProgram, StalkerPortalActions } from '@iptvnator/shared/interfaces';
+import {
+    DataService,
+    EpgSourceSettingsService,
+    RuntimeCapabilitiesService,
+} from '@iptvnator/services';
+import {
+    buildStalkerEpgMappingKey,
+    EpgItem,
+    EpgProgram,
+    StalkerPortalActions,
+} from '@iptvnator/shared/interfaces';
 import { normalizeStalkerEntityId } from '../../stalker-vod.utils';
+import { StalkerPortalRepairService } from '../../stalker-portal-repair.service';
 import { StalkerSessionService } from '../../stalker-session.service';
 import { StalkerEpgFeatureStoreContract } from '../stalker-store.contracts';
 import { executeStalkerRequest } from '../utils';
@@ -61,7 +73,8 @@ const initialEpgState: StalkerEpgState = {
     isLoadingBulkItvEpg: false,
 };
 
-const ACTIVE_EPG_FALLBACK_SIZE = 10;
+/** Short-EPG entries fetched for the active channel's panel fallback. */
+export const ACTIVE_EPG_FALLBACK_SIZE = 10;
 
 /**
  * EPG concern methods.
@@ -94,13 +107,50 @@ export function withStalkerEpg() {
             (
                 store,
                 dataService = inject(DataService),
-                stalkerSession = inject(StalkerSessionService)
+                stalkerSession = inject(StalkerSessionService),
+                portalRepair = inject(StalkerPortalRepairService),
+                runtime = inject(RuntimeCapabilitiesService),
+                epgBridge = inject(EpgRuntimeBridgeService),
+                sources = inject(EpgSourceSettingsService)
             ) => {
                 const storeContext = store as typeof store &
                     StalkerEpgFeatureStoreContract;
                 const requestDeps = {
                     dataService,
                     stalkerSession,
+                    portalRepair,
+                };
+                const supportsEpg = (): boolean => runtime.supportsEpg;
+
+                // Manual EPG mapping overrides (uploaded XMLTV programs keyed
+                // by the normalized Stalker channel id). Kept outside the
+                // signal state so ensureBulkItvEpg can merge them back in
+                // whenever it replaces the bulk record.
+                const mappingOverridesById = new Map<string, EpgProgram[]>();
+                const mappingCheckedIds = new Set<string>();
+                // Ownership is a fact of the saved mapping row, independent
+                // of whether the mapped XMLTV guide currently has programs —
+                // an empty mapped guide must still keep the portal EPG out.
+                const mappingOwnedIds = new Set<string>();
+                let mappingPlaylistId: string | null = null;
+                let cacheGeneration = 0;
+
+                const resetMappingOverrides = (): void => {
+                    mappingOverridesById.clear();
+                    mappingCheckedIds.clear();
+                    mappingOwnedIds.clear();
+                    mappingPlaylistId = null;
+                };
+
+                const mappingOverridesRecord = (): Record<
+                    string,
+                    EpgProgram[]
+                > => {
+                    const record: Record<string, EpgProgram[]> = {};
+                    for (const id of mappingOwnedIds) {
+                        record[id] = mappingOverridesById.get(id) ?? [];
+                    }
+                    return record;
                 };
 
                 const requestEpg = async (
@@ -122,6 +172,10 @@ export function withStalkerEpg() {
                     channelId: number | string,
                     size: number
                 ): Promise<EpgItem[]> => {
+                    if (!supportsEpg()) {
+                        return [];
+                    }
+
                     const playlist = storeContext.currentPlaylist();
                     if (!playlist) {
                         return [];
@@ -175,6 +229,18 @@ export function withStalkerEpg() {
                         }
 
                         const playlistId = String(playlist._id);
+                        const generation = cacheGeneration;
+                        if (!supportsEpg()) {
+                            patchState(store, {
+                                bulkItvEpgByChannel: {},
+                                bulkItvEpgLoaded: true,
+                                bulkItvEpgPeriodHours: periodHours,
+                                bulkItvEpgPlaylistId: playlistId,
+                                isLoadingBulkItvEpg: false,
+                            });
+                            return;
+                        }
+
                         const shouldReuseCache =
                             store.bulkItvEpgLoaded() &&
                             store.bulkItvEpgPlaylistId() === playlistId &&
@@ -200,6 +266,7 @@ export function withStalkerEpg() {
                                 type: 'itv',
                                 period: String(periodHours),
                             });
+                            if (generation !== cacheGeneration) return;
                             const selectedChannelId =
                                 storeContext.selectedItvId() ?? null;
                             const bulkPrograms = extractBulkEpgByChannel(
@@ -208,26 +275,213 @@ export function withStalkerEpg() {
                             );
 
                             patchState(store, {
-                                bulkItvEpgByChannel: bulkPrograms,
+                                bulkItvEpgByChannel: {
+                                    ...bulkPrograms,
+                                    ...mappingOverridesRecord(),
+                                },
                                 bulkItvEpgLoaded: true,
                                 isLoadingBulkItvEpg: false,
                             });
                         } catch (error) {
+                            if (generation !== cacheGeneration) return;
                             logger.warn('Bulk Stalker EPG unavailable', error);
                             patchState(store, {
-                                bulkItvEpgByChannel: {},
+                                bulkItvEpgByChannel: mappingOverridesRecord(),
                                 bulkItvEpgLoaded: true,
                                 isLoadingBulkItvEpg: false,
                             });
                         }
                     },
 
+                    /**
+                     * Overlay manual EPG mappings for the given Stalker
+                     * channel ids onto the bulk ITV record. Each id is
+                     * checked at most once per playlist session; channels
+                     * with a saved mapping get their programs from the
+                     * uploaded XMLTV guide instead of the portal EPG, which
+                     * feeds both the active EPG panel and the row previews.
+                     */
+                    async applyMappedItvEpg(
+                        channelIds: ReadonlyArray<string | number>
+                    ): Promise<void> {
+                        if (!epgBridge.supportsEpgMapping || !supportsEpg()) {
+                            return;
+                        }
+                        const playlist = storeContext.currentPlaylist();
+                        if (!playlist?._id) {
+                            return;
+                        }
+                        const playlistId = String(playlist._id);
+                        if (mappingPlaylistId !== playlistId) {
+                            resetMappingOverrides();
+                            mappingPlaylistId = playlistId;
+                        }
+
+                        const freshIds = [
+                            ...new Set(
+                                channelIds
+                                    .map((id) => normalizeStalkerEntityId(id))
+                                    .filter(
+                                        (id) => id && !mappingCheckedIds.has(id)
+                                    )
+                            ),
+                        ];
+                        if (freshIds.length === 0) {
+                            return;
+                        }
+
+                        // The store is a root singleton, so an in-flight
+                        // call can outlive a portal switch — bail out after
+                        // every await instead of writing portal A's data
+                        // into portal B's state.
+                        const revision = sources.revision();
+                        const generation = cacheGeneration;
+                        const isStale = (): boolean =>
+                            revision !== sources.revision() ||
+                            generation !== cacheGeneration ||
+                            mappingPlaylistId !== playlistId ||
+                            String(
+                                storeContext.currentPlaylist()?._id ?? ''
+                            ) !== playlistId;
+
+                        const keyById = new Map(
+                            freshIds.map(
+                                (id) =>
+                                    [
+                                        id,
+                                        buildStalkerEpgMappingKey(
+                                            playlistId,
+                                            id
+                                        ),
+                                    ] as const
+                            )
+                        );
+
+                        let mappings: Record<string, string> | null = null;
+                        try {
+                            mappings = await epgBridge.getEpgMappingsBatch([
+                                ...keyById.values(),
+                            ]);
+                        } catch (error) {
+                            // Nothing is marked checked — the next
+                            // invocation retries the lookup.
+                            logger.warn(
+                                'Stalker EPG mapping lookup failed',
+                                error
+                            );
+                            return;
+                        }
+                        if (!mappings || isStale()) {
+                            return;
+                        }
+
+                        let changed = false;
+                        let ownershipChanged = false;
+                        for (const [channelId, key] of keyById) {
+                            if (isStale()) return;
+                            const mappedEpgId = mappings[key]?.trim();
+                            if (!mappedEpgId) {
+                                // No mapping for this channel — a stable
+                                // outcome, safe to dedupe.
+                                mappingCheckedIds.add(channelId);
+                                continue;
+                            }
+                            if (!mappingOwnedIds.has(channelId)) {
+                                mappingOwnedIds.add(channelId);
+                                // Ownership must reach the preview effect
+                                // even when the mapped guide contributes no
+                                // programs: a concurrently fetched short-EPG
+                                // fallback may already have rendered a portal
+                                // row, and only a state patch reruns the sync
+                                // that removes it.
+                                ownershipChanged = true;
+                            }
+                            try {
+                                const programs =
+                                    (await epgBridge.getChannelPrograms(
+                                        mappedEpgId
+                                    )) ?? [];
+                                if (isStale()) {
+                                    return;
+                                }
+                                mappingCheckedIds.add(channelId);
+                                if (programs.length === 0) {
+                                    continue;
+                                }
+                                mappingOverridesById.set(
+                                    channelId,
+                                    programs.map((program) => ({
+                                        ...program,
+                                        channel: channelId,
+                                    }))
+                                );
+                                changed = true;
+                            } catch {
+                                // Transient failure — leave the id
+                                // unchecked so a later call retries; the
+                                // portal EPG stays in place meanwhile.
+                            }
+                        }
+                        if ((!changed && !ownershipChanged) || isStale()) {
+                            return;
+                        }
+
+                        // An ownership-only change patches an identical map
+                        // under a new reference — that is deliberate, it is
+                        // what reruns the preview effect.
+                        patchState(store, {
+                            bulkItvEpgByChannel: {
+                                ...store.bulkItvEpgByChannel(),
+                                ...mappingOverridesRecord(),
+                            },
+                        });
+                    },
+
+                    /**
+                     * True when the channel has a saved manual XMLTV mapping
+                     * — even one whose mapped guide currently has no
+                     * programs. Mapped channels must never fall back to the
+                     * portal's short EPG: the mapping exists to replace the
+                     * portal data, and merging the two schedules could
+                     * surface the portal's programme instead.
+                     */
+                    hasItvEpgMappingOverride(
+                        channelId: string | number
+                    ): boolean {
+                        const normalizedId =
+                            normalizeStalkerEntityId(channelId);
+                        return (
+                            mappingOwnedIds.has(normalizedId) ||
+                            mappingOverridesById.has(normalizedId)
+                        );
+                    },
+
                     clearBulkItvEpgCache(): void {
+                        cacheGeneration++;
+                        resetMappingOverrides();
                         patchState(store, initialEpgState);
                     },
                 };
             }
-        )
+        ),
+        withHooks((store) => {
+            const sources = inject(EpgSourceSettingsService);
+            let subscription: { unsubscribe(): void } | undefined;
+            return {
+                onInit: () => {
+                    subscription = sources.changed$.subscribe(() => {
+                        const context = store as typeof store &
+                            StalkerEpgFeatureStoreContract;
+                        const selectedId = context.selectedItvId();
+                        store.clearBulkItvEpgCache();
+                        void store.ensureBulkItvEpg();
+                        if (selectedId)
+                            void store.applyMappedItvEpg([selectedId]);
+                    });
+                },
+                onDestroy: () => subscription?.unsubscribe(),
+            };
+        })
     );
 }
 

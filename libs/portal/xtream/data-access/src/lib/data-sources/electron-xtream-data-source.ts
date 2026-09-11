@@ -4,8 +4,10 @@ import {
     PlaybackPositionService,
     XtreamPendingRestoreService,
     XtreamImportStatus,
+    VodSourcePinService,
 } from '@iptvnator/services';
 import {
+    ContentMetadataPatch,
     PlaybackPositionData,
     PlaylistMeta,
     XtreamPendingRestoreState,
@@ -39,6 +41,7 @@ import {
 export class ElectronXtreamDataSource implements IXtreamDataSource {
     private readonly dbService = inject(DatabaseService);
     private readonly playbackService = inject(PlaybackPositionService);
+    private readonly vodSourcePinService = inject(VodSourcePinService);
     private readonly pendingRestoreService = inject(
         XtreamPendingRestoreService
     );
@@ -104,6 +107,25 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
         });
     }
 
+    async rememberServerTimezone(
+        playlistId: string,
+        credentials: XtreamCredentials,
+        serverTimezone: string
+    ): Promise<void> {
+        // One conditional UPDATE in the worker (`DB_SET_PLAYLIST_SERVER_TIMEZONE`):
+        // the row-level connection match and the no-op-when-equal check
+        // happen inside the statement, never as a read here.
+        await this.dbService.setXtreamPlaylistServerTimezone(
+            playlistId,
+            {
+                serverUrl: credentials.serverUrl,
+                username: credentials.username,
+                password: credentials.password,
+            },
+            serverTimezone
+        );
+    }
+
     async deletePlaylist(playlistId: string): Promise<void> {
         await this.dbService.deletePlaylist(playlistId);
     }
@@ -155,6 +177,9 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
         options?: XtreamOperationOptions
     ): Promise<XtreamCategoryFromDb[]> {
         const importType = this.mapCategoryTypeToImportType(type);
+        // The DB read below is the slow part of a warm start; report it as a
+        // phase so the sync overlay never shows a phaseless card.
+        options?.onPhaseChange?.('loading-cached');
         const importStatus = await this.getImportStatus(playlistId, importType);
         // Fetch from DB directly — avoids a separate 'has' round-trip.
         // An empty result means the cache is cold; proceed to fetch from API.
@@ -297,6 +322,9 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
         onTotal?: (total: number) => void,
         options?: XtreamOperationOptions
     ): Promise<XtreamContentItem[]> {
+        // The DB read below is the slow part of a warm start; report it as a
+        // phase so the sync overlay never shows a phaseless card.
+        options?.onPhaseChange?.('loading-cached');
         const importStatus = await this.getImportStatus(playlistId, type);
         // Fetch from DB directly — avoids a separate 'has' round-trip.
         // An empty result means the cache is cold; proceed to fetch from API.
@@ -327,9 +355,7 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
             await this.dbService.saveXtreamContent(
                 playlistId,
                 remoteData as
-                    | XtreamLiveStream[]
-                    | XtreamVodStream[]
-                    | XtreamSerieItem[],
+                    XtreamLiveStream[] | XtreamVodStream[] | XtreamSerieItem[],
                 type,
                 onProgress,
                 options
@@ -360,7 +386,7 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
     ): Promise<number> {
         return this.dbService.saveXtreamContent(
             playlistId,
-            streams,
+            streams as Parameters<DatabaseService['saveXtreamContent']>[1],
             type,
             onProgress,
             options
@@ -452,6 +478,15 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
         );
     }
 
+    async setContentMetadataIfMissing(
+        contentId: number,
+        playlistId: string,
+        patch: ContentMetadataPatch
+    ): Promise<void> {
+        void playlistId;
+        await this.dbService.setContentMetadataIfMissing(contentId, patch);
+    }
+
     // =========================================================================
     // Playback Position Operations
     // =========================================================================
@@ -498,7 +533,9 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
     async getAllPlaybackPositions(
         playlistId: string
     ): Promise<PlaybackPositionData[]> {
-        return this.playbackService.getAllPlaybackPositions(playlistId);
+        // Failure-propagating on purpose: the store and catalog caches must
+        // not mistake a failed read for an authoritative empty list.
+        return this.playbackService.getAllPlaybackPositionsOrThrow(playlistId);
     }
 
     async clearPlaybackPosition(
@@ -510,6 +547,26 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
             playlistId,
             contentXtreamId,
             contentType
+        );
+    }
+
+    async savePlaybackPositionsBatch(
+        playlistId: string,
+        items: PlaybackPositionData[]
+    ): Promise<void> {
+        await this.playbackService.savePlaybackPositionsBatch(
+            playlistId,
+            items
+        );
+    }
+
+    async clearPlaybackPositionsBatch(
+        playlistId: string,
+        items: { contentXtreamId: number; contentType: 'vod' | 'episode' }[]
+    ): Promise<void> {
+        await this.playbackService.clearPlaybackPositionsBatch(
+            playlistId,
+            items
         );
     }
 
@@ -528,9 +585,10 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
     async clearPlaylistContent(
         playlistId: string
     ): Promise<XtreamPendingRestoreState> {
-        const [result, playbackPositions] = await Promise.all([
+        const [result, playbackPositions, sourcePins] = await Promise.all([
             this.dbService.deleteXtreamPlaylistContent(playlistId),
             this.playbackService.getAllPlaybackPositions(playlistId),
+            this.vodSourcePinService.listForPlaylist(playlistId),
         ]);
 
         return {
@@ -538,6 +596,11 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
             favorites: result.favorites,
             recentlyViewed: result.recentlyViewed,
             playbackPositions,
+            sourcePins: sourcePins.map((pin) => ({
+                matchKey: pin.matchKey,
+                contentId: pin.contentId,
+                ...(pin.updatedAt ? { updatedAt: pin.updatedAt } : {}),
+            })),
         };
     }
 
@@ -546,6 +609,48 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
         restoreState: XtreamPendingRestoreState,
         options?: XtreamOperationOptions
     ): Promise<void> {
+        const categoriesByType = await Promise.all([
+            this.dbService.getAllXtreamCategories(playlistId, 'live'),
+            this.dbService.getAllXtreamCategories(playlistId, 'movies'),
+            this.dbService.getAllXtreamCategories(playlistId, 'series'),
+        ]);
+        for (const categories of categoriesByType) {
+            if (categories.length === 0) {
+                continue;
+            }
+
+            const reset = await this.dbService.updateCategoryVisibility(
+                categories.map((category) => category.id),
+                false
+            );
+            if (!reset) {
+                throw new Error(
+                    `Resetting category visibility for "${playlistId}" failed.`
+                );
+            }
+
+            const hiddenCategoryIds = categories
+                .filter((category) =>
+                    restoreState.hiddenCategories.some(
+                        (hiddenCategory) =>
+                            hiddenCategory.categoryType === category.type &&
+                            hiddenCategory.xtreamId === category.xtream_id
+                    )
+                )
+                .map((category) => category.id);
+            if (
+                hiddenCategoryIds.length > 0 &&
+                !(await this.dbService.updateCategoryVisibility(
+                    hiddenCategoryIds,
+                    true
+                ))
+            ) {
+                throw new Error(
+                    `Restoring category visibility for "${playlistId}" failed.`
+                );
+            }
+        }
+
         await this.dbService.restoreXtreamUserData(
             playlistId,
             restoreState.favorites,
@@ -559,6 +664,34 @@ export class ElectronXtreamDataSource implements IXtreamDataSource {
             await this.playbackService.savePlaybackPosition(
                 playlistId,
                 playbackPosition
+            );
+        }
+
+        // The fresh-import path lands here rather than in the backup service:
+        // a new playlist has no content yet when the archive is read, so its
+        // user state is parked and applied once the import finishes.
+        if (!restoreState.sourcePins) {
+            return;
+        }
+
+        const pins = restoreState.sourcePins.map((pin) => ({
+            matchKey: pin.matchKey,
+            playlistId,
+            contentId: pin.contentId,
+            portalType: 'xtream' as const,
+            ...(pin.updatedAt ? { updatedAt: pin.updatedAt } : {}),
+        }));
+        const replaced = await this.vodSourcePinService.replaceForPlaylist(
+            playlistId,
+            pins
+        );
+
+        // Throwing keeps the pending state for a later retry — the caller only
+        // clears it when this resolves. Dropping it here would lose the
+        // preference with the import still reporting success.
+        if (!replaced) {
+            throw new Error(
+                `Restoring the pinned sources for "${playlistId}" failed.`
             );
         }
     }

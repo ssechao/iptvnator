@@ -4,7 +4,12 @@ import {
     withInterceptorsFromDi,
 } from '@angular/common/http';
 import {
+    FullscreenOverlayContainer,
+    OverlayContainer,
+} from '@angular/cdk/overlay';
+import {
     ApplicationConfig,
+    inject,
     importProvidersFrom,
     provideZoneChangeDetection,
 } from '@angular/core';
@@ -19,13 +24,13 @@ import { provideStoreDevtools } from '@ngrx/store-devtools';
 import { TranslateLoader, TranslateModule } from '@ngx-translate/core';
 import { TranslateHttpLoader } from '@ngx-translate/http-loader';
 import { PlaylistEffects, playlistReducer } from '@iptvnator/m3u-state';
-import { NgxIndexedDBModule, NgxIndexedDBService } from 'ngx-indexed-db';
+import { NgxIndexedDBModule } from 'ngx-indexed-db';
 import { NgxSkeletonLoaderModule } from 'ngx-skeleton-loader';
 import {
     PORTAL_EXTERNAL_PLAYBACK,
     PORTAL_PLAYER,
 } from '@iptvnator/portal/shared/util';
-import { PLAYLIST_PLAYER_ACTIONS } from '@iptvnator/playlist/shared/util';
+import { STALKER_PLAYLIST_CONNECTION_EDITOR } from '@iptvnator/playlist/shared/ui';
 import { provideXtreamDataSource } from '@iptvnator/portal/xtream/data-access';
 import { DataService } from '@iptvnator/services';
 import { dbConfig } from '@iptvnator/shared/interfaces';
@@ -34,13 +39,10 @@ import { routes } from './app.routes';
 import { ElectronService } from './services/electron.service';
 import { ExternalPlaybackService } from './services/external-playback.service';
 import { PlayerService } from './services/player.service';
-import {
-    AppPortalNavigationActionsService,
-    providePortalNavigationActions,
-} from './services/portal-navigation-actions.service';
 import { providePortalPlaybackPositions } from './services/portal-playback-positions.service';
 import { PwaService } from './services/pwa.service';
 import { shouldEnableServiceWorker } from './services/runtime-config';
+import { AppStalkerPlaylistConnectionEditorService } from './services/stalker-playlist-connection-editor.service';
 import { provideWorkspaceShellActions } from './services/workspace-shell-actions.service';
 
 // AoT requires an exported function for factories
@@ -66,6 +68,7 @@ const SUPPORTED_LANGS = new Set([
     'en',
     'es',
     'fr',
+    'hu',
     'it',
     'ja',
     'ko',
@@ -95,9 +98,9 @@ export function getInitialLanguage(): string {
  */
 export function DataFactory() {
     if (window.electron) {
-        return new ElectronService();
+        return inject(ElectronService);
     }
-    return new PwaService();
+    return inject(PwaService);
 }
 
 export const appConfig: ApplicationConfig = {
@@ -105,6 +108,12 @@ export const appConfig: ApplicationConfig = {
         provideZoneChangeDetection({ eventCoalescing: true }),
         provideRouter(routes, withComponentInputBinding()),
         provideAnimations(),
+        // CDK overlays (menus, tooltips, dialogs) live in a container under
+        // <body>, which the browser hides behind an element in DOM fullscreen.
+        // This container follows the fullscreen element instead, so the
+        // fullscreen channel panel's sort/context menus and the controls'
+        // tooltips render while the player is fullscreen.
+        { provide: OverlayContainer, useClass: FullscreenOverlayContainer },
         provideHttpClient(withInterceptorsFromDi()),
         provideStore({
             router: routerReducer,
@@ -135,7 +144,6 @@ export const appConfig: ApplicationConfig = {
         {
             provide: DataService,
             useFactory: DataFactory,
-            deps: [NgxIndexedDBService, HttpClient],
         },
         {
             provide: PORTAL_PLAYER,
@@ -146,10 +154,9 @@ export const appConfig: ApplicationConfig = {
             useExisting: ExternalPlaybackService,
         },
         ...providePortalPlaybackPositions(),
-        ...providePortalNavigationActions(),
         {
-            provide: PLAYLIST_PLAYER_ACTIONS,
-            useExisting: AppPortalNavigationActionsService,
+            provide: STALKER_PLAYLIST_CONNECTION_EDITOR,
+            useExisting: AppStalkerPlaylistConnectionEditorService,
         },
         ...provideWorkspaceShellActions(),
         ...provideXtreamDataSource(),

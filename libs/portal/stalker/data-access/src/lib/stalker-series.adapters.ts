@@ -1,4 +1,7 @@
-import { XtreamSerieEpisode } from '@iptvnator/shared/interfaces';
+import {
+    XtreamSerieEpisode,
+    resolveEnrichmentSeasonNumber,
+} from '@iptvnator/shared/interfaces';
 import {
     StalkerSeason,
     StalkerVodSeriesEpisode,
@@ -7,14 +10,29 @@ import {
 } from './models';
 import { isStalkerSeriesFlag } from './stalker-vod.utils';
 
+const naturalSeasonCollator = new Intl.Collator(undefined, {
+    numeric: true,
+    sensitivity: 'base',
+});
+
 export interface VodSeriesSeasonVm {
     id: string;
     video_id: string;
     name: string;
     season_number: string;
+    /** Original provider coordinates, retained when the title corrects a slice. */
+    providerSeasonKey?: string;
+    providerSeasonNumber?: number;
     episodes: StalkerVodSeriesEpisode[];
     isLoading: boolean;
     isExpanded: boolean;
+    /**
+     * True once the portal has answered an episode fetch for this season —
+     * including an EMPTY answer. Distinguishes "loaded and empty per portal"
+     * from "not fetched yet": `episodes.length === 0` alone conflates them,
+     * which would keep an empty season permanently counted as unloaded.
+     */
+    episodesLoaded?: boolean;
 }
 
 export interface StalkerSeriesSeasonVm {
@@ -24,7 +42,15 @@ export interface StalkerSeriesSeasonVm {
     series: number[];
 }
 
+export interface MapVodSeriesEpisodesOptions {
+    parentSeriesId: string | number;
+    fallbackPoster?: string;
+}
+
 export interface StalkerMappedEpisode extends XtreamSerieEpisode {
+    legacyTrackingId?: number;
+    /** Allows pre-correction legacy progress to match the same episode. */
+    providerSeasonNumber?: number;
     originalId?: string;
     originalCmd?: string;
 }
@@ -39,15 +65,31 @@ function hashString(str: string): number {
     return Math.abs(hash);
 }
 
-function generateEpisodeId(
-    seed: string,
+function generateLegacyVodEpisodeId(
     episodeNum: number,
-    seasonKey: string,
-    isVodSeries: boolean
+    seasonKey: string
 ): number {
-    if (isVodSeries) {
-        return hashString(`vod_${seasonKey}_${episodeNum}`);
-    }
+    return hashString(`vod_${seasonKey}_${episodeNum}`);
+}
+
+function generateVodEpisodeId(options: {
+    parentSeriesId: string | number;
+    providerEpisodeId: string;
+    seasonKey: string;
+    episodeNum: number;
+}): number {
+    return hashString(
+        JSON.stringify([
+            'vod',
+            String(options.parentSeriesId),
+            options.providerEpisodeId,
+            options.seasonKey,
+            options.episodeNum,
+        ])
+    );
+}
+
+function generateRegularEpisodeId(seed: string, episodeNum: number): number {
     return hashString(`${seed}_ep_${episodeNum}`);
 }
 
@@ -85,9 +127,10 @@ export function isVodSeriesItem(
 }
 
 export function mapVodSeriesSeasonsToVm(
-    seasons: StalkerVodSeriesSeason[] | undefined
+    seasons: StalkerVodSeriesSeason[] | undefined,
+    rawTitle?: string | null
 ): VodSeriesSeasonVm[] {
-    return (seasons ?? []).map((season) => ({
+    const mapped = (seasons ?? []).map((season) => ({
         id: String(season.id),
         video_id: String(season.video_id),
         name: toNonEmptyString(
@@ -99,6 +142,23 @@ export function mapVodSeriesSeasonsToVm(
         isLoading: false,
         isExpanded: false,
     }));
+    if (mapped.length !== 1) return mapped;
+    return mapped.map((season) => {
+        const providerSeasonNumber = getVodSeriesSeasonNumber(season, mapped);
+        const seasonNumber = resolveEnrichmentSeasonNumber({
+            rawTitle,
+            providerSeasonNumber,
+            providerSeasonCount: mapped.length,
+        });
+        return seasonNumber === providerSeasonNumber
+            ? season
+            : {
+                  ...season,
+                  season_number: String(seasonNumber),
+                  providerSeasonKey: getVodSeriesSeasonKey(season),
+                  providerSeasonNumber,
+              };
+    });
 }
 
 export function mapRegularSeriesSeasons(
@@ -148,24 +208,30 @@ function createBaseEpisode(
 
 export function mapVodSeriesEpisodes(
     seasons: ReadonlyArray<VodSeriesSeasonVm>,
-    fallbackPoster?: string
+    options: MapVodSeriesEpisodesOptions
 ): Record<string, XtreamSerieEpisode[]> {
     const mapped: Record<string, XtreamSerieEpisode[]> = {};
 
     seasons.forEach((season) => {
         const seasonKey = season.season_number || season.name || season.id;
-        const seasonNum = toEpisodeNumber(seasonKey) || 1;
+        const trackingSeasonKey = season.providerSeasonKey ?? seasonKey;
+        const seasonNum = getVodSeriesSeasonNumber(season, seasons);
 
         mapped[seasonKey] = (season.episodes ?? []).map((episode) => {
             const episodeNum =
                 toEpisodeNumber(episode.series_number) ||
                 toEpisodeNumber(episode.episode_num);
-            const trackingId = generateEpisodeId(
-                String(episode.id ?? ''),
+            const providerEpisodeId = String(episode.id ?? '');
+            const legacyTrackingId = generateLegacyVodEpisodeId(
                 episodeNum,
-                seasonKey,
-                true
+                trackingSeasonKey
             );
+            const trackingId = generateVodEpisodeId({
+                parentSeriesId: options.parentSeriesId,
+                providerEpisodeId,
+                seasonKey: trackingSeasonKey,
+                episodeNum,
+            });
 
             return {
                 ...createBaseEpisode(
@@ -176,14 +242,18 @@ export function mapVodSeriesEpisodes(
                     'vod-series',
                     seasonNum,
                     {
-                        movie_image: episode.cover || fallbackPoster,
+                        movie_image: episode.cover || options.fallbackPoster,
                         plot: episode.description || '',
                         duration: episode.duration
                             ? `${episode.duration} min`
                             : '',
                     }
                 ),
-                originalId: String(episode.id ?? ''),
+                legacyTrackingId,
+                ...(season.providerSeasonNumber !== undefined
+                    ? { providerSeasonNumber: season.providerSeasonNumber }
+                    : {}),
+                originalId: providerEpisodeId,
             } as StalkerMappedEpisode;
         });
     });
@@ -193,18 +263,23 @@ export function mapVodSeriesEpisodes(
 
 export function mapRegularSeriesEpisodes(
     seasons: ReadonlyArray<StalkerSeriesSeasonVm>,
-    fallbackPoster?: string
+    fallbackPoster?: string,
+    rawTitle?: string | null
 ): Record<string, XtreamSerieEpisode[]> {
     const mapped: Record<string, XtreamSerieEpisode[]> = {};
 
     seasons.forEach((season, index) => {
-        const seasonKey = String(index + 1);
+        const seasonKey = String(
+            resolveEnrichmentSeasonNumber({
+                rawTitle,
+                providerSeasonNumber: index + 1,
+                providerSeasonCount: seasons.length,
+            })
+        );
         mapped[seasonKey] = (season.series ?? []).map((episodeNum) => {
-            const trackingId = generateEpisodeId(
+            const trackingId = generateRegularEpisodeId(
                 String(season.cmd ?? ''),
-                episodeNum,
-                seasonKey,
-                false
+                episodeNum
             );
 
             return {
@@ -229,4 +304,30 @@ export function mapRegularSeriesEpisodes(
 
 export function getVodSeriesSeasonKey(season: VodSeriesSeasonVm): string {
     return season.season_number || season.name || season.id;
+}
+
+export function getVodSeriesSeasonNumber(
+    season: VodSeriesSeasonVm,
+    seasons: ReadonlyArray<VodSeriesSeasonVm>
+): number {
+    const normalizedSeasonNumber = season.season_number.trim();
+    const parsedSeasonNumber = Number(normalizedSeasonNumber);
+    if (
+        normalizedSeasonNumber !== '' &&
+        Number.isInteger(parsedSeasonNumber) &&
+        parsedSeasonNumber >= 0
+    ) {
+        return parsedSeasonNumber;
+    }
+
+    const orderedSeasons = [...seasons].sort((seasonA, seasonB) =>
+        naturalSeasonCollator.compare(
+            getVodSeriesSeasonKey(seasonA),
+            getVodSeriesSeasonKey(seasonB)
+        )
+    );
+    const seasonIndex = orderedSeasons.findIndex(
+        (candidate) => candidate.id === season.id
+    );
+    return seasonIndex >= 0 ? seasonIndex + 1 : 1;
 }

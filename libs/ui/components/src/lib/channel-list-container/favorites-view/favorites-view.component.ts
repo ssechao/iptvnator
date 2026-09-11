@@ -1,3 +1,4 @@
+import { ChannelScrollFocusDirective } from '../../channel-scroll-focus/channel-scroll-focus.directive';
 import {
     CdkDragDrop,
     DragDropModule,
@@ -17,9 +18,16 @@ import { MatDialog } from '@angular/material/dialog';
 import { MatIconModule } from '@angular/material/icon';
 import { MatMenuModule, MatMenuTrigger } from '@angular/material/menu';
 import { TranslatePipe } from '@ngx-translate/core';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
+import { SettingsStore } from '@iptvnator/services';
 import { resolveChannelEpgLookupKey } from '@iptvnator/m3u-state';
-import { Channel, EpgProgram } from '@iptvnator/shared/interfaces';
-import { ChannelEpgMetadata } from '../all-channels-view/all-channels-view.component';
+import {
+    Channel,
+    EpgProgram,
+    epgProviderClockMs,
+} from '@iptvnator/shared/interfaces';
+import { buildChannelEpgMetadataMap } from '../epg-enrichment.util';
+import { EpgMappingDialogComponent } from '../epg-mapping-dialog/epg-mapping-dialog.component';
 import { ChannelDetailsDialogComponent } from '../channel-details-dialog/channel-details-dialog.component';
 import { resolveChannelLogo } from '../channel-logo-fallback.util';
 import { ChannelListItemComponent } from '../channel-list-item/channel-list-item.component';
@@ -30,6 +38,7 @@ import { ChannelListItemComponent } from '../channel-list-item/channel-list-item
     styleUrls: ['./favorites-view.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
     imports: [
+        ChannelScrollFocusDirective,
         ChannelListItemComponent,
         DragDropModule,
         MatIconModule,
@@ -39,6 +48,9 @@ import { ChannelListItemComponent } from '../channel-list-item/channel-list-item
 })
 export class FavoritesViewComponent {
     private readonly dialog = inject(MatDialog);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
+    private readonly settingsStore = inject(SettingsStore);
+    readonly supportsEpgMapping = this.epgBridge.supportsEpgMapping;
 
     readonly contextMenuTrigger =
         viewChild.required<MatMenuTrigger>('contextMenuTrigger');
@@ -80,7 +92,9 @@ export class FavoritesViewComponent {
         y: '0px',
     });
 
-    readonly hasSearchTerm = computed(() => this.searchTerm().trim().length > 0);
+    readonly hasSearchTerm = computed(
+        () => this.searchTerm().trim().length > 0
+    );
     readonly filteredFavorites = computed(() => {
         const favorites = this.favorites();
         const term = this.searchTerm().trim().toLowerCase();
@@ -102,17 +116,17 @@ export class FavoritesViewComponent {
      * data. Replaces the previous spread-clone-every-channel pattern.
      */
     readonly epgMetadataMap = computed(() => {
-        const epgMap = this.channelEpgMap();
+        // Read progressTick to create a dependency for the ~30s progress refresh.
         this.progressTick();
-
-        const result = new Map<string, ChannelEpgMetadata>();
-        epgMap.forEach((program, channelId) => {
-            result.set(channelId, {
-                epgProgram: program,
-                progressPercentage: this.calculateProgress(program),
-            });
-        });
-        return result;
+        // Progress is measured in the provider's EPG clock: the map keeps the
+        // raw programme rows and the item shifts their times for display.
+        return buildChannelEpgMetadataMap(
+            this.channelEpgMap(),
+            epgProviderClockMs(
+                Date.now(),
+                this.settingsStore.resolvedEpgOffsetMinutes()
+            )
+        );
     });
 
     /** Resolves the EPG lookup key the side-car map is keyed by. */
@@ -123,26 +137,6 @@ export class FavoritesViewComponent {
     /** Resolves the channel logo. Called per visible row from the template. */
     getLogoForChannel(channel: Channel): string {
         return resolveChannelLogo(channel, this.channelIconMap());
-    }
-
-    /**
-     * Calculates progress percentage for an EPG program
-     */
-    private calculateProgress(
-        epgProgram: EpgProgram | null | undefined
-    ): number {
-        if (!epgProgram) {
-            return 0;
-        }
-
-        const now = new Date().getTime();
-        const start = new Date(epgProgram.start).getTime();
-        const stop = new Date(epgProgram.stop).getTime();
-
-        const total = stop - start;
-        const elapsed = now - start;
-
-        return Math.min(100, Math.max(0, (elapsed / total) * 100));
     }
 
     trackByFn(_: number, channel: Channel): string {
@@ -177,6 +171,24 @@ export class FavoritesViewComponent {
 
         queueMicrotask(() => {
             this.contextMenuTrigger().openMenu();
+        });
+    }
+
+    openEpgMapping(): void {
+        const channel = this.contextMenuChannel();
+        if (!channel) {
+            return;
+        }
+
+        this.contextMenuTrigger().closeMenu();
+        const channelKey = resolveChannelEpgLookupKey(channel);
+        if (!channelKey) {
+            return;
+        }
+
+        EpgMappingDialogComponent.open(this.dialog, {
+            channelKey,
+            channelName: channel.name ?? channelKey,
         });
     }
 

@@ -5,6 +5,7 @@ import {
     effect,
     inject,
     input,
+    output,
     signal,
     viewChild,
     ElementRef,
@@ -17,17 +18,21 @@ import { MatMenuModule } from '@angular/material/menu';
 import { MatTooltip } from '@angular/material/tooltip';
 import { Router } from '@angular/router';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
-import { StalkerStore } from '@iptvnator/portal/stalker/data-access';
 import {
+    StalkerStore,
+    asStalkerPortalError,
+} from '@iptvnator/portal/stalker/data-access';
+import {
+    LiveLayoutSidebarStateService,
     PortalCategorySortMode,
-    persistPortalCategorySortMode,
-    restorePortalCategorySortMode,
+    PortalCategorySortStateService,
     sortPortalCategoryItems,
 } from '@iptvnator/portal/shared/util';
 import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
 import { WorkspaceContextCategoryViewComponent } from './components/workspace-context-category-view.component';
 import { WorkspaceContextErrorViewComponent } from './components/workspace-context-error-view.component';
 import { hasActiveLiveCategoryRoute } from './workspace-context-panel-route.utils';
+import { WorkspaceShellContextDrawerService } from '@iptvnator/workspace/shell/util';
 
 type WorkspaceProvider = 'xtreams' | 'stalker' | 'playlists';
 
@@ -69,9 +74,56 @@ export class WorkspaceContextPanelComponent {
     private readonly dialog = inject(MatDialog);
     private readonly destroyRef = inject(DestroyRef);
     private readonly translate = inject(TranslateService);
+    // Root-provided; optional keeps standalone unit tests light. Only relevant
+    // when the panel renders as the phone drawer. Some selections here (e.g.
+    // Stalker ITV/radio) update the store without navigating, so the drawer's
+    // NavigationEnd auto-close never fires for them.
+    private readonly contextDrawer = inject(WorkspaceShellContextDrawerService, {
+        optional: true,
+    });
+    private readonly liveSidebarState = inject(LiveLayoutSidebarStateService);
 
     readonly context = input.required<WorkspaceContextRoute>();
     readonly section = input.required<string>();
+    /**
+     * `sidebar` is the in-flow shell rail and offers the "hide categories"
+     * chevron on live sections; `popover` is the same panel stamped into the
+     * live categories dropdown while that rail is folded, where the chevron
+     * would be meaningless (the popover's own footer restores the rail).
+     */
+    readonly presentation = input<'sidebar' | 'popover'>('sidebar');
+    /** A category was picked; the popover host closes on it. */
+    readonly categorySelected = output<void>();
+
+    readonly isLiveSection = computed(() => {
+        const section = this.section();
+        return (
+            (this.context().provider === 'xtreams' && section === 'live') ||
+            (this.context().provider === 'stalker' &&
+                (section === 'itv' || section === 'radio'))
+        );
+    });
+    // Only while a category is selected: that is when the live layout
+    // renders the channels rail whose header offers the way back. Not in the
+    // open phone drawer either: its stylesheet ignores the folded state, so
+    // the tap would change nothing visible while persisting a preference
+    // that only bites once the window is wide again.
+    readonly canHideCategories = computed(
+        () =>
+            this.presentation() === 'sidebar' &&
+            this.isLiveSection() &&
+            !this.contextDrawer?.isOpen() &&
+            (this.context().provider === 'xtreams'
+                ? this.xtreamSelectedCategoryId() !== null
+                : !!this.stalkerSelectedCategoryId())
+    );
+    private readonly hideCategoriesButton = viewChild(
+        'hideCategoriesButton',
+        { read: ElementRef<HTMLElement> }
+    );
+    private readonly firstHeaderAction = viewChild('firstHeaderAction', {
+        read: ElementRef<HTMLElement>,
+    });
 
     readonly isXtreamCategories = computed(
         () =>
@@ -144,6 +196,54 @@ export class WorkspaceContextPanelComponent {
         this.stalkerStore.isCategoryResourceLoading;
     readonly isStalkerCategoryFailed =
         this.stalkerStore.isCategoryResourceFailed;
+    /**
+     * When category loading failed because the portal refused the session,
+     * the portal's own explanation (msg/block_msg or the documented
+     * plain-text failure body) replaces the generic hint; a login-required
+     * refusal gets its own actionable text.
+     */
+    readonly stalkerCategoryErrorDescription = computed(() => {
+        const portalError = asStalkerPortalError(
+            this.isStalkerCategoryFailed()
+        );
+        // Device conflicts are the exception to "the portal explains itself":
+        // its own wording blames the hardware, so the actionable sentence
+        // leads and the portal's text follows it.
+        if (portalError?.kind === 'device-conflict') {
+            const hint = this.translate.instant(
+                'PORTALS.ERROR_VIEW.STALKER_DEVICE_CONFLICT'
+            );
+            return portalError.portalText
+                ? `${hint} ${portalError.portalText}`
+                : hint;
+        }
+        if (portalError?.portalText) {
+            return portalError.portalText;
+        }
+        if (portalError?.kind === 'login-required') {
+            return this.translate.instant(
+                'PORTALS.ERROR_VIEW.STALKER_LOGIN_REQUIRED'
+            );
+        }
+        return this.translate.instant(
+            'WORKSPACE.CONTEXT.LOAD_CATEGORIES_ERROR_HINT'
+        );
+    });
+    // Category count badges are only available for Stalker Live TV, where the
+    // full channel list is cached — VOD/series/radio still page lazily, so
+    // their per-category totals are unknown.
+    readonly stalkerCategoryItemCounts =
+        this.stalkerStore.itvCategoryItemCounts;
+    readonly stalkerShowCounts = computed(
+        () =>
+            this.isStalkerCategories() &&
+            this.section() === 'itv' &&
+            (this.stalkerStore.itvFullListActive() ||
+                this.stalkerStore.itvFullListLoading())
+    );
+    readonly stalkerCountDisplayMode = computed<'loading' | 'ready'>(() =>
+        this.stalkerStore.itvFullListActive() ? 'ready' : 'loading'
+    );
     readonly skeletonRows = Array.from({ length: 14 }, (_, index) => index);
     readonly skeletonLabelWidths = [
         78, 66, 74, 59, 83, 69, 76, 62, 81, 64, 72, 67, 79, 61,
@@ -153,9 +253,9 @@ export class WorkspaceContextPanelComponent {
         viewChild<ElementRef<HTMLInputElement>>('searchInput');
     readonly isSearchOpen = signal(false);
     readonly categorySearchTerm = signal('');
-    readonly categorySortMode = signal<PortalCategorySortMode>(
-        restorePortalCategorySortMode()
-    );
+    // Shared with the popover copy of this panel; see the service's note.
+    private readonly categorySort = inject(PortalCategorySortStateService);
+    readonly categorySortMode = this.categorySort.mode;
     readonly categorySortLabelKey = computed(() =>
         this.getCategorySortLabelKey(this.categorySortMode())
     );
@@ -274,6 +374,22 @@ export class WorkspaceContextPanelComponent {
         });
     }
 
+    /**
+     * The control the shell sidebar hands focus to once this rail has
+     * unfolded (the button the user activated to bring it back is gone by
+     * then): the hide chevron when it is offered, else the first header
+     * action. `null` while neither is rendered — categories still loading,
+     * or a failed Stalker load — and the sidebar falls back to the rail
+     * itself.
+     */
+    focusTarget(): HTMLElement | null {
+        return (
+            this.hideCategoriesButton()?.nativeElement ??
+            this.firstHeaderAction()?.nativeElement ??
+            null
+        );
+    }
+
     toggleCategorySearch(): void {
         const opening = !this.isSearchOpen();
         this.isSearchOpen.set(opening);
@@ -293,8 +409,7 @@ export class WorkspaceContextPanelComponent {
     }
 
     setCategorySortMode(mode: PortalCategorySortMode): void {
-        this.categorySortMode.set(mode);
-        persistPortalCategorySortMode(mode);
+        this.categorySort.setMode(mode);
     }
 
     openManageCategories(): void {
@@ -339,6 +454,10 @@ export class WorkspaceContextPanelComponent {
         );
     }
 
+    hideCategories(): void {
+        this.liveSidebarState.hideCategories('portal');
+    }
+
     onXtreamCategoryClicked(category: XtreamCategoryLike): void {
         if (!this.isXtreamCategoryInteractionEnabled()) {
             return;
@@ -355,6 +474,8 @@ export class WorkspaceContextPanelComponent {
             return;
         }
         const categoryId = numericCategoryId;
+        this.contextDrawer?.close();
+        this.categorySelected.emit();
 
         if (section === 'live') {
             this.xtreamStore.setSelectedCategory(categoryId);
@@ -395,13 +516,21 @@ export class WorkspaceContextPanelComponent {
         const section = this.section();
         const categoryId = String(item.category_id ?? '*');
 
+        this.contextDrawer?.close();
+        this.categorySelected.emit();
         this.stalkerStore.setSelectedCategory(categoryId);
         this.stalkerStore.setPage(0);
-        this.stalkerStore.clearSelectedItem();
 
         if (section === 'itv' || section === 'radio') {
+            // Live TV / radio: the category only re-filters the channel
+            // sidebar, the selected channel keeps playing (Xtream parity,
+            // #936). The live layout gates its player on `selectedItem`, so
+            // clearing it here would tear the player down for a channel the
+            // user never switched away from.
             return;
         }
+
+        this.stalkerStore.clearSelectedItem();
 
         if (categoryId === '*') {
             this.router.navigate([
@@ -436,6 +565,8 @@ export class WorkspaceContextPanelComponent {
 
     private getXtreamImportPhaseLabelKey(phase: string | null): string {
         switch (phase) {
+            case 'loading-cached':
+                return 'WORKSPACE.SHELL.XTREAM_IMPORT_LOADING_CACHED';
             case 'preparing-content':
                 return 'WORKSPACE.SHELL.XTREAM_IMPORT_PREPARING';
             case 'loading-categories':

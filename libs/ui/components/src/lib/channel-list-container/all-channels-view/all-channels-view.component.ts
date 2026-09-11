@@ -1,3 +1,4 @@
+import { ChannelScrollFocusDirective } from '../../channel-scroll-focus/channel-scroll-focus.directive';
 import { ScrollingModule } from '@angular/cdk/scrolling';
 
 import {
@@ -16,8 +17,14 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatMenuModule, MatMenuTrigger } from '@angular/material/menu';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { TranslatePipe } from '@ngx-translate/core';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
+import { SettingsStore } from '@iptvnator/services';
 import { resolveChannelEpgLookupKey } from '@iptvnator/m3u-state';
-import { Channel, EpgProgram } from '@iptvnator/shared/interfaces';
+import {
+    Channel,
+    EpgProgram,
+    epgProviderClockMs,
+} from '@iptvnator/shared/interfaces';
 import {
     PlaylistChannelSortMode,
     getPlaylistChannelSortModeLabel,
@@ -26,20 +33,14 @@ import {
     sortPlaylistChannelItems,
 } from '../channel-list-sort.util';
 import { resolveChannelLogo } from '../channel-logo-fallback.util';
+import { buildChannelEpgMetadataMap } from '../epg-enrichment.util';
 import { ChannelDetailsDialogComponent } from '../channel-details-dialog/channel-details-dialog.component';
+import { EpgMappingDialogComponent } from '../epg-mapping-dialog/epg-mapping-dialog.component';
 import { ChannelListItemComponent } from '../channel-list-item/channel-list-item.component';
 
 const ALL_CHANNELS_SORT_STORAGE_KEY = 'm3u-all-channels-sort-mode';
 
-/**
- * Per-channel EPG metadata stored in a side-car map keyed by EPG lookup key.
- * Replaces the older EnrichedChannel pattern that spread-cloned every channel
- * on every progressTick (~30 s).
- */
-export interface ChannelEpgMetadata {
-    epgProgram: EpgProgram | null | undefined;
-    progressPercentage: number;
-}
+export type { ChannelEpgMetadata } from '../epg-enrichment.util';
 
 @Component({
     selector: 'app-all-channels-view',
@@ -47,6 +48,7 @@ export interface ChannelEpgMetadata {
     styleUrls: ['./all-channels-view.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
     imports: [
+        ChannelScrollFocusDirective,
         ChannelListItemComponent,
         MatButtonModule,
         MatIconModule,
@@ -58,6 +60,9 @@ export interface ChannelEpgMetadata {
 })
 export class AllChannelsViewComponent {
     private readonly dialog = inject(MatDialog);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
+    private readonly settingsStore = inject(SettingsStore);
+    readonly supportsEpgMapping = this.epgBridge.supportsEpgMapping;
 
     readonly contextMenuTrigger =
         viewChild.required<MatMenuTrigger>('contextMenuTrigger');
@@ -65,6 +70,12 @@ export class AllChannelsViewComponent {
     /** All channels (will be filtered by search) */
     readonly channels = input.required<Channel[]>();
     readonly searchTerm = input('');
+    /**
+     * The title / sort / collapse header. Off inside the fullscreen channel
+     * panel, whose own chrome names the view; the persisted sort still
+     * applies.
+     */
+    readonly showHeader = input(true);
 
     /** EPG map for channel enrichment */
     readonly channelEpgMap = input.required<Map<string, EpgProgram | null>>();
@@ -137,18 +148,17 @@ export class AllChannelsViewComponent {
      * ~90K objects per tick on large M3U playlists.
      */
     readonly epgMetadataMap = computed(() => {
-        const epgMap = this.channelEpgMap();
-        // Read progressTick to create dependency for progress refresh
+        // Read progressTick to create a dependency for the ~30s progress refresh.
         this.progressTick();
-
-        const result = new Map<string, ChannelEpgMetadata>();
-        epgMap.forEach((program, channelId) => {
-            result.set(channelId, {
-                epgProgram: program,
-                progressPercentage: this.calculateProgress(program),
-            });
-        });
-        return result;
+        // Progress is measured in the provider's EPG clock: the map keeps the
+        // raw programme rows and the item shifts their times for display.
+        return buildChannelEpgMetadataMap(
+            this.channelEpgMap(),
+            epgProviderClockMs(
+                Date.now(),
+                this.settingsStore.resolvedEpgOffsetMinutes()
+            )
+        );
     });
 
     /** Resolves the EPG lookup key the side-car map is keyed by. */
@@ -163,38 +173,6 @@ export class AllChannelsViewComponent {
      */
     getLogoForChannel(channel: Channel): string {
         return resolveChannelLogo(channel, this.channelIconMap());
-    }
-
-    /**
-     * Calculates progress percentage for an EPG program
-     */
-    private calculateProgress(
-        epgProgram: EpgProgram | null | undefined
-    ): number {
-        if (!epgProgram) {
-            return 0;
-        }
-
-        const now = Date.now();
-        const start = new Date(epgProgram.start).getTime();
-        const stop = new Date(epgProgram.stop).getTime();
-
-        // Validate start/stop are finite numbers
-        if (!Number.isFinite(start) || !Number.isFinite(stop)) {
-            return 0;
-        }
-
-        const total = stop - start;
-
-        // Bail out if duration is zero or negative
-        if (total <= 0) {
-            return 0;
-        }
-
-        // Clamp elapsed to [0, total]
-        const elapsed = Math.min(total, Math.max(0, now - start));
-
-        return Math.round((elapsed / total) * 100);
     }
 
     trackByFn(_: number, channel: Channel): string {
@@ -248,6 +226,24 @@ export class AllChannelsViewComponent {
             data: channel,
             maxWidth: '720px',
             width: 'calc(100vw - 32px)',
+        });
+    }
+
+    openEpgMapping(): void {
+        const channel = this.contextMenuChannel();
+        if (!channel) {
+            return;
+        }
+
+        this.contextMenuTrigger().closeMenu();
+        const channelKey = resolveChannelEpgLookupKey(channel);
+        if (!channelKey) {
+            return;
+        }
+
+        EpgMappingDialogComponent.open(this.dialog, {
+            channelKey,
+            channelName: channel.name ?? channelKey,
         });
     }
 }

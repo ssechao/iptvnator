@@ -6,6 +6,10 @@ export interface PortalPlaybackPositions {
         playlistId: string,
         data: PlaybackPositionData
     ): Promise<void>;
+    savePlaybackPositionOrThrow(
+        playlistId: string,
+        data: PlaybackPositionData
+    ): Promise<void>;
     getPlaybackPosition(
         playlistId: string,
         contentXtreamId: number,
@@ -20,6 +24,24 @@ export interface PortalPlaybackPositions {
         playlistId: string,
         contentXtreamId: number,
         contentType: 'vod' | 'episode'
+    ): Promise<void>;
+    clearPlaybackPositionOrThrow(
+        playlistId: string,
+        contentXtreamId: number,
+        contentType: 'vod' | 'episode'
+    ): Promise<void>;
+    /**
+     * Bulk variants for season-level watched toggles. Unlike the single
+     * save/clear methods these REJECT on failure so callers can surface an
+     * error instead of silently showing stale state.
+     */
+    savePlaybackPositionsBatch(
+        playlistId: string,
+        items: PlaybackPositionData[]
+    ): Promise<void>;
+    clearPlaybackPositionsBatch(
+        playlistId: string,
+        items: { contentXtreamId: number; contentType: 'vod' | 'episode' }[]
     ): Promise<void>;
 }
 

@@ -27,17 +27,18 @@ import { normalizeDateLocale } from '@iptvnator/pipes';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
 import { DialogService } from '@iptvnator/ui/components';
 import { PlaylistActions } from '@iptvnator/m3u-state';
+import { PlaylistContextFacade } from '@iptvnator/playlist/shared/util';
 import {
-    PlaylistContextFacade,
-    PlaylistRefreshActionService,
-} from '@iptvnator/playlist/shared/util';
-import {
-    DatabaseService,
+    PlaylistDeleteActionService,
     PortalStatus,
     PortalStatusService,
 } from '@iptvnator/services';
-import { PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    isPortalAccountPlaylist,
+    PlaylistMeta,
+} from '@iptvnator/shared/interfaces';
 import { startWith } from 'rxjs';
+import { PlaylistRefreshActionService } from '../playlist-refresh-action.service';
 import { PlaylistInfoComponent } from '../recent-playlists/playlist-info/playlist-info.component';
 
 type PlaylistFilterType = 'm3u' | 'stalker' | 'xtream';
@@ -77,7 +78,7 @@ export class PlaylistSwitcherComponent {
     private readonly refreshAction = inject(PlaylistRefreshActionService);
     private readonly dialog = inject(MatDialog);
     private readonly dialogService = inject(DialogService);
-    private readonly databaseService = inject(DatabaseService);
+    private readonly playlistDeleteAction = inject(PlaylistDeleteActionService);
     private readonly snackBar = inject(MatSnackBar);
     private readonly store = inject(Store);
     private focusSearchTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -96,6 +97,7 @@ export class PlaylistSwitcherComponent {
     readonly playlistSelected = output<string>();
     readonly playlistInfoRequested = output<void>();
     readonly accountInfoRequested = output<void>();
+    readonly accountInfoForPlaylistRequested = output<PlaylistMeta>();
     readonly addPlaylistRequested = output<void>();
     readonly refreshPlaylistRequested = output<void>();
 
@@ -290,6 +292,16 @@ export class PlaylistSwitcherComponent {
         this.dialog.open(PlaylistInfoComponent, { data: playlist });
     }
 
+    hasAccountInfo(playlist: PlaylistMeta): boolean {
+        return isPortalAccountPlaylist(playlist);
+    }
+
+    requestAccountInfoFor(playlist: PlaylistMeta, event?: Event): void {
+        event?.stopPropagation();
+        this.menuTrigger().closeMenu();
+        this.accountInfoForPlaylistRequested.emit(playlist);
+    }
+
     refreshPlaylistFor(playlist: PlaylistMeta, event?: Event): void {
         event?.stopPropagation();
         this.menuTrigger().closeMenu();
@@ -311,14 +323,8 @@ export class PlaylistSwitcherComponent {
     private async removePlaylistConfirmed(
         playlist: PlaylistMeta
     ): Promise<void> {
-        const operationId = playlist.serverUrl
-            ? this.databaseService.createOperationId('playlist-delete')
-            : undefined;
-
-        const deleted = await this.databaseService.deletePlaylist(
-            playlist._id,
-            operationId ? { operationId } : undefined
-        );
+        const deleted =
+            await this.playlistDeleteAction.deletePlaylist(playlist);
 
         if (!deleted) {
             return;
@@ -411,8 +417,16 @@ export class PlaylistSwitcherComponent {
         this.portalStatusAbortController = controller;
 
         const xtreamPlaylists = playlists.filter(
-            (playlist) =>
-                playlist.serverUrl && playlist.username && playlist.password
+            (
+                playlist
+            ): playlist is PlaylistMeta & {
+                serverUrl: string;
+                username: string;
+                password: string;
+            } =>
+                Boolean(
+                    playlist.serverUrl && playlist.username && playlist.password
+                )
         );
         if (xtreamPlaylists.length === 0) {
             return;
@@ -422,7 +436,11 @@ export class PlaylistSwitcherComponent {
         // 'checking' in a single signal write so the UI flips from blank →
         // cached/checking dots in one render, not one per playlist.
         const next = new Map(this.portalStatuses());
-        const toFetch: PlaylistMeta[] = [];
+        const toFetch: (PlaylistMeta & {
+            serverUrl: string;
+            username: string;
+            password: string;
+        })[] = [];
         for (const playlist of xtreamPlaylists) {
             const cached = this.portalStatusService.getCachedStatus(
                 playlist.serverUrl,

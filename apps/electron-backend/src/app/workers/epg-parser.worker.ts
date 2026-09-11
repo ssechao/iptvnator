@@ -1,15 +1,34 @@
+import { epgLogger } from '../util/epg-logger';
 import type BetterSqlite3 from 'better-sqlite3';
-import { existsSync, mkdirSync } from 'fs';
-import { getIptvnatorDatabasePath } from '@iptvnator/shared/database/path-utils';
+import {
+    ELECTRON_BRIDGE_SECURITY_ERROR_CODES,
+    ElectronBridgeSecurityErrorCode,
+    ElectronBridgeTrustOptions,
+} from '@iptvnator/shared/interfaces';
 import { Readable } from 'stream';
 import { parentPort, workerData } from 'worker_threads';
-import { createGunzip } from 'zlib';
 import {
-    ParsedChannel,
-    ParsedProgram,
-    StreamingEpgParser,
-} from './epg-streaming-parser';
-import { shouldGunzipEpgResponse } from './epg-response-utils';
+    EpgDatabase,
+    EpgDatabaseClearOperation,
+    EpgDatabaseSourceClearOperation,
+} from './epg-database';
+import { createDecodedEpgStream } from './epg-stream-decoder';
+import { StreamingEpgParser } from './epg-streaming-parser';
+import {
+    getEpgResponseContentEncoding,
+    shouldGunzipEpgResponse,
+} from './epg-response-utils';
+import {
+    isPrivateNetworkUrlAccessAllowed,
+    UnsafeUrlError,
+} from '../events/url-safety';
+import { createPlaylistAgentFactory } from '../util/secure-https';
+import {
+    getHostnameFromErrorUrl,
+    getHostnameFromUrl,
+    isInvalidTlsCertificateError,
+} from '../util/security-errors';
+import { requestWithValidatedRedirects } from '../util/validated-axios';
 import {
     getNativeModuleSearchPaths,
     getWorkerDataNativeModuleSearchPaths,
@@ -17,14 +36,11 @@ import {
     registerNativeModuleSearchPaths,
 } from './worker-runtime-paths';
 
-let Database: typeof BetterSqlite3;
-
 const nativeModuleSearchPaths = [
     ...getWorkerDataNativeModuleSearchPaths(workerData),
     ...getNativeModuleSearchPaths({
-        resourcesPath: (
-            process as NodeJS.Process & { resourcesPath?: string }
-        ).resourcesPath,
+        resourcesPath: (process as NodeJS.Process & { resourcesPath?: string })
+            .resourcesPath,
     }),
 ];
 
@@ -36,12 +52,11 @@ function loadBetterSqlite3(): typeof BetterSqlite3 {
         loggerLabel: '[EPG Worker]',
         searchPaths: nativeModuleSearchPaths,
         fallbackRequire: () =>
-            // eslint-disable-next-line @typescript-eslint/no-require-imports
             require('better-sqlite3') as typeof BetterSqlite3,
     });
 }
 
-Database = loadBetterSqlite3();
+const Database = loadBetterSqlite3();
 
 /**
  * Streaming EPG Parser Worker
@@ -51,8 +66,10 @@ Database = loadBetterSqlite3();
  */
 
 interface WorkerMessage {
-    type: 'FETCH_EPG' | 'FORCE_FETCH' | 'CLEAR_EPG';
+    type: 'FETCH_EPG' | 'FORCE_FETCH' | 'CLEAR_EPG' | 'CLEAR_EPG_SOURCE';
     url?: string;
+    sourceUrl?: string;
+    options?: ElectronBridgeTrustOptions;
 }
 
 interface WorkerResponse {
@@ -63,6 +80,8 @@ interface WorkerResponse {
         | 'CLEAR_COMPLETE'
         | 'READY';
     error?: string;
+    errorCode?: ElectronBridgeSecurityErrorCode;
+    errorHost?: string;
     url?: string;
     stats?: {
         totalChannels: number;
@@ -77,151 +96,17 @@ const CHANNEL_BATCH_SIZE = 100;
 const PROGRAM_BATCH_SIZE = 1000;
 
 /**
- * Database helper class for EPG operations
- * Creates its own connection to avoid blocking main thread
- */
-class EpgDatabase {
-    private db: BetterSqlite3.Database;
-    private knownChannelIds: Set<string> = new Set();
-
-    // Prepared statements for better performance
-    private insertChannelStmt: BetterSqlite3.Statement;
-    private insertProgramStmt: BetterSqlite3.Statement;
-    private deleteChannelsStmt: BetterSqlite3.Statement;
-
-    constructor() {
-        const dbPath = getIptvnatorDatabasePath();
-        this.db = new Database(dbPath);
-        this.db.pragma('foreign_keys = ON');
-        this.db.pragma('journal_mode = WAL'); // Better concurrent write performance
-        this.db.pragma('busy_timeout = 5000');
-
-        // Prepare statements
-        // Use INSERT OR REPLACE to update existing channels and refresh updated_at
-        // Use strftime with ISO format for consistent date comparison
-        this.insertChannelStmt = this.db.prepare(`
-            INSERT INTO epg_channels (id, display_name, icon_url, url, source_url, updated_at)
-            VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-            ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                icon_url = excluded.icon_url,
-                url = excluded.url,
-                source_url = excluded.source_url,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-        `);
-
-        this.insertProgramStmt = this.db.prepare(`
-            INSERT INTO epg_programs (channel_id, start, stop, title, description, category, icon_url, rating, episode_num)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        this.deleteChannelsStmt = this.db.prepare(`
-            DELETE FROM epg_channels WHERE source_url = ?
-        `);
-    }
-
-    /**
-     * Clear existing EPG data for a source URL
-     */
-    clearSourceData(sourceUrl: string): void {
-        this.deleteChannelsStmt.run(sourceUrl);
-        this.knownChannelIds.clear();
-    }
-
-    /**
-     * Insert a batch of channels. When `clearFirst` is true, the existing rows
-     * for `sourceUrl` are deleted inside the same transaction as the insert so
-     * old data is preserved if the fetch/parse never produces any channels.
-     */
-    insertChannels(
-        channels: ParsedChannel[],
-        sourceUrl: string,
-        clearFirst = false
-    ): void {
-        const insertMany = this.db.transaction((channels: ParsedChannel[]) => {
-            if (clearFirst) {
-                this.deleteChannelsStmt.run(sourceUrl);
-                this.knownChannelIds.clear();
-            }
-            for (const channel of channels) {
-                const displayName =
-                    channel.displayName?.[0]?.value || channel.id;
-                const iconUrl = channel.icon?.[0]?.src || null;
-                const url = channel.url?.[0] || null;
-
-                this.insertChannelStmt.run(
-                    channel.id,
-                    displayName,
-                    iconUrl,
-                    url,
-                    sourceUrl
-                );
-                this.knownChannelIds.add(channel.id);
-            }
-        });
-
-        insertMany(channels);
-    }
-
-    /**
-     * Insert a batch of programs
-     * Only inserts programs for known channels to avoid FK constraint failures
-     */
-    insertPrograms(programs: ParsedProgram[]): number {
-        let insertedCount = 0;
-
-        const insertMany = this.db.transaction((programs: ParsedProgram[]) => {
-            for (const prog of programs) {
-                // Skip if channel not known
-                if (!this.knownChannelIds.has(prog.channel)) continue;
-
-                const title = prog.title?.[0]?.value || 'Unknown';
-                const description = prog.desc?.[0]?.value || null;
-                const category = prog.category?.[0]?.value || null;
-                const iconUrl = prog.icon?.[0]?.src || null;
-                const rating = prog.rating?.[0]?.value || null;
-                const episodeNum = prog.episodeNum?.[0]?.value || null;
-
-                try {
-                    this.insertProgramStmt.run(
-                        prog.channel,
-                        prog.start,
-                        prog.stop,
-                        title,
-                        description,
-                        category,
-                        iconUrl,
-                        rating,
-                        episodeNum
-                    );
-                    insertedCount++;
-                } catch (err) {
-                    // Skip individual failures (e.g., FK constraint)
-                }
-            }
-        });
-
-        insertMany(programs);
-        return insertedCount;
-    }
-
-    /**
-     * Close the database connection
-     */
-    close(): void {
-        this.db.close();
-    }
-}
-
-/**
  * Fetches and parses EPG data from URL using streaming
  * Inserts directly into SQLite to avoid blocking main thread
  */
-async function fetchAndParseEpgStreaming(url: string): Promise<void> {
-    console.log(loggerLabel, `Fetching EPG from ${url}`);
+async function fetchAndParseEpgStreaming(
+    url: string,
+    options: ElectronBridgeTrustOptions = {}
+): Promise<void> {
+    epgLogger.log(loggerLabel, 'Fetching EPG source');
 
     // Create database connection in worker
-    const epgDb = new EpgDatabase();
+    const epgDb = new EpgDatabase(Database);
 
     // Old rows for this source are retained until the first successful insert
     // batch arrives — see `hasClearedSource` below. That way, a fetch or parse
@@ -230,26 +115,52 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
     let hasClearedSource = false;
 
     try {
-        const response = await fetch(url.trim());
-        const isGzipped = shouldGunzipEpgResponse(url, response);
+        // EPG URLs can originate from an untrusted M3U `url-tvg` attribute.
+        // Validate every redirect and require an explicit operator opt-in for
+        // private/LAN sources.
+        const response = await requestWithValidatedRedirects<Readable>(
+            url.trim(),
+            {
+                agentFactory: createPlaylistAgentFactory({
+                    trustedInsecureTlsHosts: options.trustedInsecureTlsHosts,
+                }),
+                decompress: false,
+                method: 'GET',
+                responseType: 'stream',
+            },
+            {
+                allowPrivateNetworks:
+                    isPrivateNetworkUrlAccessAllowed() ||
+                    isTrustedPrivateNetworkEpgSource(url, options),
+            }
+        );
+        const responseUrl = response.config.url;
+        const isGzipped = shouldGunzipEpgResponse(url, {
+            headers: response.headers,
+            url: responseUrl,
+        });
+        const contentEncoding = getEpgResponseContentEncoding(response.headers);
 
-        if (response.url && response.url !== url) {
-            console.log(
-                loggerLabel,
-                `Resolved EPG redirect: ${url} -> ${response.url}`
-            );
+        if (responseUrl && responseUrl !== url) {
+            epgLogger.log(loggerLabel, 'Resolved EPG redirect');
         }
 
-        console.log(
+        epgLogger.log(
             loggerLabel,
             `EPG response detected as gzipped: ${isGzipped}`
         );
+        if (contentEncoding) {
+            epgLogger.log(
+                loggerLabel,
+                `EPG response content-encoding: ${contentEncoding}`
+            );
+        }
 
-        if (!response.ok) {
+        if (response.status < 200 || response.status >= 300) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        if (!response.body) {
+        if (!response.data) {
             throw new Error('Response body is null');
         }
 
@@ -262,7 +173,7 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
             },
             (programs) => {
                 // Insert programs directly into database
-                epgDb.insertPrograms(programs);
+                epgDb.insertPrograms(programs, url);
             },
             (totalChannels, totalPrograms) => {
                 // Send progress to main thread (lightweight)
@@ -276,28 +187,18 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
             PROGRAM_BATCH_SIZE
         );
 
-        // Convert web stream to Node.js stream
-        const nodeStream = Readable.fromWeb(response.body as any);
-
         return new Promise((resolve, reject) => {
-            let dataStream: Readable = nodeStream;
-
-            if (isGzipped) {
-                const gunzip = createGunzip();
-                dataStream = nodeStream.pipe(gunzip);
-
-                gunzip.on('error', (err) => {
-                    console.error(loggerLabel, 'Gunzip error:', err);
-                    epgDb.close();
-                    reject(err);
-                });
-            }
+            const dataStream = createDecodedEpgStream(
+                response.data,
+                response.headers,
+                isGzipped
+            );
 
             dataStream.on('data', (chunk: Buffer) => {
                 try {
                     parser.write(chunk.toString('utf-8'));
                 } catch (err) {
-                    console.error(loggerLabel, 'Parse error:', err);
+                    epgLogger.error(loggerLabel, 'Parse error:', err);
                     epgDb.close();
                     reject(err);
                 }
@@ -306,7 +207,7 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
             dataStream.on('end', () => {
                 try {
                     const stats = parser.finish();
-                    console.log(
+                    epgLogger.log(
                         loggerLabel,
                         `Parsing complete: ${stats.totalChannels} channels, ${stats.totalPrograms} programs`
                     );
@@ -320,7 +221,7 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
                     // real problem (unreachable feed, SAX parse failure, etc.).
                     if (stats.totalChannels === 0) {
                         const errorMessage = `EPG parse produced 0 channels — feed may be unreachable or unsupported`;
-                        console.error(loggerLabel, `${errorMessage}: ${url}`);
+                        epgLogger.error(loggerLabel, errorMessage);
                         const response: WorkerResponse = {
                             type: 'EPG_ERROR',
                             url,
@@ -348,15 +249,60 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
             });
 
             dataStream.on('error', (err) => {
-                console.error(loggerLabel, 'Stream error:', err);
+                epgLogger.error(loggerLabel, 'Stream error:', err);
                 epgDb.close();
                 reject(err);
             });
         });
     } catch (error) {
         epgDb.close();
-        throw error;
+        throw toEpgFetchError(error, url);
     }
+}
+
+function isTrustedPrivateNetworkEpgSource(
+    url: string,
+    options: ElectronBridgeTrustOptions
+): boolean {
+    const normalizedUrl = url.trim();
+    return (
+        options.trustedPrivateNetworkEpgUrls?.some(
+            (trustedUrl) => trustedUrl.trim() === normalizedUrl
+        ) ?? false
+    );
+}
+
+function toEpgFetchError(
+    error: unknown,
+    url: string
+): Error & {
+    code?: ElectronBridgeSecurityErrorCode;
+    host?: string;
+} {
+    if (
+        error instanceof UnsafeUrlError &&
+        /private|local network/i.test(error.message)
+    ) {
+        return Object.assign(
+            new Error('EPG source points to private network and was blocked.'),
+            {
+                code: ELECTRON_BRIDGE_SECURITY_ERROR_CODES.EpgPrivateNetworkBlocked,
+                host: getHostnameFromUrl(url),
+            }
+        );
+    }
+
+    if (isInvalidTlsCertificateError(error)) {
+        return Object.assign(
+            new Error('Certificate for this source host is invalid.'),
+            {
+                code: ELECTRON_BRIDGE_SECURITY_ERROR_CODES.InvalidTlsCertificate,
+                host: getHostnameFromErrorUrl(error, url),
+            }
+        );
+    }
+
+    return error instanceof Error ? error : new Error(String(error));
 }
 
 /**
@@ -364,30 +310,50 @@ async function fetchAndParseEpgStreaming(url: string): Promise<void> {
  * Runs in worker thread to avoid blocking main thread
  */
 function clearAllEpgData(): void {
-    const dbPath = getIptvnatorDatabasePath();
-    const db = new Database(dbPath);
+    const clearOperation = new EpgDatabaseClearOperation(Database);
 
     try {
-        console.log(loggerLabel, 'Clearing all EPG data...');
+        epgLogger.log(loggerLabel, 'Clearing all EPG data...');
 
-        // Delete programs first (foreign key constraint)
-        db.exec('DELETE FROM epg_programs');
-        // Then delete channels
-        db.exec('DELETE FROM epg_channels');
+        clearOperation.run();
 
-        console.log(loggerLabel, 'All EPG data cleared');
+        epgLogger.log(loggerLabel, 'All EPG data cleared');
 
         const response: WorkerResponse = { type: 'CLEAR_COMPLETE' };
         parentPort?.postMessage(response);
     } catch (error) {
-        console.error(loggerLabel, 'Error clearing EPG data:', error);
+        epgLogger.error(loggerLabel, 'Error clearing EPG data:', error);
         const errorResponse: WorkerResponse = {
             type: 'EPG_ERROR',
             error: error instanceof Error ? error.message : String(error),
         };
         parentPort?.postMessage(errorResponse);
     } finally {
-        db.close();
+        clearOperation.close();
+    }
+}
+
+function clearEpgDataForSource(sourceUrl: string): void {
+    const clearOperation = new EpgDatabaseSourceClearOperation(Database);
+
+    try {
+        epgLogger.log(loggerLabel, 'Clearing EPG data for source...');
+
+        clearOperation.run(sourceUrl);
+
+        epgLogger.log(loggerLabel, 'EPG data cleared for source');
+
+        const response: WorkerResponse = { type: 'CLEAR_COMPLETE' };
+        parentPort?.postMessage(response);
+    } catch (error) {
+        epgLogger.error(loggerLabel, 'Error clearing EPG source data:', error);
+        const errorResponse: WorkerResponse = {
+            type: 'EPG_ERROR',
+            error: error instanceof Error ? error.message : String(error),
+        };
+        parentPort?.postMessage(errorResponse);
+    } finally {
+        clearOperation.close();
     }
 }
 
@@ -401,15 +367,23 @@ if (parentPort) {
                 message.type === 'FETCH_EPG' ||
                 message.type === 'FORCE_FETCH'
             ) {
-                await fetchAndParseEpgStreaming(message.url!);
+                await fetchAndParseEpgStreaming(message.url!, message.options);
             } else if (message.type === 'CLEAR_EPG') {
                 clearAllEpgData();
+            } else if (message.type === 'CLEAR_EPG_SOURCE') {
+                clearEpgDataForSource(message.sourceUrl ?? '');
             }
         } catch (error) {
-            console.error(loggerLabel, 'Worker error:', error);
+            epgLogger.error(loggerLabel, 'Worker error:', error);
+            const typedError = error as {
+                code?: ElectronBridgeSecurityErrorCode;
+                host?: string;
+            };
             const errorResponse: WorkerResponse = {
                 type: 'EPG_ERROR',
                 error: error instanceof Error ? error.message : String(error),
+                errorCode: typedError.code,
+                errorHost: typedError.host,
                 url: message.url,
             };
             parentPort?.postMessage(errorResponse);
@@ -419,5 +393,5 @@ if (parentPort) {
     // Notify parent that worker is ready
     parentPort.postMessage({ type: 'READY' });
 } else {
-    console.error(loggerLabel, 'parentPort is not available!');
+    epgLogger.error(loggerLabel, 'parentPort is not available!');
 }

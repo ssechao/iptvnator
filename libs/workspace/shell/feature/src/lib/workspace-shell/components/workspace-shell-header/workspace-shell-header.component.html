@@ -1,18 +1,46 @@
-<header class="workspace-header">
-    <app-playlist-switcher
-        class="playlist-switcher"
-        [currentTitle]="playlistTitle()"
-        [subtitle]="playlistSubtitle()"
-        [showPlaylistInfo]="canOpenPlaylistInfo()"
-        [showAccountInfo]="canOpenAccountInfo()"
-        [showAddPlaylist]="true"
-        [canRefreshActivePlaylist]="canRefreshPlaylist()"
-        [isRefreshingActivePlaylist]="isRefreshingPlaylist()"
-        (playlistInfoRequested)="onPlaylistInfoRequested()"
-        (accountInfoRequested)="onAccountInfoRequested()"
-        (addPlaylistRequested)="onAddPlaylistRequested()"
-        (refreshPlaylistRequested)="onRefreshPlaylistRequested()"
-    />
+<header class="workspace-header" [class.is-settings-route]="isSettingsRoute()">
+    <!-- Phone-only (≤640px, CSS-hidden above): on phones the context panel
+         is an off-canvas drawer, and this button is the only way to open
+         it, so it must never be dropped while the route has a panel. -->
+    @if (showContextDrawerToggle()) {
+        <button
+            #contextDrawerToggle
+            type="button"
+            class="context-drawer-toggle"
+            mat-icon-button
+            data-test-id="context-drawer-toggle"
+            (click)="onContextDrawerToggleRequested()"
+            [matTooltip]="contextDrawerTooltipKey() | translate"
+            [attr.aria-label]="contextDrawerToggleAriaKey() | translate"
+            [attr.aria-expanded]="isContextDrawerOpen()"
+        >
+            <mat-icon>menu_open</mat-icon>
+        </button>
+    }
+
+    <!-- Playlist switcher hidden on /settings: those controls are
+         playlist-scoped, but Settings is a global page. Per the UX
+         audit, leaving them visible implied switching playlists changes
+         which settings you're editing. -->
+    @if (!isSettingsRoute()) {
+        <app-playlist-switcher
+            class="playlist-switcher"
+            [currentTitle]="playlistTitle()"
+            [subtitle]="playlistSubtitle()"
+            [showPlaylistInfo]="canOpenPlaylistInfo()"
+            [showAccountInfo]="canOpenAccountInfo()"
+            [showAddPlaylist]="true"
+            [canRefreshActivePlaylist]="canRefreshPlaylist()"
+            [isRefreshingActivePlaylist]="isRefreshingPlaylist()"
+            (playlistInfoRequested)="onPlaylistInfoRequested()"
+            (accountInfoRequested)="onAccountInfoRequested()"
+            (accountInfoForPlaylistRequested)="
+                onAccountInfoForPlaylistRequested($event)
+            "
+            (addPlaylistRequested)="onAddPlaylistRequested()"
+            (refreshPlaylistRequested)="onRefreshPlaylistRequested()"
+        />
+    }
 
     @if (!hasNoPlaylists()) {
         <label class="search-field">
@@ -23,6 +51,7 @@
                 </span>
             }
             <input
+                #searchInput
                 type="search"
                 spellcheck="false"
                 [value]="searchQuery()"
@@ -48,12 +77,34 @@
                     'WORKSPACE.SHELL.OPEN_COMMAND_PALETTE' | translate
                 "
             >
-                {{ commandShortcutLabel }}
+                <!-- The shortcut label is the affordance on a keyboard; on a
+                     phone it means nothing, but this button is the only way
+                     to open the palette, so it becomes an icon rather than
+                     disappearing. -->
+                <span class="command-trigger__shortcut">{{
+                    commandShortcutLabel
+                }}</span>
+                <mat-icon class="command-trigger__icon">bolt</mat-icon>
             </button>
         </label>
     }
 
+    <!-- The "Add playlist" button stays visible on /settings — adding a
+         playlist is a global action, not playlist-scoped, so it must
+         remain reachable (e.g. a fresh user configuring the app before
+         importing their first source). Only the per-playlist shortcut
+         and bulk actions are hidden on Settings. -->
     <div class="header-actions header-actions--leading">
+        <button
+            type="button"
+            class="shortcuts-trigger"
+            mat-icon-button
+            (click)="onShortcutsRequested()"
+            [matTooltip]="'WORKSPACE.SHORTCUTS.OPEN_TOOLTIP' | translate"
+            [attr.aria-label]="'WORKSPACE.SHORTCUTS.OPEN_ARIA' | translate"
+        >
+            <mat-icon>keyboard</mat-icon>
+        </button>
         <button
             type="button"
             mat-icon-button
@@ -63,30 +114,51 @@
         >
             <mat-icon>add</mat-icon>
         </button>
-        @if (headerShortcut(); as action) {
-            <button
-                type="button"
-                class="header-shortcut"
-                mat-icon-button
-                (click)="onHeaderShortcutRequested()"
-                [matTooltip]="action.tooltipKey | translate"
-                [attr.aria-label]="action.ariaLabelKey | translate"
-            >
-                <mat-icon>{{ action.icon }}</mat-icon>
-            </button>
-        }
-        @if (headerBulkAction(); as bulk) {
-            <button
-                type="button"
-                class="header-shortcut header-bulk-action"
-                mat-icon-button
-                [disabled]="bulk.disabled"
-                (click)="onHeaderBulkActionRequested()"
-                [matTooltip]="bulk.tooltip"
-                [attr.aria-label]="bulk.ariaLabel"
-            >
-                <mat-icon>{{ bulk.icon }}</mat-icon>
-            </button>
+        @if (!isSettingsRoute()) {
+            @if (headerSidebarToggle(); as sidebarToggle) {
+                <button
+                    type="button"
+                    class="header-shortcut header-sidebar-toggle"
+                    [class.header-sidebar-toggle--collapsed]="
+                        !sidebarToggle.expanded
+                    "
+                    mat-icon-button
+                    (click)="onHeaderSidebarToggleRequested()"
+                    [matTooltip]="sidebarToggle.tooltip"
+                    [attr.aria-label]="sidebarToggle.ariaLabel"
+                    [attr.aria-pressed]="sidebarToggle.expanded"
+                >
+                    <mat-icon>view_sidebar</mat-icon>
+                </button>
+            }
+            @if (headerShortcut(); as action) {
+                <button
+                    type="button"
+                    class="header-shortcut"
+                    mat-icon-button
+                    [class.is-active]="action.active?.() ?? false"
+                    [disabled]="action.disabled?.() ?? false"
+                    [attr.aria-pressed]="action.active ? action.active() : null"
+                    (click)="onHeaderShortcutRequested()"
+                    [matTooltip]="action.tooltipKey | translate"
+                    [attr.aria-label]="action.ariaLabelKey | translate"
+                >
+                    <mat-icon>{{ action.icon }}</mat-icon>
+                </button>
+            }
+            @if (headerBulkAction(); as bulk) {
+                <button
+                    type="button"
+                    class="header-shortcut header-bulk-action"
+                    mat-icon-button
+                    [disabled]="bulk.disabled"
+                    (click)="onHeaderBulkActionRequested()"
+                    [matTooltip]="bulk.tooltip"
+                    [attr.aria-label]="bulk.ariaLabel"
+                >
+                    <mat-icon>{{ bulk.icon }}</mat-icon>
+                </button>
+            }
         }
     </div>
 
@@ -98,6 +170,15 @@
                         <span class="download-activity-bar__fill"></span>
                     </span>
                 }
+                @if (activeDownloadsCount() > 0) {
+                    <span
+                        class="download-count-badge"
+                        data-test-id="global-download-count"
+                        aria-hidden="true"
+                    >
+                        {{ activeDownloadsCount() }}
+                    </span>
+                }
                 <button
                     type="button"
                     class="header-shortcut"
@@ -105,11 +186,12 @@
                     [class.is-active]="isDownloadsView()"
                     [class.has-activity]="hasActiveDownloads()"
                     (click)="onDownloadsRequested()"
-                    [matTooltip]="
-                        'WORKSPACE.SHELL.RAIL_DOWNLOADS' | translate
-                    "
+                    [matTooltip]="'WORKSPACE.SHELL.RAIL_DOWNLOADS' | translate"
                     [attr.aria-label]="
-                        'WORKSPACE.SHELL.OPEN_DOWNLOADS' | translate
+                        ('WORKSPACE.SHELL.OPEN_DOWNLOADS' | translate) +
+                        (hasActiveDownloads()
+                            ? ' (' + activeDownloadsCount() + ')'
+                            : '')
                     "
                 >
                     <mat-icon>download</mat-icon>

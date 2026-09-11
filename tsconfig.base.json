@@ -5,6 +5,7 @@
         "sourceMap": true,
         "declaration": false,
         "moduleResolution": "node",
+        "esModuleInterop": true,
         "emitDecoratorMetadata": true,
         "experimentalDecorators": true,
         "importHelpers": true,
@@ -24,10 +25,14 @@
             "@iptvnator/portal/shared/ui": [
                 "libs/portal/shared/ui/src/index.ts"
             ],
+            "@iptvnator/portal/shared/data-access": [
+                "libs/portal/shared/data-access/src/index.ts"
+            ],
             "@iptvnator/portal/shared/util": [
                 "libs/portal/shared/util/src/index.ts"
             ],
             "@iptvnator/epg/data-access": ["libs/epg/data-access/src/index.ts"],
+            "@iptvnator/playback/util": ["libs/playback/util/src/index.ts"],
             "@iptvnator/playlist/shared/ui": [
                 "libs/playlist/shared/ui/src/index.ts"
             ],
@@ -41,6 +46,9 @@
             ],
             "@iptvnator/ui/playback/external-player-info-dialog": [
                 "libs/ui/playback/src/lib/external-player-info-dialog/external-player-info-dialog.component.ts"
+            ],
+            "@iptvnator/ui/playback/embedded-mpv-player": [
+                "libs/ui/playback/src/lib/embedded-mpv-player/index.ts"
             ],
             "@iptvnator/ui/playback": ["libs/ui/playback/src/index.ts"],
             "@iptvnator/playlist/import/feature": [
@@ -73,9 +81,17 @@
             "@iptvnator/shared/m3u-utils": [
                 "libs/shared/m3u-utils/src/index.ts"
             ],
+            "@iptvnator/shared/testing": ["libs/shared/testing/src/index.ts"],
+            "@iptvnator/shared/logging": ["libs/shared/logging/src/index.ts"],
+            "@iptvnator/shared/host-health": [
+                "libs/shared/host-health/src/index.ts"
+            ],
             "@iptvnator/services": ["libs/services/src/index.ts"],
             "@iptvnator/shared/interfaces": [
                 "libs/shared/interfaces/src/index.ts"
+            ],
+            "@iptvnator/shared/interfaces/ipc-commands": [
+                "libs/shared/interfaces/src/lib/ipc-commands.ts"
             ],
             "@iptvnator/ui/shared-portals": [
                 "libs/ui/shared-portals/src/index.ts"
@@ -96,7 +112,10 @@
             "@iptvnator/workspace/dashboard/data-access": [
                 "libs/workspace/dashboard/data-access/src/index.ts"
             ],
-            "@package": ["./package.json"]
+            "@package": ["./package.json"],
+            "@iptvnator/shared/marketing-fixtures": [
+                "./libs/shared/marketing-fixtures/src/index.ts"
+            ]
         }
     },
     "exclude": ["node_modules", "tmp"],

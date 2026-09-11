@@ -22,6 +22,11 @@ export const selectActivePlaybackUrl = createSelector(
     fromPlaylistState.selectActivePlaybackUrlReducer
 );
 
+export const selectActiveEpgProgram = createSelector(
+    selectPlaylistState,
+    fromPlaylistState.selectActiveEpgProgramReducer
+);
+
 export const selectCurrentEpgProgram = createSelector(
     selectPlaylistState,
     fromPlaylistState.selectCurrentEpgProgramReducer
@@ -46,6 +51,11 @@ export const selectPlaylistsLoadingFlag = createSelector(
 export const selectPlaylistsMetaState = createSelector(
     selectPlaylistState,
     fromPlaylistState.selectPlaylists
+);
+
+export const selectPlaylistsLoadFailed = createSelector(
+    selectPlaylistsMetaState,
+    (state) => state.loadFailed === true
 );
 
 export const selectAllPlaylistsMeta = createSelector(

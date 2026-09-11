@@ -7,6 +7,7 @@ import {
     WorkspaceAccountInfoData,
     WorkspacePlaylistType,
     WorkspaceShellActions,
+    WorkspaceStalkerAccountInfoData,
 } from '@iptvnator/workspace/shell/util';
 
 @Injectable({ providedIn: 'root' })
@@ -18,7 +19,12 @@ export class AppWorkspaceShellActionsService implements WorkspaceShellActions {
         void import('@iptvnator/playlist/import/feature').then(
             ({ AddPlaylistDialogComponent }) => {
                 this.dialog.open(AddPlaylistDialogComponent, {
-                    width: '560px',
+                    // Width sized for the 5-card method picker plus the
+                    // selected method's form below. Matches the v0.22
+                    // mockup; falls back to viewport-clamped width on
+                    // narrow screens so the grid can collapse via the
+                    // SCSS responsive breakpoints.
+                    width: '780px',
                     maxWidth: '92vw',
                     data: type ? { type } : {},
                 });
@@ -27,20 +33,10 @@ export class AppWorkspaceShellActionsService implements WorkspaceShellActions {
     }
 
     openGlobalSearch(initialQuery = ''): void {
-        void import('@iptvnator/portal/xtream/feature').then(
-            ({ GlobalSearchResultsComponent }) => {
-                this.dialog.open(GlobalSearchResultsComponent, {
-                    width: '100%',
-                    height: '100%',
-                    maxWidth: '100%',
-                    panelClass: 'global-search-overlay',
-                    data: {
-                        isGlobalSearch: true,
-                        initialQuery,
-                    },
-                });
-            }
-        );
+        const query = initialQuery.trim();
+        void this.router.navigate(['/workspace/search'], {
+            queryParams: query ? { q: query } : {},
+        });
     }
 
     openGlobalRecent(): void {
@@ -51,6 +47,19 @@ export class AppWorkspaceShellActionsService implements WorkspaceShellActions {
         void import('@iptvnator/portal/xtream/feature').then(
             ({ AccountInfoComponent }) => {
                 this.dialog.open(AccountInfoComponent, {
+                    width: '80%',
+                    maxWidth: '1200px',
+                    maxHeight: '90vh',
+                    data,
+                });
+            }
+        );
+    }
+
+    openStalkerAccountInfo(data: WorkspaceStalkerAccountInfoData): void {
+        void import('@iptvnator/portal/stalker/feature').then(
+            ({ StalkerAccountInfoComponent }) => {
+                this.dialog.open(StalkerAccountInfoComponent, {
                     width: '80%',
                     maxWidth: '1200px',
                     maxHeight: '90vh',

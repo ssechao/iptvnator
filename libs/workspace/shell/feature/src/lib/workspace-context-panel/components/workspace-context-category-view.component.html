@@ -1,5 +1,8 @@
-@if (items()?.length > 0) {
-    <div class="nav-list">
+@if (items().length > 0) {
+    <div
+        class="nav-list"
+        [attr.id]="columnHandoff() ? 'portal-categories' : null"
+    >
         @if (statusText()) {
             <div class="context-inline-status">
                 {{ statusText() }}
@@ -9,6 +12,7 @@
             <button
                 type="button"
                 class="nav-item category-item"
+                (keydown)="onCategoryKeydown($event)"
                 [attr.data-category-id]="
                     $any(item).category_id ?? $any(item).xtream_id ?? item.id
                 "
@@ -33,7 +37,7 @@
                             class="item-count item-count--loading"
                             aria-hidden="true"
                         ></div>
-                    } @else {
+                    } @else if (hasItemCount(item)) {
                         <div class="item-count app-count-badge">
                             {{ getItemCount(item) }}
                         </div>

@@ -1,4 +1,8 @@
+import { TestBed } from '@angular/core/testing';
+import { SettingsStore } from '@iptvnator/services';
+
 describe('app routes', () => {
+    let workspaceRoute: import('@angular/router').Route | undefined;
     let workspaceChildren: Array<{
         canActivate?: unknown[];
         data?: Record<string, unknown>;
@@ -7,9 +11,16 @@ describe('app routes', () => {
         path?: string;
         redirectTo?: unknown;
     }> = [];
+    let resolveElectronOnlyGlobalSearchRoute: (
+        runtime: { isElectron: boolean },
+        router: { parseUrl: (url: string) => unknown }
+    ) => unknown;
+    let resolveRecordingsCapabilityRoute: (
+        runtime: { supportsRecordings: boolean },
+        router: { parseUrl: (url: string) => unknown }
+    ) => unknown;
 
     beforeAll(async () => {
-        jest.resetModules();
         jest.unstable_mockModule(
             '@iptvnator/playlist/m3u/feature-player',
             () => ({
@@ -42,11 +53,66 @@ describe('app routes', () => {
             })
         );
 
-        const { routes } = await import('./app.routes');
-        const workspaceRoute = routes.find(
-            (route) => route.path === 'workspace'
-        );
+        const appRoutes = await import('./app.routes');
+        const { routes } = appRoutes;
+        workspaceRoute = routes.find((route) => route.path === 'workspace');
         workspaceChildren = workspaceRoute?.children ?? [];
+        resolveElectronOnlyGlobalSearchRoute =
+            appRoutes.resolveElectronOnlyGlobalSearchRoute;
+        resolveRecordingsCapabilityRoute =
+            appRoutes.resolveRecordingsCapabilityRoute;
+    });
+
+    afterEach(() => {
+        TestBed.resetTestingModule();
+    });
+
+    it('waits for settings before activating workspace children', async () => {
+        let releaseSettings!: () => void;
+        const settingsPending = new Promise<void>((resolve) => {
+            releaseSettings = resolve;
+        });
+        const loadSettings = jest.fn(() => settingsPending);
+        TestBed.configureTestingModule({
+            providers: [
+                {
+                    provide: SettingsStore,
+                    useValue: { loadSettings },
+                },
+            ],
+        });
+        const settingsReadyResolver =
+            workspaceRoute?.resolve?.['settingsReady'];
+
+        expect(typeof settingsReadyResolver).toBe('function');
+        if (typeof settingsReadyResolver !== 'function') {
+            return;
+        }
+
+        const resolution = TestBed.runInInjectionContext(() =>
+            Promise.resolve(
+                (
+                    settingsReadyResolver as import('@angular/router').ResolveFn<void>
+                )(
+                    {} as import('@angular/router').ActivatedRouteSnapshot,
+                    {} as import('@angular/router').RouterStateSnapshot
+                )
+            )
+        );
+        let resolved = false;
+        void resolution.then(() => {
+            resolved = true;
+        });
+
+        await Promise.resolve();
+
+        expect(loadSettings).toHaveBeenCalledTimes(1);
+        expect(resolved).toBe(false);
+
+        releaseSettings();
+
+        await expect(resolution).resolves.toBeUndefined();
+        expect(resolved).toBe(true);
     });
 
     it('lazy-loads M3U workspace routes through the feature boundary', async () => {
@@ -89,6 +155,58 @@ describe('app routes', () => {
             defaultScope: 'all',
         });
         expect(typeof globalRecentRoute?.loadComponent).toBe('function');
+    });
+
+    it('adds a routed /workspace/search global search view', async () => {
+        const globalSearchRoute = workspaceChildren.find(
+            (route) => route.path === 'search'
+        );
+
+        expect(globalSearchRoute?.data).toEqual({
+            isGlobalSearch: true,
+        });
+        expect(globalSearchRoute?.canActivate).toHaveLength(1);
+        expect(typeof globalSearchRoute?.loadComponent).toBe('function');
+    });
+
+    it('redirects the Electron-only global search route in the web runtime', async () => {
+        const redirectTree = { url: '/workspace/sources' };
+        const parseUrl = jest.fn().mockReturnValue(redirectTree);
+
+        const result = resolveElectronOnlyGlobalSearchRoute(
+            { isElectron: false },
+            { parseUrl }
+        );
+
+        expect(parseUrl).toHaveBeenCalledWith('/workspace/sources');
+        expect(result).toBe(redirectTree);
+    });
+
+    it('guards the focused recording detail behind the recordings capability', async () => {
+        const recordingRoute = workspaceChildren.find(
+            (route) => route.path === 'downloads/recording/:recordingId'
+        );
+
+        expect(recordingRoute?.canActivate).toHaveLength(1);
+    });
+
+    it('redirects the recording detail to the manager without the capability', async () => {
+        const redirectTree = { url: '/workspace/downloads' };
+        const parseUrl = jest.fn().mockReturnValue(redirectTree);
+
+        const result = resolveRecordingsCapabilityRoute(
+            { supportsRecordings: false },
+            { parseUrl }
+        );
+
+        expect(parseUrl).toHaveBeenCalledWith('/workspace/downloads');
+        expect(result).toBe(redirectTree);
+        expect(
+            resolveRecordingsCapabilityRoute(
+                { supportsRecordings: true },
+                { parseUrl }
+            )
+        ).toBe(true);
     });
 
     it('uses a dynamic redirect for the default /workspace child route', async () => {

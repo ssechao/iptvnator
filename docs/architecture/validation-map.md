@@ -17,11 +17,91 @@ pnpm nx show projects --withTarget e2e
 | ---------------------------------- | ----------------------------------- |
 | Angular renderer entry points      | `pnpm run typecheck:web`            |
 | Electron main process entry points | `pnpm run typecheck:backend`        |
-| Curated CI unit suite              | `pnpm run test:unit:ci`             |
+| Full unit suite (all projects)     | `pnpm run test:unit:ci`             |
 | EPG data access                    | `pnpm nx test epg-data-access`      |
 | Workspace shell utilities          | `pnpm nx test workspace-shell-util` |
 | Shared SQLite schema/connection    | `pnpm nx test database`             |
 | Packaging metadata                 | `pnpm nx test packaging`            |
+
+## Lint
+
+```bash
+pnpm run lint                 # nx run-many --target=lint --all
+pnpm nx lint <project>        # single project
+```
+
+The CI workflow (`.github/workflows/ci.yml`) lints affected projects on PRs
+(`nx affected`) and every project on master pushes.
+This enforces `@nx/enforce-module-boundaries` (scope/domain/type tag
+constraints), the legacy bare-alias ban, and the `max-lines` file-size rule
+(hard maximum 400 lines for production TypeScript, 1200 for tests; blank lines
+and comments are not counted). The limits live in
+`tools/eslint/max-lines-config.mjs`, which both `eslint.config.mjs` and the
+generator import. Files that predate the `max-lines` rule are baselined in
+`tools/eslint/max-lines-baseline.mjs`; after splitting a baselined file below
+the limit, regenerate the list with
+`node tools/eslint/generate-max-lines-baseline.mjs`. Never add new files to
+the baseline.
+
+## Coverage Tiers
+
+Use `tools/coverage/coverage-policy.json` as the source of truth for coverage
+ownership. Every project with a `test` target must be classified in a tier;
+`pnpm run coverage:policy:check` (part of `coverage:ci`) fails CI when a new
+project is missing from the policy, a listed project no longer exists, or a
+Tier A entry has no test target. CI runs Tier A with coverage (uploaded to
+Codecov) and each Tier B/C project's `validationCommand` (falling back to
+`nx test`) without coverage; projects with an `e2e` target are skipped there
+because the E2E workflow already runs them on every PR that touches app code.
+Docs-only changes (Markdown, `docs/`, `.plans/`, `.codex/`, `.claude/`) and
+`apps/website/**` changes skip the E2E workflow via `paths-ignore` — for those
+PRs no E2E validation runs in CI, which is intentional: they cannot affect app
+behavior.
+
+Tier A coverage is fail-closed. `coverage:unit:ci` relays Jest output but exits
+nonzero on a `Failed to collect coverage` marker, a missing or invalid project
+report, or a runtime-owning production TypeScript file absent from that report.
+`coverage:merge` requires every configured Tier A report before replacing the
+merged output. Strict health validation also requires the merged Istanbul map
+itself to contain usable instrumentation for every runtime-owning Tier A file,
+recomputes its summary, and then applies aggregate and selected critical-file
+ratchets.
+
+Runtime-owning files are discovered from the TypeScript AST. Specs,
+declarations, test setup and stubs, generated and environment files, `index.ts`,
+type-only files, and pure re-export shims are excluded. Ratchets live under
+`reporting.coverageRatchet` in `tools/coverage/coverage-policy.json`; update
+them only from a fresh full `coverage:ci` report when every value stays level
+or rises, and never lower one to accept a regression. The only exception is an
+explicitly reviewed production source shrink: `minimumCovered` may follow a
+lower total statement count when the PR documents the removed executable
+statements and fresh coverage proves that the corresponding
+`minimumPercent`, every aggregate ratchet, and the remaining behavioral
+coverage do not decrease.
+
+| Tier | Rule                                                                                                                                              | Validation                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| A    | Product/runtime Angular, Electron, backend, data-access, portal, playlist, workspace, playback, EPG, and shared UI code collects source coverage. | `pnpm run coverage:ci`                                                                 |
+| B    | Validate behavior without percentage coverage, such as `website`, `packaging`, and Playwright E2E projects.                                       | `pnpm nx test website`, `pnpm nx test packaging`, or the closest E2E target            |
+| C    | Excluded from the source coverage baseline, such as mock servers, test helper libraries, and untested feature shells.                             | Validate through dependent flows, or add focused tests when changing behavior directly |
+
+`apps/website` is an Astro marketing site. Its useful signal is a successful
+static build plus targeted output checks, not a merged code coverage percentage.
+Projects with a test target but no specs, such as `remote-control-web` and
+`remote-control` today, should not be in Tier A until focused specs exist.
+
+For local coverage inspection:
+
+```bash
+pnpm run coverage:tools:test
+pnpm run coverage:unit:ci
+pnpm run coverage:merge
+pnpm run coverage:health -- --require-report
+```
+
+The merged report is written to `coverage/merged/` as HTML, LCOV, Cobertura,
+and JSON summary output. CI uploads the merged Tier A report to Codecov with the
+`unit` flag and keeps the HTML report as a GitHub artifact.
 
 ## E2E
 
@@ -29,9 +109,27 @@ pnpm nx show projects --withTarget e2e
 | --------------------- | ----------------------------------------------- |
 | Web app browser flows | `pnpm nx run web-e2e:e2e -- --project=chromium` |
 | Electron flows        | `pnpm nx run electron-backend-e2e:e2e`          |
+| VOD multi-source      | `pnpm nx run electron-backend-e2e:e2e-ci--src/vod-multi-source.e2e.ts` |
 
 Use atomized E2E targets when available, for example
 `pnpm nx run web-e2e:e2e-ci--src/xtream.e2e.ts`.
+
+Playwright coverage is measured semantically by tags and critical journeys, not
+by a source-line percentage. E2E reports should use tags such as `@critical`,
+`@electron`, `@web`, `@xtream`, `@stalker`, `@m3u`, `@search`, `@epg`,
+`@persistence`, `@settings`, `@pwa`, and `@self-hosted`.
+
+After an E2E run, generate the semantic summary with:
+
+```bash
+pnpm run coverage:e2e:summary
+```
+
+For local investigation only, Chromium browser V8 coverage can be explored with:
+
+```bash
+pnpm run coverage:e2e:v8:web
+```
 
 ## I18n
 

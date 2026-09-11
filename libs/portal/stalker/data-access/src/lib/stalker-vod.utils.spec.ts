@@ -2,13 +2,36 @@ import { VodDetailsItem } from '@iptvnator/shared/interfaces';
 import { StalkerFavoriteItem } from './models';
 import {
     buildStalkerFavoritePayload,
+    buildStalkerSelectedVodItem,
+    createStalkerInfo,
     createStalkerInlineDetailState,
     createStalkerDetailViewState,
+    isStalkerSeriesFlag,
     normalizeStalkerFavoriteItem,
+    normalizeStalkerSeriesFlag,
+    normalizeStalkerVodDetailsItem,
     toggleStalkerVodFavorite,
 } from './stalker-vod.utils';
 
 describe('stalker-vod.utils regressions', () => {
+    describe('Stalker series flag contract', () => {
+        it.each([true, 1, '1'])(
+            'accepts %p and normalizes it to the positive marker',
+            (value) => {
+                expect(isStalkerSeriesFlag(value)).toBe(true);
+                expect(normalizeStalkerSeriesFlag(value)).toBe(true);
+            }
+        );
+
+        it.each([false, 0, '0', 'true', null, undefined, {}, []])(
+            'rejects unsupported value %p',
+            (value) => {
+                expect(isStalkerSeriesFlag(value)).toBe(false);
+                expect(normalizeStalkerSeriesFlag(value)).toBeUndefined();
+            }
+        );
+    });
+
     it('routes embedded series[] items to series view state', () => {
         const state = createStalkerDetailViewState(
             {
@@ -223,5 +246,94 @@ describe('stalker-vod.utils regressions', () => {
 
         expect(detailState.categoryId).toBe('series');
         expect(detailState.seriesItem?.id).toBe('9');
+    });
+
+    it('preserves TMDB enrichment fields through info re-normalization', () => {
+        const tmdbCast = [{ name: 'Karl Urban', profileUrl: null }];
+        const tmdbRecommendations = [
+            { tmdbId: 1, title: 'Invincible', year: 2021, posterUrl: null },
+        ];
+
+        const info = createStalkerInfo({
+            id: '7',
+            info: {
+                name: 'The Boys s05',
+                movie_image: 'http://portal/poster.jpg',
+                description: 'Plot',
+                actors: 'Karl Urban',
+                director: '',
+                releasedate: '2026',
+                genre: 'Action',
+                rating_imdb: '',
+                rating_kinopoisk: '8.1',
+                tmdb_cast: tmdbCast,
+                tmdb_directors: [
+                    {
+                        name: 'Eric Kripke',
+                        profileUrl: null,
+                        tmdbPersonId: 1216630,
+                    },
+                ],
+                tmdb_backdrop: 'https://image.tmdb.org/t/p/w1280/boys.jpg',
+                tmdb_trailer: 'abc123def',
+                tmdb_recommendations: tmdbRecommendations,
+            },
+        });
+
+        expect(info.tmdb_cast).toEqual(tmdbCast);
+        expect(info.tmdb_directors?.[0]?.name).toBe('Eric Kripke');
+        expect(info.tmdb_backdrop).toBe(
+            'https://image.tmdb.org/t/p/w1280/boys.jpg'
+        );
+        expect(info.tmdb_trailer).toBe('abc123def');
+        expect(info.tmdb_recommendations).toEqual(tmdbRecommendations);
+    });
+
+    describe('temporary-link flags survive normalization', () => {
+        // `buildStalkerSelectedVodItem` is a whitelist, so a field it forgets
+        // is silently gone. For these two that fails OPEN: playback and
+        // downloads would read "no temporary link needed" and play the
+        // portal's non-final URL instead of minting one.
+        const FLAGGED_ROW = {
+            id: '42',
+            cmd: 'ffrt3 http://cdn.example/movie.mkv',
+            use_http_tmp_link: '1',
+            use_load_balancing: '0',
+            info: { name: 'Flagged Movie' },
+        };
+
+        it('keeps both flags on the selected VOD item', () => {
+            const selected = buildStalkerSelectedVodItem(FLAGGED_ROW);
+
+            expect(selected.use_http_tmp_link).toBe('1');
+            expect(selected.use_load_balancing).toBe('0');
+        });
+
+        it('keeps both flags through the VOD details normalizer', () => {
+            const normalized = normalizeStalkerVodDetailsItem(FLAGGED_ROW);
+
+            expect(normalized.use_http_tmp_link).toBe('1');
+            expect(normalized.use_load_balancing).toBe('0');
+        });
+
+        it('keeps both flags on a normalized favorite', () => {
+            const normalized = normalizeStalkerFavoriteItem(
+                FLAGGED_ROW as StalkerFavoriteItem
+            );
+
+            expect(normalized.details.use_http_tmp_link).toBe('1');
+            expect(normalized.details.use_load_balancing).toBe('0');
+        });
+
+        it('leaves an unflagged row without inventing flags', () => {
+            const selected = buildStalkerSelectedVodItem({
+                id: '43',
+                cmd: 'ffrt3 http://cdn.example/other.mkv',
+                info: { name: 'Plain Movie' },
+            });
+
+            expect(selected.use_http_tmp_link).toBeUndefined();
+            expect(selected.use_load_balancing).toBeUndefined();
+        });
     });
 });

@@ -1,3 +1,4 @@
+import { ChannelScrollFocusDirective } from '../../channel-scroll-focus/channel-scroll-focus.directive';
 import {
     ChangeDetectionStrategy,
     Component,
@@ -12,10 +13,21 @@ import { MatDialog } from '@angular/material/dialog';
 import { MatIconModule } from '@angular/material/icon';
 import { MatMenuModule, MatMenuTrigger } from '@angular/material/menu';
 import { TranslatePipe } from '@ngx-translate/core';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
 import { resolveChannelEpgLookupKey } from '@iptvnator/m3u-state';
-import { Channel, EpgProgram } from '@iptvnator/shared/interfaces';
+import { SettingsStore } from '@iptvnator/services';
+import {
+    Channel,
+    EpgProgram,
+    epgProviderClockMs,
+} from '@iptvnator/shared/interfaces';
+import { EpgMappingDialogComponent } from '../epg-mapping-dialog/epg-mapping-dialog.component';
 import { ChannelDetailsDialogComponent } from '../channel-details-dialog/channel-details-dialog.component';
 import { resolveChannelLogo } from '../channel-logo-fallback.util';
+import {
+    calculateEpgProgress,
+    resolveChannelEpgProgram,
+} from '../epg-enrichment.util';
 import { ChannelListItemComponent } from '../channel-list-item/channel-list-item.component';
 
 export interface RecentViewItem {
@@ -29,6 +41,7 @@ export interface RecentViewItem {
     styleUrls: ['./recent-view.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
     imports: [
+        ChannelScrollFocusDirective,
         ChannelListItemComponent,
         MatIconModule,
         MatMenuModule,
@@ -37,6 +50,9 @@ export interface RecentViewItem {
 })
 export class RecentViewComponent {
     private readonly dialog = inject(MatDialog);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
+    private readonly settingsStore = inject(SettingsStore);
+    readonly supportsEpgMapping = this.epgBridge.supportsEpgMapping;
 
     readonly contextMenuTrigger =
         viewChild.required<MatMenuTrigger>('contextMenuTrigger');
@@ -80,36 +96,28 @@ export class RecentViewComponent {
         const epgMap = this.channelEpgMap();
         const iconMap = this.channelIconMap();
         this.progressTick();
+        // Progress is measured in the provider's EPG clock: the rows keep the
+        // raw programme and the item shifts its times for display.
+        const epgClockMs = epgProviderClockMs(
+            Date.now(),
+            this.settingsStore.resolvedEpgOffsetMinutes()
+        );
 
         return recentItems.map(({ channel, viewedAt }) => {
-            const channelId = resolveChannelEpgLookupKey(channel);
-            const epgProgram = channelId ? epgMap.get(channelId) : null;
+            const epgProgram = resolveChannelEpgProgram(channel, epgMap);
 
             return {
                 channel,
                 viewedAt,
                 epgProgram,
                 logo: resolveChannelLogo(channel, iconMap),
-                progressPercentage: this.calculateProgress(epgProgram),
+                progressPercentage: calculateEpgProgress(
+                    epgProgram,
+                    epgClockMs
+                ),
             };
         });
     });
-
-    private calculateProgress(
-        epgProgram: EpgProgram | null | undefined
-    ): number {
-        if (!epgProgram) {
-            return 0;
-        }
-
-        const now = new Date().getTime();
-        const start = new Date(epgProgram.start).getTime();
-        const stop = new Date(epgProgram.stop).getTime();
-        const total = stop - start;
-        const elapsed = now - start;
-
-        return Math.min(100, Math.max(0, (elapsed / total) * 100));
-    }
 
     trackByFn(_: number, item: RecentViewItem): string {
         return item.channel?.url;
@@ -144,6 +152,24 @@ export class RecentViewComponent {
 
         queueMicrotask(() => {
             this.contextMenuTrigger().openMenu();
+        });
+    }
+
+    openEpgMapping(): void {
+        const channel = this.contextMenuChannel();
+        if (!channel) {
+            return;
+        }
+
+        this.contextMenuTrigger().closeMenu();
+        const channelKey = resolveChannelEpgLookupKey(channel);
+        if (!channelKey) {
+            return;
+        }
+
+        EpgMappingDialogComponent.open(this.dialog, {
+            channelKey,
+            channelName: channel.name ?? channelKey,
         });
     }
 

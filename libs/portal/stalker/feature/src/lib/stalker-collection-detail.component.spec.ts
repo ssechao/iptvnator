@@ -1,8 +1,13 @@
 import { Component, input, output, signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { By } from '@angular/platform-browser';
 import { MatSnackBar } from '@angular/material/snack-bar';
+import { Router } from '@angular/router';
 import { TranslateService } from '@ngx-translate/core';
-import { ContentHeroComponent } from '@iptvnator/ui/components';
+import {
+    ContentHeroComponent,
+    VIEW_IN_PORTAL_HANDOFF,
+} from '@iptvnator/ui/components';
 import {
     PORTAL_EXTERNAL_PLAYBACK,
     PORTAL_PLAYBACK_POSITIONS,
@@ -20,6 +25,7 @@ import {
 import { of } from 'rxjs';
 import { StalkerCollectionDetailComponent } from './stalker-collection-detail.component';
 import { StalkerInlineDetailComponent } from './stalker-inline-detail/stalker-inline-detail.component';
+import { createPlaybackSessionKey } from '@iptvnator/playback/util';
 
 @Component({
     selector: 'app-content-hero',
@@ -36,6 +42,7 @@ class StubContentHeroComponent {
     template: '',
 })
 class StubStalkerInlineDetailComponent {
+    readonly playbackSessionKey = input.required<string>();
     readonly categoryId = input<'vod' | 'series' | null>(null);
     readonly seriesItem = input<unknown>(null);
     readonly isSeries = input(false);
@@ -71,6 +78,7 @@ describe('StalkerCollectionDetailComponent', () => {
         setSelectedContentType: jest.Mock;
         setSelectedCategory: jest.Mock;
         setSelectedItem: jest.Mock;
+        refreshEmbeddedSeriesSelection: jest.Mock;
         addToFavorites: jest.Mock;
         removeFromFavorites: jest.Mock;
         createLinkToPlayVod: jest.Mock;
@@ -88,6 +96,9 @@ describe('StalkerCollectionDetailComponent', () => {
         getAllPlaybackPositions: jest.Mock;
         clearPlaybackPosition: jest.Mock;
     };
+    let snackBar: { open: jest.Mock };
+    let playlistsService: { getPlaylistById: jest.Mock };
+    let routerNavigate: jest.Mock;
 
     const playlist = {
         _id: 'stalker-1',
@@ -121,6 +132,7 @@ describe('StalkerCollectionDetailComponent', () => {
             setSelectedItem: jest.fn((value: unknown) => {
                 selectedItem.set(value);
             }),
+            refreshEmbeddedSeriesSelection: jest.fn(async () => false),
             addToFavorites: jest.fn(),
             removeFromFavorites: jest.fn(),
             createLinkToPlayVod: jest.fn(),
@@ -138,6 +150,14 @@ describe('StalkerCollectionDetailComponent', () => {
             getAllPlaybackPositions: jest.fn(),
             clearPlaybackPosition: jest.fn(),
         };
+        snackBar = { open: jest.fn() };
+        playlistsService = {
+            getPlaylistById: jest.fn((playlistId: string) =>
+                of({ ...playlist, _id: playlistId })
+            ),
+        };
+
+        routerNavigate = jest.fn().mockResolvedValue(true);
 
         await TestBed.configureTestingModule({
             imports: [StalkerCollectionDetailComponent],
@@ -145,6 +165,13 @@ describe('StalkerCollectionDetailComponent', () => {
                 {
                     provide: StalkerStore,
                     useValue: stalkerStore,
+                },
+                {
+                    provide: Router,
+                    useValue: {
+                        navigate: routerNavigate,
+                        url: '/workspace/global-favorites',
+                    },
                 },
                 {
                     provide: PORTAL_PLAYER,
@@ -165,9 +192,7 @@ describe('StalkerCollectionDetailComponent', () => {
                 },
                 {
                     provide: MatSnackBar,
-                    useValue: {
-                        open: jest.fn(),
-                    },
+                    useValue: snackBar,
                 },
                 {
                     provide: TranslateService,
@@ -183,7 +208,7 @@ describe('StalkerCollectionDetailComponent', () => {
                 {
                     provide: PlaylistsService,
                     useValue: {
-                        getPlaylistById: jest.fn(() => of(playlist)),
+                        getPlaylistById: playlistsService.getPlaylistById,
                         getPortalFavorites: jest.fn(() => of([])),
                     },
                 },
@@ -311,6 +336,40 @@ describe('StalkerCollectionDetailComponent', () => {
         expect(
             fixture.componentInstance.inlineDetail().seriesItem?.series
         ).toEqual([1, 2]);
+        // The snapshot renders immediately, but a background portal
+        // re-fetch must be triggered so new episodes can appear.
+        expect(stalkerStore.refreshEmbeddedSeriesSelection).toHaveBeenCalled();
+    });
+
+    it('shows newly released episodes when the background snapshot refresh patches the selection', async () => {
+        fixture.componentRef.setInput(
+            'item',
+            buildCollectionItem({
+                contentType: 'series',
+                categoryId: 'series',
+                stalkerItem: {
+                    id: '20001',
+                    title: 'Embedded Series',
+                    category_id: 'series',
+                    cmd: '/media/file_20001.mpg',
+                    series: [1],
+                },
+            })
+        );
+
+        await settleDetail(fixture);
+        expect(
+            fixture.componentInstance.inlineDetail().seriesItem?.series
+        ).toEqual([1]);
+
+        // Simulate the store-side refresh completing with a fresh portal row.
+        const current = selectedItem() as Record<string, unknown>;
+        selectedItem.set({ ...current, series: [1, 2] });
+        await settleDetail(fixture);
+
+        expect(
+            fixture.componentInstance.inlineDetail().seriesItem?.series
+        ).toEqual([1, 2]);
     });
 
     it('plays regular VOD collection details inline for embedded players instead of using the legacy play wrapper', async () => {
@@ -355,6 +414,131 @@ describe('StalkerCollectionDetailComponent', () => {
         expect(stalkerStore.createLinkToPlayVod).not.toHaveBeenCalled();
         expect(portalPlayer.openResolvedPlayback).not.toHaveBeenCalled();
         expect(fixture.componentInstance.inlinePlayback()).toEqual(playback);
+        const detail = fixture.debugElement.query(
+            By.directive(StubStalkerInlineDetailComponent)
+        ).componentInstance as StubStalkerInlineDetailComponent;
+        expect(detail.playbackSessionKey()).toBe(
+            createPlaybackSessionKey({
+                kind: 'vod',
+                sourceId: 'stalker-1',
+                contentId: '1701',
+            })
+        );
+    });
+
+    it('ignores a pending payload after the collection detail owner changes and lets the new owner commit', async () => {
+        const pendingA = deferred<ResolvedPortalPlayback>();
+        const pendingB = deferred<ResolvedPortalPlayback>();
+        stalkerStore.resolveVodPlayback.mockImplementation((cmd: string) =>
+            cmd.includes('1701') ? pendingA.promise : pendingB.promise
+        );
+        const itemA = buildCollectionItem({
+            stalkerId: '1701',
+            stalkerItem: buildVodSource('1701', 'Movie A'),
+        });
+        const itemB = buildCollectionItem({
+            stalkerId: '1702',
+            stalkerItem: buildVodSource('1702', 'Movie B'),
+        });
+
+        fixture.componentRef.setInput('item', itemA);
+        await settleDetail(fixture);
+        fixture.componentInstance.onVodPlay(
+            createStalkerVodItem(itemA.stalkerItem as never, itemA.playlistId)
+        );
+        await Promise.resolve();
+
+        fixture.componentRef.setInput('item', itemB);
+        await settleDetail(fixture);
+        pendingA.resolve({ streamUrl: 'https://streams.test/a.mp4' });
+        await settleDetail(fixture);
+
+        expect(fixture.componentInstance.inlinePlayback()).toBeNull();
+        expect(snackBar.open).not.toHaveBeenCalled();
+        expect(fixture.componentInstance.playbackSessionKey()).toBe(
+            createPlaybackSessionKey({
+                kind: 'vod',
+                sourceId: 'stalker-1',
+                contentId: '1702',
+            })
+        );
+
+        fixture.componentInstance.onVodPlay(
+            createStalkerVodItem(itemB.stalkerItem as never, itemB.playlistId)
+        );
+        pendingB.resolve({ streamUrl: 'https://streams.test/b.mp4' });
+        await settleDetail(fixture);
+
+        expect(fixture.componentInstance.inlinePlayback()).toEqual({
+            streamUrl: 'https://streams.test/b.mp4',
+        });
+    });
+
+    it('suppresses a pending error after the collection playlist owner changes', async () => {
+        const pending = deferred<ResolvedPortalPlayback>();
+        stalkerStore.resolveVodPlayback.mockReturnValue(pending.promise);
+        const source = buildVodSource('1701', 'Movie A');
+        const itemA = buildCollectionItem({
+            playlistId: 'stalker-1',
+            stalkerId: '1701',
+            stalkerItem: source,
+        });
+        const itemB = buildCollectionItem({
+            playlistId: 'stalker-2',
+            stalkerId: '1701',
+            stalkerItem: { ...source },
+        });
+
+        fixture.componentRef.setInput('item', itemA);
+        await settleDetail(fixture);
+        fixture.componentInstance.onVodPlay(
+            createStalkerVodItem(itemA.stalkerItem as never, itemA.playlistId)
+        );
+        await Promise.resolve();
+
+        fixture.componentRef.setInput('item', itemB);
+        await settleDetail(fixture);
+        pending.reject(new Error('stale A failure'));
+        await settleDetail(fixture);
+
+        expect(fixture.componentInstance.inlinePlayback()).toBeNull();
+        expect(snackBar.open).not.toHaveBeenCalled();
+        expect(fixture.componentInstance.playbackSessionKey()).toBe(
+            createPlaybackSessionKey({
+                kind: 'vod',
+                sourceId: 'stalker-2',
+                contentId: '1701',
+            })
+        );
+    });
+
+    it('keeps a pending request when the same canonical owner is refreshed with a new object', async () => {
+        const pending = deferred<ResolvedPortalPlayback>();
+        stalkerStore.resolveVodPlayback.mockReturnValue(pending.promise);
+        const item = buildCollectionItem({
+            stalkerId: '1701',
+            stalkerItem: buildVodSource('1701', 'Movie A'),
+        });
+
+        fixture.componentRef.setInput('item', item);
+        await settleDetail(fixture);
+        fixture.componentInstance.onVodPlay(
+            createStalkerVodItem(item.stalkerItem as never, item.playlistId)
+        );
+        await Promise.resolve();
+
+        fixture.componentRef.setInput('item', {
+            ...item,
+            stalkerItem: { ...(item.stalkerItem as object) },
+        });
+        await settleDetail(fixture);
+        pending.resolve({ streamUrl: 'https://streams.test/a.mp4' });
+        await settleDetail(fixture);
+
+        expect(fixture.componentInstance.inlinePlayback()).toEqual({
+            streamUrl: 'https://streams.test/a.mp4',
+        });
+        expect(snackBar.open).not.toHaveBeenCalled();
     });
 
     it('does not load VOD playback position when the playlist id is missing', async () => {
@@ -389,6 +573,61 @@ describe('StalkerCollectionDetailComponent', () => {
             null
         );
     });
+
+    it('provides itself as the view-in-portal handoff on its element injector', () => {
+        fixture.componentRef.setInput(
+            'item',
+            buildCollectionItem({
+                contentType: 'series',
+                categoryId: '44',
+                stalkerId: 'series-9',
+                name: 'Series Nine',
+            })
+        );
+        fixture.detectChanges();
+
+        expect(fixture.debugElement.injector.get(VIEW_IN_PORTAL_HANDOFF)).toBe(
+            fixture.componentInstance
+        );
+        expect(fixture.componentInstance.viewInPortalAvailable()).toBe(true);
+        expect(fixture.componentInstance.viewInPortalPlaylistName()).toBe(
+            'Stalker Portal'
+        );
+    });
+
+    it('navigates to the portal category with openStalkerItem and return state', () => {
+        fixture.componentRef.setInput(
+            'item',
+            buildCollectionItem({
+                contentType: 'series',
+                categoryId: '44',
+                stalkerId: 'series-9',
+                name: 'Series Nine',
+            })
+        );
+        fixture.detectChanges();
+
+        fixture.componentInstance.openInPortal();
+
+        expect(routerNavigate).toHaveBeenCalledWith(
+            ['/workspace', 'stalker', 'stalker-1', 'series', '44'],
+            {
+                state: {
+                    openStalkerItem: expect.objectContaining({
+                        id: 'series-9',
+                        category_id: '44',
+                        title: 'Series Nine',
+                    }),
+                    stalkerReturnTo: '/workspace/global-favorites',
+                    // The portal detail's back affordance steps back through
+                    // history so the collection keeps its tab and open detail.
+                    // Bound to the handed-off item so a later title on the
+                    // same history entry does not inherit it.
+                    stalkerReturnByHistory: 'series-9',
+                },
+            }
+        );
+    });
 });
 
 function buildCollectionItem(
@@ -404,6 +643,26 @@ function buildCollectionItem(
         stalkerId: 'item-1',
         ...overrides,
     };
+}
+
+function buildVodSource(id: string, title: string) {
+    return {
+        id,
+        title,
+        category_id: 'vod',
+        cmd: `/media/file_${id}.mpg`,
+        info: { name: title },
+    };
+}
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
 }
 
 async function settleDetail(

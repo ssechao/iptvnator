@@ -1,9 +1,4 @@
-<section
-    class="settings-group"
-    [class.settings-group--active]="activeSection() === 'general'"
-    id="general"
-    [formGroup]="form()"
->
+<section class="settings-group" id="general" [formGroup]="form()">
     <header class="settings-group__header">
         <div class="settings-group__header-icon">
             <mat-icon>settings</mat-icon>
@@ -115,21 +110,6 @@
 
     <div class="setting-item">
         <div class="setting-item__meta">
-            <h4>{{ 'SETTINGS.SHOW_DASHBOARD' | translate }}</h4>
-            <p>
-                {{ 'SETTINGS.SHOW_DASHBOARD_DESCRIPTION' | translate }}
-            </p>
-        </div>
-        <div class="setting-item__control setting-item__toggle">
-            <mat-checkbox
-                formControlName="showDashboard"
-                data-test-id="toggle-show-dashboard"
-            ></mat-checkbox>
-        </div>
-    </div>
-
-    <div class="setting-item">
-        <div class="setting-item__meta">
             <h4>{{ 'SETTINGS.STARTUP_BEHAVIOR' | translate }}</h4>
             <p>
                 {{ 'SETTINGS.STARTUP_BEHAVIOR_DESCRIPTION' | translate }}
@@ -160,6 +140,42 @@
         </div>
     </div>
 
+    @if (supportsStartupWindowMode()) {
+        <div class="setting-item" data-test-id="startup-window-mode-setting">
+            <div class="setting-item__meta">
+                <h4>{{ 'SETTINGS.STARTUP_WINDOW_MODE' | translate }}</h4>
+                <p>
+                    {{ 'SETTINGS.STARTUP_WINDOW_MODE_DESCRIPTION' | translate }}
+                </p>
+            </div>
+            <div class="setting-item__control">
+                <mat-form-field appearance="outline" subscriptSizing="dynamic">
+                    <mat-label>{{
+                        'SETTINGS.STARTUP_WINDOW_MODE' | translate
+                    }}</mat-label>
+                    <mat-select
+                        formControlName="startupWindowMode"
+                        data-test-id="select-startup-window-mode"
+                    >
+                        @for (
+                            option of startupWindowModeOptions();
+                            track option.value
+                        ) {
+                            <mat-option
+                                [value]="option.value"
+                                [attr.data-test-id]="
+                                    'startup-window-mode-' + option.value
+                                "
+                            >
+                                {{ option.labelKey | translate }}
+                            </mat-option>
+                        }
+                    </mat-select>
+                </mat-form-field>
+            </div>
+        </div>
+    }
+
     <div class="setting-item">
         <div class="setting-item__meta">
             <h4>{{ 'SETTINGS.SHOW_CAPTIONS' | translate }}</h4>
@@ -174,22 +190,58 @@
 
     <div class="setting-item">
         <div class="setting-item__meta">
-            <h4>{{ 'SETTINGS.TMDB_API_KEY' | translate }}</h4>
+            <h4>{{ 'SETTINGS.STRIP_COUNTRY_PREFIX' | translate }}</h4>
             <p>
-                {{ 'SETTINGS.TMDB_API_KEY_DESCRIPTION' | translate }}
+                {{ 'SETTINGS.STRIP_COUNTRY_PREFIX_DESCRIPTION' | translate }}
             </p>
         </div>
-        <div class="setting-item__control">
-            <mat-form-field appearance="outline" subscriptSizing="dynamic">
-                <mat-label>{{ 'SETTINGS.TMDB_API_KEY' | translate }}</mat-label>
-                <input
-                    matInput
-                    type="password"
-                    autocomplete="off"
-                    formControlName="tmdbApiKey"
-                    data-test-id="tmdb-api-key"
-                />
-            </mat-form-field>
+        <div class="setting-item__control setting-item__toggle">
+            <mat-checkbox formControlName="stripCountryPrefix"></mat-checkbox>
         </div>
     </div>
 </section>
+@if (supportsPortalConnectivityGuard()) {
+    <section
+        class="settings-group"
+        [formGroup]="form()"
+        data-test-id="portal-connectivity-setting"
+    >
+        <header class="settings-group__header">
+            <div class="settings-group__header-icon">
+                <mat-icon>hub</mat-icon>
+            </div>
+            <div class="settings-group__header-text">
+                <h3>{{ 'SETTINGS.PORTAL_CONNECTIONS' | translate }}</h3>
+            </div>
+        </header>
+        <div class="setting-item">
+            <div class="setting-item__meta">
+                <h4 id="portal-connectivity-label">
+                    {{ 'SETTINGS.PORTAL_CONNECTIVITY_GUARD' | translate }}
+                </h4>
+                <p id="portal-connectivity-description">
+                    {{
+                        'SETTINGS.PORTAL_CONNECTIVITY_GUARD_DESCRIPTION'
+                            | translate
+                    }}
+                </p>
+                @if (form().get('portalConnectivityGuard')?.value === false) {
+                    <p>
+                        {{
+                            'SETTINGS.PORTAL_CONNECTIVITY_GUARD_DISABLED'
+                                | translate
+                        }}
+                    </p>
+                }
+            </div>
+            <div class="setting-item__control setting-item__toggle">
+                <mat-checkbox
+                    formControlName="portalConnectivityGuard"
+                    aria-labelledby="portal-connectivity-label"
+                    aria-describedby="portal-connectivity-description"
+                    data-test-id="portal-connectivity-toggle"
+                ></mat-checkbox>
+            </div>
+        </div>
+    </section>
+}

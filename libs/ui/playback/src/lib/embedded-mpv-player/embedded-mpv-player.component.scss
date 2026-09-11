@@ -4,17 +4,27 @@
 }
 
 .embedded-mpv-player {
-    --embedded-mpv-accent: var(--mat-sys-primary, #7dd3fc);
-    --embedded-mpv-track: rgba(255, 255, 255, 0.28);
-    --embedded-mpv-thumb-ring: rgba(255, 255, 255, 0.95);
-    --embedded-mpv-glass: color-mix(
+    // The native-view dock is app chrome; overlays over video own a separate
+    // fixed contrast pair. Never mix a dark fallback with inherited app text.
+    --embedded-mpv-accent: var(--app-selection-color);
+    --embedded-mpv-track: color-mix(
         in srgb,
-        var(--mat-sys-surface, #0f1620) 78%,
+        var(--app-on-surface) 28%,
         transparent
     );
-    --embedded-mpv-border: var(
-        --mat-sys-outline-variant,
-        rgba(255, 255, 255, 0.16)
+    --embedded-mpv-thumb-ring: var(--app-widget-bg);
+    --embedded-mpv-glass: var(--app-widget-bg);
+    --embedded-mpv-border: var(--app-separator);
+    --embedded-mpv-text: var(--app-on-surface);
+    --embedded-mpv-text-muted: color-mix(
+        in srgb,
+        var(--app-on-surface) 76%,
+        transparent
+    );
+    --embedded-mpv-disabled: color-mix(
+        in srgb,
+        var(--app-on-surface) 45%,
+        transparent
     );
     --embedded-mpv-controls-height: 64px;
 
@@ -22,7 +32,7 @@
     display: block;
     height: 100%;
     min-height: 0;
-    background: var(--mat-sys-surface);
+    background: #000;
     border-radius: inherit;
     overflow: hidden;
 }
@@ -48,7 +58,21 @@
     position: absolute;
     inset: 0;
     min-height: 0;
-    background: var(--mat-sys-surface);
+    background: #000;
+}
+
+// Frame-copy engine: video frames are painted onto this canvas by the
+// preload frame pump. The helper renders at the aspect-fit size of the
+// video inside the viewport (no letterbox bars are baked into frames), so
+// object-fit: contain centers the content over the black video viewport in
+// both windowed and fullscreen mode.
+.embedded-mpv-player__frame-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: transparent;
 }
 
 .embedded-mpv-player--controls-enabled .embedded-mpv-player__viewport {
@@ -63,14 +87,14 @@
     place-content: center;
     justify-items: center;
     gap: 12px;
-    color: var(--mat-sys-on-surface);
+    color: var(--embedded-mpv-text);
     font-size: 0.85rem;
     pointer-events: none;
     z-index: 1;
 }
 
 .embedded-mpv-player__loader span {
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 80%, transparent);
+    color: var(--embedded-mpv-text-muted);
 }
 
 .embedded-mpv-player__stalled {
@@ -83,12 +107,12 @@
     gap: 14px;
     padding: 24px;
     text-align: center;
-    color: var(--mat-sys-on-surface);
+    color: var(--embedded-mpv-text);
     z-index: 1;
 }
 
-.embedded-mpv-player__stalled mat-icon {
-    color: var(--mat-sys-error);
+.embedded-mpv-player__stalled > mat-icon {
+    color: var(--app-live-color);
     font-size: 36px;
     width: 36px;
     height: 36px;
@@ -97,7 +121,7 @@
 .embedded-mpv-player__stalled p {
     margin: 0;
     max-width: 360px;
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 84%, transparent);
+    color: var(--embedded-mpv-text-muted);
 }
 
 .embedded-mpv-player__feedback {
@@ -109,7 +133,7 @@
     align-items: center;
     gap: 10px;
     padding: 10px 18px;
-    color: var(--mat-sys-on-surface);
+    color: var(--embedded-mpv-text);
     background: color-mix(in srgb, #000 65%, transparent);
     border-radius: 999px;
     font-size: 0.95rem;
@@ -150,7 +174,7 @@
     inset: 16px 16px auto auto;
     max-width: min(60%, 360px);
     padding: 10px 12px;
-    color: var(--mat-sys-on-surface);
+    color: var(--embedded-mpv-text);
     background: var(--embedded-mpv-glass);
     border: 1px solid var(--embedded-mpv-border);
     border-radius: 12px;
@@ -209,7 +233,7 @@
     justify-content: space-between;
     align-items: center;
     gap: 12px;
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 84%, transparent);
+    color: var(--embedded-mpv-text-muted);
     font-size: 0.78rem;
     font-variant-numeric: tabular-nums;
 }
@@ -219,7 +243,7 @@
     align-items: center;
     gap: 6px;
     min-width: 0;
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 78%, transparent);
+    color: var(--embedded-mpv-text-muted);
     font-size: 0.72rem;
     font-variant-numeric: tabular-nums;
 }
@@ -229,7 +253,7 @@
     width: 16px;
     height: 16px;
     font-size: 16px;
-    color: var(--mat-sys-primary);
+    color: var(--embedded-mpv-accent);
 }
 
 .embedded-mpv-player__recording-status span {
@@ -240,12 +264,12 @@
 }
 
 .embedded-mpv-player__recording-status--active {
-    color: var(--mat-sys-error);
+    color: var(--app-live-color);
     font-weight: 700;
 }
 
 .embedded-mpv-player__recording-status--active mat-icon {
-    color: var(--mat-sys-error);
+    color: var(--app-live-color);
 }
 
 .embedded-mpv-player__live-badge {
@@ -254,8 +278,8 @@
     gap: 6px;
     padding: 2px 8px;
     border-radius: 4px;
-    color: var(--mat-sys-on-error);
-    background: var(--mat-sys-error);
+    color: var(--app-widget-bg);
+    background: var(--app-live-color);
     font-size: 0.66rem;
     font-weight: 700;
     letter-spacing: 0.08em;
@@ -279,19 +303,31 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    // Let the actions cell shrink below its content so the inline volume
+    // (a scroll container) clips its own slider instead of pushing the
+    // fullscreen button past the overflow:hidden player edge on narrow
+    // sidebar-constrained widths (viewport wider than the 720px breakpoint).
+    min-width: 0;
 }
 
-.embedded-mpv-player__popover-anchor {
-    position: relative;
+.embedded-mpv-player__volume-group {
     display: flex;
+    align-items: center;
+    min-width: 0;
 }
 
 .embedded-mpv-player__control-button {
     position: relative;
 }
 
+/* A dock panel morphs the whole controls row into a single full-width
+   cell; the strip keeps its fixed height so MPV bounds stay untouched. */
+.embedded-mpv-player__controls--panel {
+    grid-template-columns: minmax(0, 1fr);
+}
+
 .embedded-mpv-player__record-button--active {
-    color: var(--mat-sys-error) !important;
+    color: var(--app-live-color);
 }
 
 .embedded-mpv-player__slider {
@@ -344,8 +380,8 @@
 }
 
 .embedded-mpv-player__slider:disabled::-webkit-slider-thumb {
-    background: rgba(255, 255, 255, 0.45);
-    border-color: rgba(255, 255, 255, 0.6);
+    background: var(--embedded-mpv-disabled);
+    border-color: var(--embedded-mpv-disabled);
     box-shadow: none;
 }
 
@@ -378,125 +414,77 @@
 }
 
 .embedded-mpv-player__slider:disabled::-moz-range-thumb {
-    background: rgba(255, 255, 255, 0.45);
-    border-color: rgba(255, 255, 255, 0.6);
+    background: var(--embedded-mpv-disabled);
+    border-color: var(--embedded-mpv-disabled);
     box-shadow: none;
 }
 
-.embedded-mpv-player__control-panel {
-    min-width: 0;
-    color: var(--mat-sys-on-surface);
-    background: var(--embedded-mpv-glass);
-    border: 1px solid var(--embedded-mpv-border);
-    border-radius: 14px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    backdrop-filter: blur(18px);
+/* Volume expands inline next to the mute icon, inside the actions row —
+   never above the strip, so it needs no compositor workarounds. */
+.embedded-mpv-player__volume-inline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
+    animation: embedded-mpv-volume-in 160ms ease-out;
 }
 
-.embedded-mpv-player__volume-popover {
-    position: absolute;
-    bottom: calc(100% + 6px);
-    right: 0;
-    display: grid;
-    grid-template-columns: minmax(160px, 200px);
-    gap: 4px;
-    padding: 12px 14px 10px;
-    z-index: 3;
+@keyframes embedded-mpv-volume-in {
+    from {
+        max-width: 0;
+        opacity: 0;
+    }
+    to {
+        max-width: 200px;
+        opacity: 1;
+    }
 }
 
-.embedded-mpv-player__volume-popover::before {
-    /* Hover-bridge so the cursor can move from the button to the popover
-       without crossing a dead zone. */
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: -8px;
-    height: 8px;
-}
-
-.embedded-mpv-player__volume-popover .embedded-mpv-player__slider--volume {
-    width: 100%;
+.embedded-mpv-player__volume-inline .embedded-mpv-player__slider--volume {
+    width: 132px;
 }
 
 .embedded-mpv-player__volume-value {
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 80%, transparent);
+    color: var(--embedded-mpv-text-muted);
     font-size: 0.74rem;
     font-variant-numeric: tabular-nums;
-    text-align: right;
+    min-width: 34px;
+    text-align: end;
     white-space: nowrap;
 }
 
-.embedded-mpv-player__audio-popover {
-    position: absolute;
-    bottom: calc(100% + 6px);
-    right: 0;
-    min-width: 220px;
-    max-width: min(420px, 80vw);
-    padding: 10px 12px;
-    z-index: 3;
+// Material-owned icons use their component tokens, including disabled state.
+.embedded-mpv-player__controls {
+    --mat-icon-button-icon-color: var(--embedded-mpv-text);
+    --mat-icon-button-disabled-icon-color: var(--embedded-mpv-disabled);
+    --mat-icon-button-state-layer-color: var(--embedded-mpv-text);
+    color: var(--embedded-mpv-text);
 }
 
-.embedded-mpv-player__menu-title {
-    padding: 0 2px 6px;
-    color: color-mix(in srgb, var(--mat-sys-on-surface) 70%, transparent);
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    white-space: nowrap;
+.embedded-mpv-player__controls button[mat-icon-button]:enabled:hover {
+    background: var(--app-hover-overlay);
 }
 
-.embedded-mpv-player__audio-track-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-height: 240px;
-    overflow-y: auto;
-    scrollbar-width: thin;
+.embedded-mpv-player__controls button[mat-icon-button]:focus-visible {
+    outline: 2px solid var(--embedded-mpv-accent);
+    outline-offset: -2px;
 }
 
-.embedded-mpv-player__audio-track {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 8px 10px;
-    color: var(--mat-sys-on-surface);
-    background: transparent;
-    border: 0;
-    border-radius: 10px;
-    cursor: pointer;
-    font: inherit;
-    text-align: left;
+// These surfaces cover video, so their foreground and scrim stay paired.
+.embedded-mpv-player__loader,
+.embedded-mpv-player__stalled {
+    --embedded-mpv-text: #fff;
+    --embedded-mpv-text-muted: rgba(255, 255, 255, 0.85);
+    background: rgba(0, 0, 0, 0.82);
 }
 
-.embedded-mpv-player__audio-track span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.embedded-mpv-player__stalled button {
+    --mat-button-outlined-label-text-color: #fff;
+    --mat-button-outlined-outline-color: rgba(255, 255, 255, 0.6);
 }
 
-.embedded-mpv-player__audio-track:hover,
-.embedded-mpv-player__audio-track:focus-visible,
-.embedded-mpv-player__audio-track--selected {
-    background: color-mix(in srgb, var(--embedded-mpv-accent) 16%, transparent);
-}
-
-.embedded-mpv-player__audio-track mat-icon {
-    color: var(--embedded-mpv-accent);
-    font-size: 18px;
-    width: 18px;
-    height: 18px;
-}
-
-.embedded-mpv-player :is(button[mat-icon-button]) {
-    color: var(--mat-sys-on-surface);
-}
-
-.embedded-mpv-player :is(button[mat-icon-button]:hover) {
-    color: var(--mat-sys-on-surface);
-    background: color-mix(in srgb, var(--embedded-mpv-accent) 14%, transparent);
+.embedded-mpv-player__feedback {
+    color: #fff;
 }
 
 @media (max-width: 720px) {
@@ -514,9 +502,7 @@
         min-width: 0;
     }
 
-    .embedded-mpv-player__volume-popover,
-    .embedded-mpv-player__audio-popover {
-        right: 0;
-        left: auto;
+    .embedded-mpv-player__volume-inline .embedded-mpv-player__slider--volume {
+        width: 96px;
     }
 }

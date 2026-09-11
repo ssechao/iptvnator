@@ -74,7 +74,9 @@ test.describe('Electron Recently Viewed', () => {
                 'Stable Recent Channel'
             ).first();
             const livePlayer = app.mainWindow
-                .locator('app-unified-live-tab .content-container .video-player')
+                .locator(
+                    'app-unified-live-tab .content-container .video-player'
+                )
                 .first();
 
             await item.click();
@@ -89,7 +91,7 @@ test.describe('Electron Recently Viewed', () => {
         }
     });
 
-    test('tracks M3U recent channels in newest-first order, supports all-playlists scope, and persists favorites after restart', async ({
+    test('@persistence @m3u @electron tracks M3U recent channels in newest-first order, supports all-playlists scope, and persists favorites after restart', async ({
         dataDir,
     }) => {
         const playlistTitle = 'm3u-recent-source.m3u';
@@ -129,7 +131,10 @@ test.describe('Electron Recently Viewed', () => {
                 .poll(() => visibleLiveTitles(app.mainWindow))
                 .toEqual(['Recent Channel Two', 'Recent Channel One']);
 
-            await toggleFavoriteForChannel(app.mainWindow, 'Recent Channel Two');
+            await toggleFavoriteForChannel(
+                app.mainWindow,
+                'Recent Channel Two'
+            );
             await expect
                 .poll(() => visibleLiveTitles(app.mainWindow))
                 .toEqual(['Recent Channel Two', 'Recent Channel One']);
@@ -219,7 +224,7 @@ test.describe('Electron Recently Viewed', () => {
         }
     });
 
-    test('tracks Xtream live, movie, and series history across playlist and all-playlists scope, persists after restart, and supports clearing', async ({
+    test('@persistence @xtream @electron tracks Xtream live, movie, and series history across playlist and all-playlists scope, persists after restart, and supports clearing', async ({
         dataDir,
         request,
     }) => {
@@ -425,7 +430,7 @@ test.describe('Electron Recently Viewed', () => {
         }
     });
 
-    test('tracks Stalker live, movie, and series history across playlist and all-playlists scope, and preserves it after restart', async ({
+    test('@persistence @stalker @electron tracks Stalker live, movie, and series history across playlist and all-playlists scope, and preserves it after restart', async ({
         dataDir,
         request,
     }) => {
@@ -648,9 +653,12 @@ async function expectUnifiedLiveDetailOpen(
 }
 
 async function goBackFromDetail(page: Page): Promise<void> {
+    // Return to the list: browse uses the sticky Back, watch uses the
+    // now-playing bar's direct Back (the sticky watch action is Close player).
     const backButton = page
-        .locator('app-content-hero .hero__back-button')
-        .first();
+        .locator('app-portal-detail-shell')
+        .first()
+        .getByRole('button', { name: 'Back', exact: true });
 
     await expect(backButton).toBeVisible({ timeout: 20000 });
     try {
@@ -677,7 +685,7 @@ async function expectInlineCollectionDetail(
     await expect(page.locator('app-workspace-context-panel')).toHaveCount(0);
     await expect(page.locator('app-content-hero')).toContainText(params.title);
     await expect(
-        page.locator('app-content-hero .hero__back-button').first()
+        page.locator('app-portal-detail-shell .shell__back-button').first()
     ).toBeVisible({ timeout: 20000 });
 }
 

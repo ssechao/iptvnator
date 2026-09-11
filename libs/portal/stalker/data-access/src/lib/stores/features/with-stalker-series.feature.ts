@@ -16,7 +16,9 @@ import {
     StalkerVodSeriesSeason,
 } from '../../models';
 import { StalkerContentTypes } from '../../stalker-content-types';
+import { StalkerPortalRepairService } from '../../stalker-portal-repair.service';
 import { StalkerSessionService } from '../../stalker-session.service';
+import { isStalkerSeriesFlag } from '../../stalker-vod.utils';
 import { StalkerSeriesFeatureStoreContract } from '../stalker-store.contracts';
 import {
     executeStalkerRequest,
@@ -51,7 +53,15 @@ interface StalkerSeriesResponse<T> {
 
 type StalkerSeriesStoreContext = StalkerSeriesFeatureStoreContract;
 
-function extractSeriesItems<T>(response: StalkerSeriesResponse<T>): T[] {
+/**
+ * Strict variant: null when the envelope carried no array at all, so a
+ * malformed answer is distinguishable from a well-formed empty list. The
+ * series watched toggle treats an answered-empty season as loaded, so a
+ * malformed envelope collapsing to [] would silently skip that season.
+ */
+function extractSeriesItemsStrict<T>(
+    response: StalkerSeriesResponse<T>
+): T[] | null {
     if (Array.isArray(response?.js)) {
         return response.js;
     }
@@ -60,7 +70,11 @@ function extractSeriesItems<T>(response: StalkerSeriesResponse<T>): T[] {
         return response.js.data;
     }
 
-    return [];
+    return null;
+}
+
+function extractSeriesItems<T>(response: StalkerSeriesResponse<T>): T[] {
+    return extractSeriesItemsStrict(response) ?? [];
 }
 
 function toMovieId(value: unknown): string {
@@ -81,13 +95,25 @@ export function withStalkerSeries() {
             (
                 store,
                 dataService = inject(DataService),
-                stalkerSession = inject(StalkerSessionService)
+                stalkerSession = inject(StalkerSessionService),
+                portalRepair = inject(StalkerPortalRepairService)
             ) => {
                 const storeContext = store as typeof store &
                     StalkerSeriesStoreContext;
+                // Enrichment patches selectedItem in place. Only provider
+                // identity/mode changes should reload seasons and reset episodes.
+                const vodSeriesMovieId = computed(() => {
+                    const item = storeContext.selectedItem();
+                    return storeContext.selectedContentType() === 'vod' &&
+                        isStalkerSeriesFlag(item?.is_series) &&
+                        item?.id != null
+                        ? String(item.id)
+                        : null;
+                });
                 const requestDeps = {
                     dataService,
                     stalkerSession,
+                    portalRepair,
                 };
 
                 return {
@@ -131,32 +157,14 @@ export function withStalkerSeries() {
                     vodSeriesSeasonsResource: resource({
                         params: () => ({
                             currentPlaylist: storeContext.currentPlaylist(),
-                            selectedItem: storeContext.selectedItem(),
-                            selectedContentType:
-                                storeContext.selectedContentType(),
+                            movieId: vodSeriesMovieId(),
                         }),
                         loader: async ({
                             params,
                         }): Promise<StalkerVodSeriesSeason[]> => {
-                            const { currentPlaylist, selectedItem } = params;
+                            const { currentPlaylist, movieId } = params;
 
-                            logger.debug(
-                                'vodSeriesSeasonsResource loader called',
-                                {
-                                    item: selectedItem,
-                                    isSeries: selectedItem?.is_series,
-                                    currentPlaylist,
-                                }
-                            );
-
-                            if (
-                                !currentPlaylist ||
-                                params.selectedContentType !== 'vod' ||
-                                !selectedItem ||
-                                selectedItem.id === undefined ||
-                                selectedItem.id === null ||
-                                !selectedItem.is_series
-                            ) {
+                            if (!currentPlaylist || movieId === null) {
                                 logger.debug(
                                     'vodSeriesSeasonsResource skipped - conditions not met'
                                 );
@@ -168,7 +176,7 @@ export function withStalkerSeries() {
                             >(requestDeps, currentPlaylist, {
                                 action: StalkerPortalActions.GetOrderedList,
                                 type: 'vod',
-                                movie_id: selectedItem.id,
+                                movie_id: movieId,
                                 p: '1',
                             });
 
@@ -222,13 +230,15 @@ export function withStalkerSeries() {
             (
                 store,
                 dataService = inject(DataService),
-                stalkerSession = inject(StalkerSessionService)
+                stalkerSession = inject(StalkerSessionService),
+                portalRepair = inject(StalkerPortalRepairService)
             ) => {
                 const storeContext = store as typeof store &
                     Pick<StalkerSeriesStoreContext, 'currentPlaylist'>;
                 const requestDeps = {
                     dataService,
                     stalkerSession,
+                    portalRepair,
                 };
 
                 return {
@@ -251,7 +261,16 @@ export function withStalkerSeries() {
                             p: '1',
                         });
 
-                        const episodeItems = extractSeriesItems(response);
+                        // Only a well-formed empty array is a trusted empty
+                        // season. A malformed envelope, or rows in which no
+                        // episode is recognizable, rejects so callers treat
+                        // the load as failed instead of loaded-and-empty.
+                        const episodeItems = extractSeriesItemsStrict(response);
+                        if (episodeItems === null) {
+                            throw new Error(
+                                'Malformed Stalker season episodes response'
+                            );
+                        }
                         if (episodeItems.length === 0) {
                             return [];
                         }
@@ -261,6 +280,11 @@ export function withStalkerSeries() {
                                 (item) => item.is_episode === true
                             )
                         );
+                        if (episodes.length === 0) {
+                            throw new Error(
+                                'Stalker season answered without recognizable episodes'
+                            );
+                        }
 
                         patchState(store, {
                             vodSeriesEpisodes: episodes,

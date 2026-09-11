@@ -18,7 +18,6 @@ Direct signal properties currently exposed by `signalStore`:
 - `selectedVodId: string | undefined`
 - `selectedSerialId: string | undefined`
 - `selectedItvId: string | undefined`
-- `limit: number`
 - `page: number`
 - `searchPhrase: string`
 - `currentPlaylist: PlaylistMeta | undefined`
@@ -37,7 +36,6 @@ Direct signal properties currently exposed by `signalStore`:
 
 ## Public Computed Selectors
 
-- `getTotalPages: number`
 - `getPaginatedContent: StalkerContentItem[]`
 - `isPaginatedContentLoading: boolean`
 - `isPaginatedContentFailed: unknown`
@@ -59,7 +57,23 @@ These are currently reachable on the store object and used internally by compute
 - `getContentResource` (resource)
 - `serialSeasonsResource` (resource)
 - `vodSeriesSeasonsResource` (resource)
-- `makeStalkerRequest(...)`
+
+Removed:
+
+- `makeStalkerRequest(...)` — deleted with the endpoint-discovery work. It
+  was production-dead (no caller outside its own spec) and carried a fourth
+  private copy of the portal-mode branch. Every Stalker request goes through
+  `executeStalkerRequest()` (`stores/utils/stalker-request.utils.ts`), which
+  owns mode routing plus the lazy portal repair; no facade alias is provided
+  because reinstating one would reintroduce the drift the shared predicate
+  exists to prevent.
+- `limit`, `setLimit(...)` and `getTotalPages` — deleted with the catalog
+  pagination removal (#1392, #1395). Catalogs now accumulate server-paged
+  results into one deduplicated list, so `hasMoreContent` (accumulated length
+  vs `total_items`) answers what `getTotalPages` used to, and no caller reads a
+  page size: the portal decides how large a page is. No facade alias is
+  provided, because a surviving `limit` would advertise a client-side window
+  that the append path does not honour.
 
 During refactor:
 
@@ -73,7 +87,6 @@ During refactor:
 - `setSelectedSerialId(id: string): void`
 - `setSelectedVodId(id: string): void`
 - `setSelectedItvId(id: string): void`
-- `setLimit(limit: number): void`
 - `setPage(page: number): void`
 - `setCurrentPlaylist(playlist: PlaylistMeta | undefined): Promise<void>`
 - `setSelectedItem(selectedItem: StalkerVodSource | null | undefined): void`
@@ -123,7 +136,15 @@ Consumer directories sampled:
 
 ## Invariants to Preserve During Refactor
 
-- Selection IDs (`selectedVodId`, `selectedSerialId`, `selectedItvId`) are synchronized in `setSelectedItem`.
+- Selection IDs (`selectedVodId`, `selectedItvId`) are synchronized in `setSelectedItem`.
+- `selectedSerialId` is set only when `selectedContentType` is `series`, and is
+  cleared for every other content type. `serialSeasonsResource` fires a
+  `get_ordered_list&type=series` portal request on each change of that id, and
+  it is the only episode source for a `series` selection — while VOD-context
+  shapes (embedded `series[]`, Ministra `is_series`) resolve their episodes
+  elsewhere, so carrying the id there only wastes a request. The gate must stay
+  on content type alone: gating it on item shape would leave a series-section
+  item that happens to carry `is_series`/`series[]` with an empty episode list.
 - `setSelectedCategory(...)` resets `page` to `0`.
 - `getPaginatedContent()` and `getCategoryResource()` always return arrays,
   even when the underlying request fails.

@@ -9,9 +9,12 @@ import {
 } from '@angular/core';
 import {
     buildStalkerSelectedVodItem,
+    isStalkerSeriesFlag,
+    StalkerLinkFlagSource,
     StalkerStore,
     StalkerVodSource,
 } from '@iptvnator/portal/stalker/data-access';
+import { PlaybackPositionRuntimeBridgeService } from '@iptvnator/services';
 import {
     PortalCatalogItemProgress,
     PortalCatalogPlaylistMeta,
@@ -27,8 +30,7 @@ function calculateProgress(position: PlaybackPositionData | undefined): number {
         return 0;
     }
 
-    const percent =
-        (position.positionSeconds / position.durationSeconds) * 100;
+    const percent = (position.positionSeconds / position.durationSeconds) * 100;
 
     if (position.positionSeconds > 10 && percent < 1) {
         return 1;
@@ -38,43 +40,63 @@ function calculateProgress(position: PlaybackPositionData | undefined): number {
 }
 
 @Injectable()
-export class StalkerCatalogFacadeService
-    implements
-        StalkerPortalCatalogFacade<
-            Record<string, unknown>,
-            StalkerVodSource,
-            StalkerVodSource
-        >
-{
+export class StalkerCatalogFacadeService implements StalkerPortalCatalogFacade<
+    Record<string, unknown>,
+    StalkerVodSource,
+    StalkerVodSource
+> {
     private readonly stalkerStore = inject(StalkerStore);
     private readonly playbackPositions = inject(PORTAL_PLAYBACK_POSITIONS);
-    private readonly destroyRef = inject(DestroyRef);
-    private readonly stalkerPositions = signal<Map<string, PlaybackPositionData>>(
-        new Map()
+    private readonly playbackPositionBridge = inject(
+        PlaybackPositionRuntimeBridgeService
     );
+    private readonly destroyRef = inject(DestroyRef);
+    private readonly stalkerPositions = signal<
+        Map<string, PlaybackPositionData>
+    >(new Map());
     private readonly stalkerSeriesPositions = signal<
         Map<number, PlaybackPositionData[]>
     >(new Map());
     private loadedPositionsForPlaylistId: string | null = null;
+    // Latest-load-wins: a positions fetch superseded while in flight must
+    // not patch the maps with another playlist's rows.
+    private positionsLoadGeneration = 0;
 
     readonly provider = 'stalker' as const;
-    readonly pageSizeOptions = [14] as const;
     readonly contentType = this.stalkerStore.selectedContentType;
-    readonly limit = this.stalkerStore.limit;
-    readonly pageIndex = this.stalkerStore.page;
     readonly selectedCategory = this.stalkerStore.getSelectedCategory;
     readonly paginatedContent = computed(
         () => this.stalkerStore.getPaginatedContent() ?? []
     );
     readonly selectedItem = this.stalkerStore.selectedItem;
-    readonly totalPages = this.stalkerStore.getTotalPages;
-    readonly isPaginatedContentLoading =
-        this.stalkerStore.isPaginatedContentLoading;
+    /**
+     * The store's loading flag covers every portal page; the grid skeleton
+     * belongs to the first page only — appends surface as the tail spinner.
+     */
+    readonly isPaginatedContentLoading = computed(
+        () =>
+            this.stalkerStore.isPaginatedContentLoading() &&
+            this.stalkerStore.page() === 0
+    );
+    readonly isAppending = computed(
+        () =>
+            this.stalkerStore.isPaginatedContentLoading() &&
+            this.stalkerStore.page() > 0
+    );
+    readonly hasMore = this.stalkerStore.hasMoreContent;
+    readonly appendError = this.stalkerStore.hasContentAppendError;
+    /**
+     * Scroll offsets per list identity for inline-detail round trips. The
+     * accumulated portal pages already survive in the store (same-category
+     * re-initialisation is a no-op), so only the offset needs a home here.
+     * Bounded like the Xtream store's snapshot list.
+     */
+    private readonly savedScrollPositions = new Map<string, number>();
     readonly selectedCategoryTitle = computed(() => {
         const category = this.selectedCategory();
-        const fromCategory = String(
-            category?.['category_name'] ?? category?.['name'] ?? ''
-        );
+        const fromCategory = category
+            ? String(category.category_name ?? '')
+            : '';
 
         if (fromCategory) {
             return fromCategory;
@@ -119,13 +141,20 @@ export class StalkerCatalogFacadeService
             }
 
             this.loadedPositionsForPlaylistId = playlistId;
-            void this.loadStalkerPositions(playlistId);
+            void this.loadStalkerPositions(playlistId).catch(() => {
+                // Allow a retry on the next playlist activation; the read
+                // now rejects instead of masquerading as an empty list.
+                this.loadedPositionsForPlaylistId = null;
+            });
         });
 
-        if (window.electron?.onPlaybackPositionUpdate) {
-            const unsubscribe = window.electron.onPlaybackPositionUpdate(
+        const unsubscribe =
+            this.playbackPositionBridge.onPlaybackPositionUpdate(
                 (data: PlaybackPositionData) => {
-                    if (data.playlistId !== this.playlist()?.id) {
+                    if (
+                        !data.playlistId ||
+                        data.playlistId !== this.playlist()?.id
+                    ) {
                         return;
                     }
 
@@ -138,18 +167,14 @@ export class StalkerCatalogFacadeService
                         this.updateVodPlaybackPosition(data);
                     }
 
-                    if (
-                        data.contentType === 'episode' &&
-                        data.seriesXtreamId
-                    ) {
+                    if (data.contentType === 'episode' && data.seriesXtreamId) {
                         this.updateSeriesPlaybackPosition(data);
                     }
                 }
             );
 
-            if (typeof unsubscribe === 'function') {
-                this.destroyRef.onDestroy(unsubscribe);
-            }
+        if (unsubscribe) {
+            this.destroyRef.onDestroy(unsubscribe);
         }
     }
 
@@ -171,12 +196,47 @@ export class StalkerCatalogFacadeService
         this.stalkerStore.setSearchPhrase(query);
     }
 
-    setPage(page: number): void {
-        this.stalkerStore.setPage(page);
+    loadMore(): void {
+        if (
+            this.stalkerStore.isPaginatedContentLoading() ||
+            // A failed append blocks further paging — skipping past the
+            // failed portal page would leave a silent hole in the list; the
+            // grid tail's retry re-runs it instead.
+            this.stalkerStore.hasContentAppendError() ||
+            !this.stalkerStore.hasMoreContent()
+        ) {
+            return;
+        }
+
+        this.stalkerStore.nextPage();
     }
 
-    setLimit(limit: number): void {
-        this.stalkerStore.setLimit(limit);
+    retryAppend(): void {
+        void this.stalkerStore.retryContentPage();
+    }
+
+    saveScrollPosition(scrollTop: number): void {
+        const key = this.scrollIdentity();
+        // Re-insert so Map order stays oldest-first for the bound below.
+        this.savedScrollPositions.delete(key);
+        this.savedScrollPositions.set(key, scrollTop);
+        if (this.savedScrollPositions.size > 8) {
+            const oldestKey = this.savedScrollPositions.keys().next().value;
+            if (oldestKey !== undefined) {
+                this.savedScrollPositions.delete(oldestKey);
+            }
+        }
+    }
+
+    consumeSavedScrollPosition(): number | null {
+        const key = this.scrollIdentity();
+        const saved = this.savedScrollPositions.get(key);
+        if (saved === undefined) {
+            return null;
+        }
+
+        this.savedScrollPositions.delete(key);
+        return saved;
     }
 
     setContentSortMode(mode: PortalCatalogSortMode): void {
@@ -184,15 +244,30 @@ export class StalkerCatalogFacadeService
         // Stalker catalog content is server-paginated and does not support local sort modes.
     }
 
+    private scrollIdentity(): string {
+        return [
+            // The playlist belongs to the identity: the route provider (and
+            // this map with it) survives a same-config portal switch, and a
+            // portal A offset must never restore onto portal B's catalog.
+            this.stalkerStore.currentPlaylist()?._id ?? '',
+            this.stalkerStore.selectedContentType(),
+            String(this.stalkerStore.selectedCategoryId() ?? ''),
+            this.stalkerStore.searchPhrase(),
+        ].join('|');
+    }
+
     selectItem(item: StalkerVodSource): string[] | null {
         const needsSeriesFetch =
-            this.contentType() === 'vod' &&
-            (item.is_series === '1' || item.is_series === 1);
+            this.contentType() === 'vod' && isStalkerSeriesFlag(item.is_series);
 
         this.stalkerStore.setSelectedItem(
             buildStalkerSelectedVodItem(item, needsSeriesFetch)
         );
         return null;
+    }
+
+    refreshSnapshotSelection(): void {
+        void this.stalkerStore.refreshEmbeddedSeriesSelection();
     }
 
     getItemProgress(item: StalkerVodSource): PortalCatalogItemProgress {
@@ -206,8 +281,7 @@ export class StalkerCatalogFacadeService
         );
         const isSeries =
             this.contentType() === 'series' ||
-            item.is_series === '1' ||
-            item.is_series === 1;
+            isStalkerSeriesFlag(item.is_series);
 
         if (hasSeriesProgress) {
             return { hasSeriesProgress: true };
@@ -249,9 +323,17 @@ export class StalkerCatalogFacadeService
     async fetchLinkToPlay(
         portalUrl: string,
         macAddress: string,
-        cmd: string
+        cmd: string,
+        series?: number,
+        linkFlags?: StalkerLinkFlagSource | null
     ): Promise<string> {
-        return this.stalkerStore.fetchLinkToPlay(portalUrl, macAddress, cmd);
+        return this.stalkerStore.fetchLinkToPlay(
+            portalUrl,
+            macAddress,
+            cmd,
+            series,
+            linkFlags
+        );
     }
 
     resolveVodPlayback(
@@ -270,9 +352,26 @@ export class StalkerCatalogFacadeService
         );
     }
 
+    /**
+     * Re-read persisted positions after a renderer-initiated mutation (the
+     * season watched batch or a single toggle): the once-per-playlist load
+     * cannot see them and the runtime bridge only pushes external-player
+     * updates, so grid progress badges would stay stale on return.
+     */
+    async refreshPositions(playlistId: string): Promise<void> {
+        if (this.playlist()?.id !== playlistId) {
+            return;
+        }
+        await this.loadStalkerPositions(playlistId);
+    }
+
     private async loadStalkerPositions(playlistId: string): Promise<void> {
+        const generation = ++this.positionsLoadGeneration;
         const positions =
             await this.playbackPositions.getAllPlaybackPositions(playlistId);
+        if (generation !== this.positionsLoadGeneration) {
+            return;
+        }
 
         const positionsMap = new Map<string, PlaybackPositionData>();
         const seriesMap = new Map<number, PlaybackPositionData[]>();

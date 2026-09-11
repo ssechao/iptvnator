@@ -7,16 +7,30 @@ import {
     Page,
     test as base,
 } from '@playwright/test';
+import { spawn } from 'child_process';
 import { createServer, Server } from 'http';
 import {
+    accessSync,
+    constants as fsConstants,
     existsSync,
     mkdtempSync,
+    readdirSync,
     readFileSync,
     rmSync,
+    statSync,
     writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
+import {
+    dataDirPrefix,
+    reapOrphanedDataDirs,
+    writeDataDirOwnerMarker,
+} from './data-dir-reaper';
+import {
+    closeElectronApplicationAndConfirmExit,
+    prepareElectronApplication,
+} from './electron-process-lifecycle';
 
 export const workspaceRoot = resolve(__dirname, '../../..');
 export const electronMainPath = join(
@@ -40,6 +54,10 @@ export const defaultStalkerPortalName = 'Mock Stalker Portal';
 export const defaultXtreamUsername = 'user1';
 export const defaultXtreamPassword = 'pass1';
 export const defaultStalkerMacAddress = '00:1A:79:00:00:01';
+const electronAppCloseTimeoutMs = Number(
+    process.env['IPTVNATOR_E2E_CLOSE_TIMEOUT_MS'] ?? '10000'
+);
+const electronAppKillWaitMs = 2000;
 
 export type PortalProvider = 'stalker' | 'xtream';
 
@@ -47,7 +65,10 @@ export type M3uTestChannel = {
     groupTitle?: string;
     logo?: string;
     name: string;
+    radio?: boolean;
+    tvgCountry?: string;
     tvgId?: string;
+    tvgLanguage?: string;
     tvgName?: string;
     url: string;
 };
@@ -63,8 +84,17 @@ type ElectronFixtures = {
     dataDir: string;
 };
 
-type LaunchElectronAppOptions = {
+export type LaunchElectronAppOptions = {
+    /** Electron/Chromium switches — they must precede the entry point. */
+    args?: readonly string[];
+    /**
+     * Arguments for the app itself, appended *after* the entry point so they
+     * land in `process.argv` the way a file-association launch does.
+     */
+    appArgs?: readonly string[];
+    environmentInheritance?: 'all' | 'runtime-only';
     env?: Record<string, string | undefined>;
+    omitEnvKeys?: readonly string[];
 };
 
 export type PortalDebugEvent = {
@@ -107,18 +137,78 @@ export type LaunchedElectronApp = {
     mainWindow: Page;
 };
 
+export type CompetingElectronInstanceResult = {
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    stderr: string;
+    timedOut: boolean;
+};
+
+const competingInstanceStderrLimit = 4000;
+
+/**
+ * Removes a run's data directory, tolerating handles the OS has not released
+ * yet.
+ *
+ * Electron's single-instance lock keeps `SingletonLock`/`SingletonSocket`
+ * (`lockfile` on Windows) open for the whole process lifetime, and Windows
+ * releases those handles asynchronously as the process dies — so a removal
+ * issued right after `closeElectronApp` can still hit EBUSY. This is throwaway
+ * temp state, so a stubborn directory is a warning, never a test failure.
+ */
+function removeDataDir(dataDir: string): void {
+    try {
+        rmSync(dataDir, {
+            force: true,
+            maxRetries: 20,
+            recursive: true,
+            retryDelay: 250,
+        });
+    } catch (error) {
+        console.warn(`Could not remove E2E data dir ${dataDir}:`, error);
+    }
+}
+
+let reapedOrphanedDataDirs = false;
+
 export const test = base.extend<ElectronFixtures>({
     dataDir: async ({ browserName }, use) => {
         void browserName;
-        const dataDir = mkdtempSync(join(tmpdir(), 'iptvnator-electron-e2e-'));
+        if (!reapedOrphanedDataDirs) {
+            reapedOrphanedDataDirs = true;
+            reapOrphanedDataDirs();
+        }
+        const dataDir = mkdtempSync(join(tmpdir(), dataDirPrefix));
+        writeDataDirOwnerMarker(dataDir);
 
         await use(dataDir);
 
-        rmSync(dataDir, { force: true, recursive: true });
+        removeDataDir(dataDir);
     },
 });
 
 export { expect };
+
+/**
+ * Builds the argv every locally launched Electron process must share.
+ *
+ * Headless Linux CI has no usable sandbox or GPU, and an Electron started
+ * without these flags there dies on a signal instead of running — so any
+ * helper that spawns the app itself has to use the same list. `appArgs` land
+ * after the entry point, which is where the OS puts an opened file's path.
+ */
+function buildElectronLaunchArgs(
+    extraArgs: readonly string[] = [],
+    appArgs: readonly string[] = []
+): string[] {
+    const args = [...extraArgs, electronMainPath, ...appArgs];
+
+    if (process.platform === 'linux' && process.env['CI']) {
+        args.unshift('--no-sandbox', '--disable-gpu');
+    }
+
+    return args;
+}
 
 export async function launchElectronApp(
     dataDir: string,
@@ -131,28 +221,240 @@ export async function launchElectronApp(
     }
     assertPackagedRendererBuildIsElectronSafe();
 
-    const args = [electronMainPath];
-
-    if (process.platform === 'linux' && process.env['CI']) {
-        args.unshift('--no-sandbox', '--disable-gpu');
-    }
+    const args = buildElectronLaunchArgs(options.args, options.appArgs);
 
     const electronApp = await electron.launch({
         args,
+        env: buildElectronLaunchEnvironment(dataDir, options),
+    });
+    return prepareElectronApplication({
+        application: electronApp,
+        dispose: (application) =>
+            closeElectronApplicationAndConfirmExit(application, {
+                closeTimeoutMs: electronAppCloseTimeoutMs,
+                exitTimeoutMs: electronAppKillWaitMs,
+            }),
+        prepare: async (application) => {
+            attachElectronProcessDiagnostics(application);
+            const mainWindow = await findMainWindow(application);
+            await waitForAppReady(mainWindow);
+            await startPortalDebugCapture(mainWindow);
+            await startDbOperationCapture(mainWindow);
+            await startRendererFrameCapture(mainWindow);
+            return {
+                electronApp: application,
+                mainWindow,
+            };
+        },
+    });
+}
+
+export function buildElectronLaunchEnvironment(
+    dataDir: string,
+    options: LaunchElectronAppOptions = {},
+    inheritedEnvironment: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+    if (
+        options.environmentInheritance !== undefined &&
+        options.environmentInheritance !== 'all' &&
+        options.environmentInheritance !== 'runtime-only'
+    ) {
+        throw new Error('Electron environment inheritance mode is invalid');
+    }
+    const runtimeOnly = options.environmentInheritance === 'runtime-only';
+    const environment: Record<string, string | undefined> = {
+        ...(runtimeOnly
+            ? selectElectronRuntimeEnvironment(inheritedEnvironment)
+            : inheritedEnvironment),
+        // Electron E2E uses local mock HTTP servers for playlists, portals, and EPG sources.
+        IPTVNATOR_ALLOW_PRIVATE_NETWORK_URLS: runtimeOnly
+            ? '1'
+            : (inheritedEnvironment['IPTVNATOR_ALLOW_PRIVATE_NETWORK_URLS'] ??
+              '1'),
+        ...options.env,
+        ELECTRON_IS_DEV: '0',
+        IPTVNATOR_E2E_DATA_DIR: dataDir,
+        NODE_ENV: 'test',
+    };
+    for (const key of options.omitEnvKeys ?? []) {
+        delete environment[key];
+    }
+    return Object.fromEntries(
+        Object.entries(environment).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string'
+        )
+    );
+}
+
+export const ELECTRON_RUNTIME_ENVIRONMENT_KEYS = Object.freeze([
+    'APPDATA',
+    'COMSPEC',
+    'DBUS_SESSION_BUS_ADDRESS',
+    'DISPLAY',
+    'HOME',
+    'LANG',
+    'LANGUAGE',
+    'LC_ALL',
+    'LC_CTYPE',
+    'LOCALAPPDATA',
+    'LOGNAME',
+    'PATH',
+    'PATHEXT',
+    'SYSTEMROOT',
+    'TEMP',
+    'TMP',
+    'TMPDIR',
+    'USER',
+    'USERPROFILE',
+    'WAYLAND_DISPLAY',
+    'WINDIR',
+    'XAUTHORITY',
+    'XDG_RUNTIME_DIR',
+    'XDG_SESSION_TYPE',
+    '__CF_USER_TEXT_ENCODING',
+] as const);
+
+function selectElectronRuntimeEnvironment(
+    inheritedEnvironment: NodeJS.ProcessEnv
+): Record<string, string> {
+    const selected: Record<string, string> = {};
+    const allowed = new Set(
+        ELECTRON_RUNTIME_ENVIRONMENT_KEYS.map((key) => key.toUpperCase())
+    );
+    for (const [key, value] of Object.entries(inheritedEnvironment)) {
+        if (typeof value === 'string' && allowed.has(key.toUpperCase())) {
+            selected[key] = value;
+        }
+    }
+    return selected;
+}
+
+/**
+ * Resolve the x64 unpacked Linux executable produced by electron-builder.
+ * An explicit path wins so CI can point at an AppImage/Flatpak extraction
+ * without relying on electron-builder's local output directory names.
+ */
+export function resolvePackagedLinuxExecutable(
+    explicitPath = process.env['IPTVNATOR_E2E_PACKAGED_EXECUTABLE']
+): string | undefined {
+    if (explicitPath?.trim()) {
+        return resolve(explicitPath.trim());
+    }
+
+    const executablesRoot = join(workspaceRoot, 'dist', 'executables');
+    if (!existsSync(executablesRoot)) {
+        return undefined;
+    }
+
+    const unpackedDirectories = readdirSync(executablesRoot, {
+        withFileTypes: true,
+    })
+        .filter(
+            (entry) =>
+                entry.isDirectory() &&
+                entry.name.startsWith('linux') &&
+                entry.name.endsWith('-unpacked') &&
+                !entry.name.includes('arm')
+        )
+        .sort((left, right) => {
+            const leftPriority = left.name === 'linux-unpacked' ? 0 : 1;
+            const rightPriority = right.name === 'linux-unpacked' ? 0 : 1;
+            return (
+                leftPriority - rightPriority ||
+                left.name.localeCompare(right.name)
+            );
+        });
+
+    for (const directory of unpackedDirectories) {
+        for (const executableName of ['IPTVnator', 'iptvnator']) {
+            const candidate = join(
+                executablesRoot,
+                directory.name,
+                executableName
+            );
+            try {
+                accessSync(candidate, fsConstants.X_OK);
+                if (statSync(candidate).isFile()) {
+                    return candidate;
+                }
+            } catch {
+                // Keep looking for the next unpacked x64 layout.
+            }
+        }
+    }
+
+    return undefined;
+}
+
+export function getPackagedLinuxNativeDir(executablePath: string): string {
+    return join(
+        dirname(resolve(executablePath)),
+        'resources',
+        'app.asar.unpacked',
+        'electron-backend',
+        'native'
+    );
+}
+
+export function resolvePackagedElectronLaunchArgs(
+    getuid: (() => number) | undefined
+): string[] {
+    const args = ['--ignore-gpu-blocklist'];
+    if (typeof getuid === 'function' && getuid() === 0) {
+        args.push('--no-sandbox');
+    }
+    return args;
+}
+
+/**
+ * Launch a real packaged Linux executable. Unlike the regular source E2E
+ * launcher, this deliberately keeps Chromium's GPU path enabled and ignores
+ * its GPU blocklist: the frame-copy smoke sets LIBGL_ALWAYS_SOFTWARE=1, and
+ * CI's llvmpipe WebGL2 context must prove that the shared-memory frame reaches
+ * the renderer canvas.
+ */
+export async function launchPackagedElectronApp(
+    executablePath: string,
+    dataDir: string,
+    options: LaunchElectronAppOptions = {}
+): Promise<LaunchedElectronApp> {
+    if (process.platform !== 'linux') {
+        throw new Error(
+            'The packaged embedded-MPV launcher is available on Linux only.'
+        );
+    }
+
+    const resolvedExecutablePath = resolve(executablePath);
+    try {
+        accessSync(resolvedExecutablePath, fsConstants.X_OK);
+        if (!statSync(resolvedExecutablePath).isFile()) {
+            throw new Error('not a regular file');
+        }
+    } catch (error) {
+        throw new Error(
+            `Packaged Linux executable is not a regular executable file at ${resolvedExecutablePath}: ${
+                error instanceof Error ? error.message : String(error)
+            }`
+        );
+    }
+
+    const electronApp = await electron.launch({
+        executablePath: resolvedExecutablePath,
+        args: resolvePackagedElectronLaunchArgs(process.getuid),
         env: {
             ...process.env,
+            IPTVNATOR_ALLOW_PRIVATE_NETWORK_URLS:
+                process.env['IPTVNATOR_ALLOW_PRIVATE_NETWORK_URLS'] ?? '1',
             ...options.env,
             ELECTRON_IS_DEV: '0',
             IPTVNATOR_E2E_DATA_DIR: dataDir,
             NODE_ENV: 'test',
         },
     });
+    attachElectronProcessDiagnostics(electronApp);
 
     const mainWindow = await findMainWindow(electronApp);
     await waitForAppReady(mainWindow);
-    await startPortalDebugCapture(mainWindow);
-    await startDbOperationCapture(mainWindow);
-    await startRendererFrameCapture(mainWindow);
 
     return {
         electronApp,
@@ -160,13 +462,175 @@ export async function launchElectronApp(
     };
 }
 
+function attachElectronProcessDiagnostics(
+    electronApp: ElectronApplication
+): void {
+    if (!process.env['CI']) {
+        return;
+    }
+
+    const childProcess = electronApp.process();
+
+    childProcess.stdout?.on('data', (chunk: Buffer) => {
+        console.log(`[electron stdout] ${chunk.toString().trimEnd()}`);
+    });
+    childProcess.stderr?.on('data', (chunk: Buffer) => {
+        console.error(`[electron stderr] ${chunk.toString().trimEnd()}`);
+    });
+    childProcess.once('exit', (code, signal) => {
+        console.log(
+            `[electron process exit] code=${code ?? '<null>'} signal=${
+                signal ?? '<null>'
+            }`
+        );
+    });
+}
+
+/**
+ * Starts a raw second Electron process against an already-running instance's
+ * data directory and reports how it terminated.
+ *
+ * Deliberately not `launchElectronApp`: the expected outcome is that no window
+ * is ever created, because the single-instance guard hands the launch over to
+ * the running app. Two live instances would share a Chromium profile whose
+ * IndexedDB only one of them can lock, which is how settings silently stopped
+ * persisting (issues #102, #1156).
+ */
+export async function launchCompetingElectronInstance(
+    dataDir: string,
+    options: {
+        /** Arguments for the app itself, e.g. a playlist path to open. */
+        appArgs?: readonly string[];
+        timeoutMs?: number;
+    } = {}
+): Promise<CompetingElectronInstanceResult> {
+    const { appArgs = [], timeoutMs = 30000 } = options;
+    // In a Node context the `electron` package resolves to its binary path.
+    const electronBinaryPath = require('electron') as unknown as string;
+    const child = spawn(
+        electronBinaryPath,
+        buildElectronLaunchArgs([], appArgs),
+        {
+            env: {
+                ...process.env,
+                ELECTRON_IS_DEV: '0',
+                IPTVNATOR_E2E_DATA_DIR: dataDir,
+                NODE_ENV: 'test',
+            },
+            stdio: ['ignore', 'ignore', 'pipe'],
+        }
+    );
+
+    // Kept for the assertion message: a competing launch that dies for an
+    // unrelated reason (missing sandbox, missing GPU) looks exactly like a
+    // refused one from the outside.
+    let stderr = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(
+            -competingInstanceStderrLimit
+        );
+    });
+
+    return new Promise((resolvePromise) => {
+        const timer = setTimeout(() => {
+            child.kill();
+            resolvePromise({
+                exitCode: null,
+                signal: null,
+                stderr,
+                timedOut: true,
+            });
+        }, timeoutMs);
+
+        child.once('exit', (code, signal) => {
+            clearTimeout(timer);
+            resolvePromise({
+                exitCode: code,
+                signal,
+                stderr,
+                timedOut: false,
+            });
+        });
+    });
+}
+
 export async function closeElectronApp(
     app: LaunchedElectronApp
 ): Promise<void> {
     try {
-        await app.electronApp.close();
+        const closePromise = app.electronApp.close();
+        const closed = await waitForPromiseWithTimeout(
+            closePromise,
+            electronAppCloseTimeoutMs
+        );
+
+        if (closed) {
+            return;
+        }
+
+        console.warn(
+            `Electron app did not close within ${electronAppCloseTimeoutMs}ms; killing process`
+        );
+        const childProcess = app.electronApp.process();
+
+        if (!childProcess.killed) {
+            childProcess.kill();
+        }
+
+        await waitForPromiseWithTimeout(
+            closePromise.catch(() => undefined),
+            electronAppKillWaitMs
+        );
+
+        // SIGTERM asks Electron for a graceful quit, which the app can
+        // legitimately refuse — the unsaved-settings close guard cancels the
+        // quit while it waits for an answer. A process that survives here
+        // would outlive the test, hold its data dir, and time out the worker
+        // teardown, so escalate to SIGKILL.
+        if (
+            childProcess.exitCode === null &&
+            childProcess.signalCode === null
+        ) {
+            console.warn(
+                'Electron app survived SIGTERM; escalating to SIGKILL'
+            );
+            childProcess.kill('SIGKILL');
+            await waitForPromiseWithTimeout(
+                closePromise.catch(() => undefined),
+                electronAppKillWaitMs
+            );
+        }
     } catch (error) {
         console.warn('Failed to close Electron app cleanly:', error);
+    }
+}
+
+export async function closeElectronAppAndConfirmExit(
+    app: LaunchedElectronApp
+): Promise<void> {
+    await closeElectronApplicationAndConfirmExit(app.electronApp, {
+        closeTimeoutMs: electronAppCloseTimeoutMs,
+        exitTimeoutMs: electronAppKillWaitMs,
+    });
+}
+
+async function waitForPromiseWithTimeout(
+    promise: Promise<unknown>,
+    timeoutMs: number
+): Promise<boolean> {
+    let timeoutId: NodeJS.Timeout | undefined;
+
+    try {
+        return await Promise.race([
+            promise.then(() => true),
+            new Promise<boolean>((resolvePromise) => {
+                timeoutId = setTimeout(() => resolvePromise(false), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+        }
     }
 }
 
@@ -219,11 +683,11 @@ async function waitForAppReady(page: Page): Promise<void> {
     } catch (error) {
         const diagnostics = await page.evaluate(() => ({
             appRootLength:
-                document.querySelector('app-root')?.innerHTML.trim().length ?? 0,
+                document.querySelector('app-root')?.innerHTML.trim().length ??
+                0,
             baseHref:
-                document
-                    .querySelector('base')
-                    ?.getAttribute('href') ?? '<missing>',
+                document.querySelector('base')?.getAttribute('href') ??
+                '<missing>',
             readyState: document.readyState,
             title: document.title,
             url: location.href,
@@ -273,13 +737,13 @@ export async function importM3uPlaylistFromNativeDialog(
     await clickDialogCategoryOption(dialog, /^m3u$/i);
     await clickDialogSubtypeOption(
         dialog,
-        /add\s+via\s+file\s+upload/i,
+        /m3u\s*file|add\s+via\s+file\s+upload/i,
         'mat-button-toggle[value="file"]'
     );
     const fileInput = dialog.locator('input[type="file"][name="playlist"]');
 
     await fileInput.evaluate((element, selectedFilePath) => {
-        (element as HTMLInputElement).dataset.filePathOverride =
+        (element as HTMLInputElement).dataset['filePathOverride'] =
             selectedFilePath;
     }, filePath);
     await fileInput.setInputFiles(filePath);
@@ -364,7 +828,7 @@ export async function addXtreamPortal(
     const dialog = await getActiveDialog(page);
     await clickDialogCategoryOption(
         dialog,
-        /^xtream$/i,
+        /xtream(\s+credentials)?/i,
         'mat-button-toggle[value="xtream"]'
     );
 
@@ -409,57 +873,48 @@ async function setInputValue(input: Locator, value: string): Promise<void> {
     await expect(input).toHaveValue(value);
 }
 
-async function clickDialogCategoryOption(
+/**
+ * Pick a source method on the Add Playlist dialog. Since v0.22 the dialog
+ * exposes a single flat 5-card radiogroup ("M3U URL", "M3U file", "Xtream
+ * credentials", "Stalker portal", "Raw m3u text") instead of the legacy
+ * 2-level category × subtype tabs/toggles. The helper still falls through
+ * to the old tab/button/legacy-selector lookups so we don't have to rewrite
+ * every call-site on each redesign — but the radio-based picker is the
+ * primary path now.
+ */
+async function clickDialogMethodOption(
     dialog: Locator,
     label: RegExp,
     legacySelector?: string
 ): Promise<void> {
-    await clickDialogSegmentedOption(
-        dialog,
+    const optionByRadio = dialog.getByRole('radio', { name: label }).first();
+    if ((await optionByRadio.count()) > 0) {
+        await optionByRadio.click();
+        return;
+    }
+
+    for (const tablistLabel of [
+        'Source method',
         'Playlist category',
-        label,
-        legacySelector
-    );
-}
-
-async function clickDialogSubtypeOption(
-    dialog: Locator,
-    label: RegExp,
-    legacySelector?: string
-): Promise<void> {
-    await clickDialogSegmentedOption(
-        dialog,
         'M3U source',
-        label,
-        legacySelector
-    );
-}
-
-async function clickDialogSegmentedOption(
-    dialog: Locator,
-    tablistLabel: string,
-    label: RegExp,
-    legacySelector?: string
-): Promise<void> {
-    const tablist = dialog
-        .locator(`[role="tablist"][aria-label="${tablistLabel}"]`)
-        .first();
-
-    if ((await tablist.count()) > 0) {
-        const optionByTabRole = tablist
-            .getByRole('tab', { name: label })
+    ]) {
+        const tablist = dialog
+            .locator(`[role="tablist"][aria-label="${tablistLabel}"]`)
             .first();
-
-        if ((await optionByTabRole.count()) > 0) {
-            await optionByTabRole.click();
-            return;
+        if ((await tablist.count()) > 0) {
+            const optionByTabRole = tablist
+                .getByRole('tab', { name: label })
+                .first();
+            if ((await optionByTabRole.count()) > 0) {
+                await optionByTabRole.click();
+                return;
+            }
         }
     }
 
     const optionByGlobalTabRole = dialog
         .getByRole('tab', { name: label })
         .first();
-
     if ((await optionByGlobalTabRole.count()) > 0) {
         await optionByGlobalTabRole.click();
         return;
@@ -468,19 +923,44 @@ async function clickDialogSegmentedOption(
     const optionByButtonRole = dialog
         .getByRole('button', { name: label })
         .first();
-
     if ((await optionByButtonRole.count()) > 0) {
         await optionByButtonRole.click();
         return;
     }
 
     if (!legacySelector) {
-        throw new Error(
-            `Could not find dialog option matching ${label} in "${tablistLabel}".`
-        );
+        throw new Error(`Could not find dialog option matching ${label}.`);
     }
 
     await dialog.locator(legacySelector).click();
+}
+
+// Backwards-compat shims for the legacy two-step flow. Both helpers now route
+// through `clickDialogMethodOption` and use the patterns of the new flat
+// picker. `clickDialogCategoryOption` is a no-op for "M3U" since the new
+// picker has no parent "M3U" tile — callers immediately follow up with a
+// `clickDialogSubtypeOption` which picks the concrete M3U URL/file/text card.
+async function clickDialogCategoryOption(
+    dialog: Locator,
+    label: RegExp,
+    legacySelector?: string
+): Promise<void> {
+    // The legacy "M3U" category is now implicit — the new picker has no
+    // standalone "M3U" radio; callers always immediately specialise via
+    // `clickDialogSubtypeOption` below. Skip the click to avoid matching
+    // unrelated radios (e.g. "M3U URL" when caller wanted "M3U file").
+    if (/^\^?m3u\$?$/i.test(label.source)) {
+        return;
+    }
+    await clickDialogMethodOption(dialog, label, legacySelector);
+}
+
+async function clickDialogSubtypeOption(
+    dialog: Locator,
+    label: RegExp,
+    legacySelector?: string
+): Promise<void> {
+    await clickDialogMethodOption(dialog, label, legacySelector);
 }
 
 export async function addStalkerPortal(
@@ -501,7 +981,7 @@ export async function addStalkerPortal(
     const dialog = await getActiveDialog(page);
     await clickDialogCategoryOption(
         dialog,
-        /^stalker$/i,
+        /stalker(\s+portal)?/i,
         'mat-button-toggle[value="stalker"]'
     );
 
@@ -522,10 +1002,24 @@ export async function openSettings(page: Page): Promise<void> {
     await expect(page.getByTestId('settings-container')).toBeVisible();
 }
 
+/**
+ * Settings render one section page at a time (`/workspace/settings/:section`),
+ * so a control can only be interacted with after its section page is open.
+ */
+export async function openSettingsSection(
+    page: Page,
+    sectionId: string
+): Promise<void> {
+    await page.getByTestId(`settings-section-${sectionId}`).click();
+    await page.waitForURL(new RegExp(`/workspace/settings/${sectionId}$`));
+}
+
 export async function enableRemoteControl(
     page: Page,
     port: number
 ): Promise<void> {
+    await openSettingsSection(page, 'remote-control');
+
     const remoteControlCheckbox = page.locator(
         'mat-checkbox[formcontrolname="remoteControl"] input[type="checkbox"]'
     );
@@ -538,8 +1032,24 @@ export async function enableRemoteControl(
 export async function saveSettings(page: Page): Promise<void> {
     const saveButton = page.getByTestId('save-settings');
 
-    await saveButton.click();
-    await expect(saveButton).toBeDisabled();
+    // The save control is a native form submit (`<button type="submit">`
+    // inside `<form (ngSubmit)="onSubmit()">`). Clicking it makes Chromium
+    // register a form-submission navigation, which Angular's `ngSubmit`
+    // handler immediately cancels via `preventDefault()` — no real navigation
+    // ever happens. Playwright's default post-click "wait for signals" barrier
+    // still observes that requested-then-cancelled navigation and waits for it
+    // to settle; on slow/loaded CI runners that wait can stall for the full
+    // timeout ("waiting for scheduled navigations to finish"). We never depend
+    // on a navigation here, so opt out of the barrier and instead assert the
+    // deterministic post-save state below.
+    await saveButton.click({ noWaitAfter: true });
+    // `onSubmit()` calls `applyChangedSettings()` -> `markAsPristine()` once the
+    // settings write resolves, which hides the whole unsaved-changes bar.
+    // Awaiting that is a stronger, race-free confirmation that the save
+    // actually committed.
+    await expect(saveButton).toBeHidden();
+    // Let the fire-and-forget `window.electron.updateSettings(...)` IPC flush to
+    // the main process before callers may relaunch the app to assert persistence.
     await page.waitForTimeout(300);
 }
 
@@ -569,14 +1079,15 @@ export async function restartElectronApp(
 
 export async function importM3uPlaylistFromUrl(
     page: Page,
-    playlistUrl: string
+    playlistUrl: string,
+    userAgent?: string
 ): Promise<void> {
     await openAddPlaylistDialog(page);
     const dialog = await getActiveDialog(page);
     await clickDialogCategoryOption(dialog, /^m3u$/i);
     await clickDialogSubtypeOption(
         dialog,
-        /add\s+via\s+url/i,
+        /m3u\s*url|add\s+via\s+url/i,
         'mat-button-toggle[value="url"]'
     );
 
@@ -584,6 +1095,9 @@ export async function importM3uPlaylistFromUrl(
         dialog.locator('input[formcontrolname="playlistUrl"]'),
         playlistUrl
     );
+    if (userAgent !== undefined) {
+        await setInputValue(dialog.getByRole('textbox', { name: 'User agent', exact: true }), userAgent);
+    }
     await dialog.getByRole('button', { name: /Add playlist/i }).click();
     await dialog.waitFor({ state: 'detached' });
 }
@@ -594,9 +1108,12 @@ export function buildM3uContent(channels: M3uTestChannel[]): string {
     for (const channel of channels) {
         const attributes = [
             channel.tvgId ? `tvg-id="${channel.tvgId}"` : '',
+            channel.tvgCountry ? `tvg-country="${channel.tvgCountry}"` : '',
+            channel.tvgLanguage ? `tvg-language="${channel.tvgLanguage}"` : '',
             channel.tvgName ? `tvg-name="${channel.tvgName}"` : '',
             channel.logo ? `tvg-logo="${channel.logo}"` : '',
             channel.groupTitle ? `group-title="${channel.groupTitle}"` : '',
+            channel.radio ? 'radio="true"' : '',
         ]
             .filter(Boolean)
             .join(' ');
@@ -629,6 +1146,7 @@ export function parseM3uFixture(filePath: string): M3uTestChannel[] {
               groupTitle?: string;
               logo?: string;
               name: string;
+              radio?: boolean;
               tvgId?: string;
               tvgName?: string;
           }
@@ -646,6 +1164,7 @@ export function parseM3uFixture(filePath: string): M3uTestChannel[] {
                     line.match(/group-title="([^"]*)"/)?.[1]?.trim() ?? '',
                 logo: line.match(/tvg-logo="([^"]*)"/)?.[1]?.trim() ?? '',
                 name: line.split(',').at(-1)?.trim() ?? '',
+                radio: /radio="true"/i.test(line),
                 tvgId: line.match(/tvg-id="([^"]*)"/)?.[1]?.trim() ?? '',
                 tvgName: line.match(/tvg-name="([^"]*)"/)?.[1]?.trim() ?? '',
             };
@@ -671,6 +1190,7 @@ export async function createMutableTextServer(
     options: {
         contentType?: string;
         resourcePath?: string;
+        requiredUserAgent?: string;
     } = {}
 ): Promise<MutableTextServer> {
     const {
@@ -687,6 +1207,12 @@ export async function createMutableTextServer(
                 'Content-Type': 'application/json; charset=utf-8',
             });
             res.end(JSON.stringify({ error: 'Not found' }));
+            return;
+        }
+
+        if (options.requiredUserAgent && req.headers['user-agent'] !== options.requiredUserAgent) {
+            res.writeHead(403);
+            res.end('User-Agent required');
             return;
         }
 
@@ -773,9 +1299,7 @@ export async function switchUnifiedCollectionContent(
     await clickButtonToggleOption(toggleGroup, contentLabel);
 }
 
-export async function clearCurrentUnifiedCollection(
-    page: Page
-): Promise<void> {
+export async function clearCurrentUnifiedCollection(page: Page): Promise<void> {
     await page
         .getByRole('button', {
             name: /Clear .* (favorites|recently viewed)/i,
@@ -1117,7 +1641,10 @@ export async function saveSourceDialog(
     page: Page,
     dialog: Locator
 ): Promise<void> {
-    await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+    await dialog
+        .locator('mat-dialog-actions')
+        .getByRole('button', { name: 'Save', exact: true })
+        .click();
     await page.waitForSelector('mat-dialog-container', { state: 'detached' });
     await expectPlaylistUpdatedToast(page);
 }
@@ -1343,6 +1870,13 @@ export async function expectWorkspaceSearchStatus(
     await expect(
         page.locator('app-workspace-shell-header .search-chip--status')
     ).toHaveText(expected);
+}
+
+/** The degraded-search hint chip must be absent (e.g. complete local search). */
+export async function expectNoWorkspaceSearchStatus(page: Page): Promise<void> {
+    await expect(
+        page.locator('app-workspace-shell-header .search-chip--status')
+    ).toHaveCount(0);
 }
 
 async function startPortalDebugCapture(page: Page): Promise<void> {

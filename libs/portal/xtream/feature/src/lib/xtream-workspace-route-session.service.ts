@@ -53,16 +53,31 @@ function toXtreamPlaylistData(
         ...(userAgent ? { userAgent } : {}),
         ...(referrer ? { referrer } : {}),
         ...(origin ? { origin } : {}),
+        ...(playlist.serverTimezone
+            ? { serverTimezone: playlist.serverTimezone }
+            : {}),
     };
 }
 
-function isImportDrivenSection(section: PortalRailSection | null): boolean {
+/**
+ * Sections whose content comes from the imported catalog, so a cold load
+ * of one has to initialize it first.
+ *
+ * The parameter is a raw URL segment, not a rail section: `actor` and
+ * `discover` have no rail entry, yet both read the catalog to decide
+ * whether a TMDB title is "In your library". Without initialization a
+ * direct load of either answers "no" for everything the user owns —
+ * a wrong claim rather than a missing one.
+ */
+function isImportDrivenSection(section: string | null): boolean {
     return (
         section === 'vod' ||
         section === 'live' ||
         section === 'series' ||
         section === 'search' ||
-        section === 'recently-added'
+        section === 'recently-added' ||
+        section === 'actor' ||
+        section === 'discover'
     );
 }
 
@@ -80,7 +95,7 @@ function toContentInitBlockReason(
 }
 
 function toCachedContentScope(
-    section: PortalRailSection | null
+    section: string | null
 ): XtreamCachedContentScope | null {
     switch (section) {
         case 'live':
@@ -89,6 +104,13 @@ function toCachedContentScope(
         case 'search':
         case 'recently-added':
             return section;
+        // Neither reads one content type: both match TMDB titles against
+        // the whole catalog, so they take the aggregate scope search uses.
+        // Without it an expired or offline portal skips hydration and the
+        // page answers "not in your library" from an empty catalog.
+        case 'actor':
+        case 'discover':
+            return 'search';
         default:
             return null;
     }
@@ -98,9 +120,7 @@ function getXtreamRouteTarget(url: string): {
     playlistId: string | null;
     section: PortalRailSection | null;
 } {
-    const match = url.match(
-        /^\/workspace\/xtreams\/([^/?]+)(?:\/([^/?]+))?/
-    );
+    const match = url.match(/^\/workspace\/xtreams\/([^/?]+)(?:\/([^/?]+))?/);
 
     return {
         playlistId: match?.[1] ?? null,
@@ -125,7 +145,9 @@ function hasPlaylistConnectionChanges(
     const currentReferrer = normalizeOptionalConnectionValue(
         currentPlaylist.referrer
     );
-    const nextReferrer = normalizeOptionalConnectionValue(nextPlaylist.referrer);
+    const nextReferrer = normalizeOptionalConnectionValue(
+        nextPlaylist.referrer
+    );
     const currentOrigin = normalizeOptionalConnectionValue(
         currentPlaylist.origin
     );
@@ -152,11 +174,11 @@ function shouldBootstrapXtreamPlaylist(
 
     return Boolean(
         playlistId &&
-            routePlaylist &&
-            (storePlaylistId !== playlistId ||
-                currentPlaylist?.id !== playlistId ||
-                currentPlaylistUpdateDate !== routePlaylistUpdateDate ||
-                hasPlaylistConnectionChanges(currentPlaylist, routePlaylist))
+        routePlaylist &&
+        (storePlaylistId !== playlistId ||
+            currentPlaylist?.id !== playlistId ||
+            currentPlaylistUpdateDate !== routePlaylistUpdateDate ||
+            hasPlaylistConnectionChanges(currentPlaylist, routePlaylist))
     );
 }
 
@@ -164,11 +186,7 @@ function getXtreamRouteCategoryId(
     url: string,
     section: PortalRailSection | null
 ): number | null {
-    if (
-        section !== 'live' &&
-        section !== 'vod' &&
-        section !== 'series'
-    ) {
+    if (section !== 'live' && section !== 'vod' && section !== 'series') {
         return null;
     }
 
@@ -298,6 +316,7 @@ export class XtreamWorkspaceRouteSession {
             didBootstrapPlaylist = true;
 
             this.xtreamStore.setCurrentPlaylist(routePlaylist);
+            this.xtreamStore.reconcilePendingRestoreBlock();
             section = this.syncRouteState(routeSection);
             if (isImportDrivenSection(section)) {
                 this.xtreamStore.prepareContentLoading(cacheScope);
@@ -310,10 +329,9 @@ export class XtreamWorkspaceRouteSession {
                     ? this.xtreamStore.isCachedContentScopeReady(cacheScope) ||
                       (await this.xtreamStore.hasUsableOfflineCache(cacheScope))
                     : false;
-            const nextBlockReason =
-                canUseCachedContent
-                    ? null
-                    : toContentInitBlockReason(portalStatus);
+            const nextBlockReason = canUseCachedContent
+                ? null
+                : toContentInitBlockReason(portalStatus);
             const currentBlockReason =
                 this.xtreamStore.contentInitBlockReason();
 
@@ -329,11 +347,7 @@ export class XtreamWorkspaceRouteSession {
             section = this.syncRouteState(routeSection);
         }
 
-        if (
-            portalStatus !== 'active' &&
-            !canUseCachedContent &&
-            cacheScope
-        ) {
+        if (portalStatus !== 'active' && !canUseCachedContent && cacheScope) {
             canUseCachedContent =
                 this.xtreamStore.isCachedContentScopeReady(cacheScope) ||
                 (await this.xtreamStore.hasUsableOfflineCache(cacheScope));

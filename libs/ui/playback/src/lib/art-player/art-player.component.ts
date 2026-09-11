@@ -1,377 +1,243 @@
 import {
     Component,
     ElementRef,
-    EventEmitter,
     inject,
-    Input,
+    input,
     OnChanges,
     OnDestroy,
     OnInit,
-    Output,
+    output,
+    signal,
     SimpleChanges,
+    viewChild,
 } from '@angular/core';
-import type ArtplayerDefault from 'artplayer';
-import * as ArtplayerModule from 'artplayer';
-import Hls, { type ErrorData, type ManifestParsedData } from 'hls.js';
-import mpegts from 'mpegts.js';
-import { Channel } from '@iptvnator/shared/interfaces';
+import Artplayer from 'artplayer';
+import { Channel, createDevLogger } from '@iptvnator/shared/interfaces';
+import { releaseVideoPictureInPicture } from '../player-controls/web-video-picture-in-picture-lifecycle';
+import type { PlaybackDiagnostic } from '@iptvnator/playback/util';
 import {
-    InlinePlaybackPlayer,
-    PlaybackDiagnostic,
-    classifyHlsPlaybackIssue,
-    classifyMpegTsPlaybackIssue,
-    classifyNativePlaybackIssue,
-    classifyUnsupportedHlsManifestCodecs,
-    createPlaybackSourceMetadata,
-    getPlaybackMediaExtensionFromUrl,
-} from '../playback-diagnostics/playback-diagnostics.util';
+    type LegacyPlayerShortcuts,
+    PlayerControlsComponent,
+    type PlayerMediaTitle,
+    WEB_PLAYER_SHARED_CONTROLS,
+    WebVideoControlsAdapter,
+} from '../player-controls';
+import { SeriesPlaybackNavigationControlsComponent } from '../portal-inline-player/series-playback-navigation-controls.component';
+import type { SeriesPlaybackNavigation } from '../portal-inline-player/series-playback-navigation';
+import { attachArtPlayerLegacyShortcuts } from './art-player-legacy-shortcuts';
+import {
+    buildArtPlayerChrome,
+    exitOwnedArtPlayerFullscreen,
+    getArtPlayerVideoType,
+    resolveArtPlayerIsLive,
+} from './art-player-setup';
+import { ArtPlayerSourceSession } from './art-player-source-session';
+import { ArtPlayerVideoSession } from './art-player-video-session';
 
-type AudioTrackSelector = {
-    html: string | HTMLElement;
-    default?: boolean;
-};
-
-type ArtplayerConstructor = typeof ArtplayerDefault;
-type ArtplayerInstance = InstanceType<ArtplayerConstructor>;
-
-const Artplayer = (
-    (ArtplayerModule as unknown as { default?: ArtplayerConstructor })
-        .default ?? (ArtplayerModule as unknown as ArtplayerConstructor)
-) as ArtplayerConstructor;
+const debugArtPlayer = createDevLogger('ArtPlayer');
 
 Artplayer.AUTO_PLAYBACK_TIMEOUT = 10000;
 
 @Component({
     selector: 'app-art-player',
-    imports: [],
-    template: `<div #artplayer class="artplayer-container"></div>`,
-    styles: [
-        `
-            :host {
-                display: block;
-                width: 100%;
-                height: 100%;
-            }
-            .artplayer-container {
-                width: 100%;
-                height: 100%;
-            }
-        `,
+    imports: [
+        PlayerControlsComponent,
+        SeriesPlaybackNavigationControlsComponent,
     ],
+    providers: [WebVideoControlsAdapter],
+    templateUrl: './art-player.component.html',
+    styleUrls: ['./art-player.component.scss'],
 })
 export class ArtPlayerComponent implements OnInit, OnDestroy, OnChanges {
-    @Input() channel!: Channel;
-    @Input() volume = 1;
-    @Input() showCaptions = false;
-    @Input() startTime = 0;
-    @Output() timeUpdate = new EventEmitter<{
+    readonly channel = input.required<Channel>();
+    readonly volume = input(1);
+    readonly showCaptions = input(false);
+    readonly startTime = input(0);
+    readonly seriesNavigation = input<SeriesPlaybackNavigation | null>(null);
+    readonly isLive = input(true);
+    readonly interactionEnabled = input(true);
+    readonly mediaTitle = input<PlayerMediaTitle | null>(null);
+    /** See `PlayerControlsComponent.fullscreenTarget`; null keeps the shell. */
+    readonly fullscreenTarget = input<HTMLElement | null>(null);
+
+    readonly timeUpdate = output<{
         currentTime: number;
         duration: number;
     }>();
-    @Output() playbackIssue = new EventEmitter<PlaybackDiagnostic | null>();
+    readonly playbackIssue = output<PlaybackDiagnostic | null>();
+    readonly playbackEnded = output<void>();
+    readonly playbackStarted = output<void>();
+    readonly previousEpisodeRequested = output<void>();
+    readonly nextEpisodeRequested = output<void>();
 
-    private player!: ArtplayerInstance;
-    private hls: Hls | null = null;
-    private mpegtsPlayer: mpegts.Player | null = null;
+    readonly sharedControls = inject(WEB_PLAYER_SHARED_CONTROLS);
+    readonly controlsAdapter = inject(WebVideoControlsAdapter);
+    readonly playerRoot = viewChild<ElementRef<HTMLElement>>('playerRoot');
+    private readonly artplayerContainer =
+        viewChild.required<ElementRef<HTMLDivElement>>('artplayer');
+    private readonly seriesNavigationSignal =
+        signal<SeriesPlaybackNavigation | null>(null);
 
-    private readonly elementRef = inject(ElementRef);
-
-    private readonly handleNativePlaybackError = () => {
-        this.playbackIssue.emit(
-            classifyNativePlaybackIssue(
-                this.player?.video?.error,
-                this.createSourceMetadata(
-                    this.channel?.url ?? this.player?.video?.currentSrc ?? ''
-                )
-            )
-        );
-    };
-
-    private readonly clearPlaybackIssue = () => {
-        this.playbackIssue.emit(null);
-    };
+    private player: Artplayer | null = null;
+    private sourceSession: ArtPlayerSourceSession | null = null;
+    private videoSession: ArtPlayerVideoSession | null = null;
+    private legacyShortcuts: LegacyPlayerShortcuts | null = null;
 
     ngOnInit(): void {
+        this.seriesNavigationSignal.set(this.seriesNavigation());
+        if (this.sharedControls) {
+            this.controlsAdapter.setContext({
+                seriesNavigation: this.seriesNavigationSignal,
+            });
+        } else {
+            // Survives the channel-change destroy/init cycle: the handlers
+            // read the current player lazily.
+            this.legacyShortcuts = attachArtPlayerLegacyShortcuts({
+                player: () => this.player,
+                hostElement: () => this.playerRoot()?.nativeElement ?? null,
+                isAvailable: () => this.interactionEnabled(),
+                isLive: () => this.isLive(),
+            });
+        }
         this.initPlayer();
     }
 
-    ngOnDestroy(): void {
-        this.destroyPlayer();
-    }
-
     ngOnChanges(changes: SimpleChanges): void {
-        if (changes['channel'] && !changes['channel'].firstChange) {
+        if (changes['seriesNavigation']) {
+            this.seriesNavigationSignal.set(this.seriesNavigation());
+        }
+
+        const channelChanged =
+            changes['channel'] && !changes['channel'].firstChange;
+        const authoritativeLiveChanged =
+            this.sharedControls &&
+            changes['isLive'] &&
+            !changes['isLive'].firstChange &&
+            changes['isLive'].previousValue !== changes['isLive'].currentValue;
+        if (this.player && (channelChanged || authoritativeLiveChanged)) {
             this.destroyPlayer();
             this.initPlayer();
         }
+
+        if (changes['showCaptions']) {
+            this.sourceSession?.refreshInputs();
+        }
+        if (changes['interactionEnabled']?.currentValue === false) {
+            exitOwnedArtPlayerFullscreen(
+                this.sharedControls,
+                this.fullscreenTarget() ?? this.playerRoot()?.nativeElement,
+                (error) =>
+                    debugArtPlayer(
+                        'Failed to exit ArtPlayer fullscreen:',
+                        error
+                    )
+            );
+        }
+        if (changes['volume']?.currentValue !== undefined && this.player) {
+            this.applyVolume(changes['volume'].currentValue);
+        }
     }
 
-    private destroyPlayer(): void {
-        if (this.mpegtsPlayer) {
-            this.mpegtsPlayer.pause();
-            this.mpegtsPlayer.unload();
-            this.mpegtsPlayer.detachMediaElement();
-            this.mpegtsPlayer.destroy();
-            this.mpegtsPlayer = null;
-        }
-        if (this.hls) {
-            this.hls.destroy();
-            this.hls = null;
-        }
-        if (this.player) {
-            this.player.video?.removeEventListener(
-                'error',
-                this.handleNativePlaybackError
-            );
-            this.player.video?.removeEventListener(
-                'loadeddata',
-                this.clearPlaybackIssue
-            );
-            this.player.video?.removeEventListener(
-                'playing',
-                this.clearPlaybackIssue
-            );
-            this.player.destroy();
-        }
+    ngOnDestroy(): void {
+        this.legacyShortcuts?.detach();
+        this.legacyShortcuts = null;
+        this.destroyPlayer();
     }
 
     private initPlayer(): void {
         this.playbackIssue.emit(null);
-        const el = this.elementRef.nativeElement.querySelector(
-            '.artplayer-container'
-        );
-        const extension = getPlaybackMediaExtensionFromUrl(
-            this.channel?.url ?? ''
-        );
-        const isLive = extension === 'm3u8' || extension === 'ts' || !extension;
+        const channel = this.channel();
+        const sourceUrl = channel.url + (channel.epgParams ?? '');
+        const sourceSession = new ArtPlayerSourceSession({
+            sharedControls: this.sharedControls,
+            controlsAdapter: this.controlsAdapter,
+            isLive: () => this.isLive(),
+            showCaptions: () => this.showCaptions(),
+            emitPlaybackIssue: (issue) => this.playbackIssue.emit(issue),
+            getDrm: () => this.channel().drm,
+        });
+        this.sourceSession = sourceSession;
 
-        this.player = new Artplayer({
-            container: el,
-            url: this.channel.url + (this.channel.epgParams || ''),
-            volume: this.volume,
-            isLive: isLive,
+        const player = new Artplayer({
+            container: this.artplayerContainer().nativeElement,
+            url: sourceUrl,
+            volume: this.clampVolume(this.volume()),
+            isLive: resolveArtPlayerIsLive(
+                this.sharedControls,
+                this.isLive(),
+                channel.url
+            ),
             autoplay: true,
-            type: this.getVideoType(this.channel.url),
-            pip: true,
-            autoPlayback: true,
-            autoSize: true,
-            autoMini: true,
-            screenshot: true,
-            setting: true,
-            playbackRate: true,
-            aspectRatio: true,
-            fullscreen: true,
-            fullscreenWeb: true,
+            type: getArtPlayerVideoType(channel.url),
             playsInline: true,
-            airplay: true,
             backdrop: true,
             mutex: true,
             theme: '#ff0000',
-            customType: {
-                m3u8: (video: HTMLVideoElement, url: string) => {
-                    if (Hls.isSupported()) {
-                        if (this.hls) {
-                            this.hls.destroy();
-                        }
-                        this.hls = new Hls();
-                        this.hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-                            this.handleHlsManifestParsed(url, data);
-                        });
-                        this.hls.on(Hls.Events.ERROR, (_, data) => {
-                            this.handleHlsError(url, data);
-                        });
-                        this.hls.loadSource(url);
-                        this.hls.attachMedia(video);
-                        this.setupHlsAudioTracks();
-                    } else if (
-                        video.canPlayType('application/vnd.apple.mpegurl')
-                    ) {
-                        video.src = url;
-                    }
-                },
-                ts: (video: HTMLVideoElement, url: string) => {
-                    if (mpegts.isSupported()) {
-                        if (this.mpegtsPlayer) {
-                            this.mpegtsPlayer.destroy();
-                        }
-                        this.mpegtsPlayer = mpegts.createPlayer({
-                            type: 'mpegts',
-                            isLive: true,
-                            url: url,
-                        });
-                        this.mpegtsPlayer.attachMediaElement(video);
-                        this.mpegtsPlayer.on(
-                            mpegts.Events.ERROR,
-                            (
-                                type: string,
-                                details: string,
-                                info: unknown
-                            ): void => {
-                                this.playbackIssue.emit(
-                                    classifyMpegTsPlaybackIssue(
-                                        {
-                                            type,
-                                            details,
-                                            info,
-                                        },
-                                        this.createSourceMetadata(
-                                            url,
-                                            'video/mp2t'
-                                        )
-                                    )
-                                );
-                            }
-                        );
-                        this.mpegtsPlayer.load();
-                        this.mpegtsPlayer.play();
-                    }
-                },
-                mkv: (video: HTMLVideoElement, url: string) => {
-                    video.src = url;
-                },
-            },
+            ...buildArtPlayerChrome(this.sharedControls),
+            customType: sourceSession.customType,
         });
+        this.player = player;
+        sourceSession.attach(player);
 
-        this.player.video.addEventListener(
-            'error',
-            this.handleNativePlaybackError
-        );
-        this.player.video.addEventListener(
-            'loadeddata',
-            this.clearPlaybackIssue
-        );
-        this.player.video.addEventListener('playing', this.clearPlaybackIssue);
-
-        if (this.startTime > 0) {
-            this.player.on('ready', () => {
-                this.player.seek = this.startTime;
-            });
-        }
-
-        this.player.on('video:timeupdate', () => {
-            this.timeUpdate.emit({
-                currentTime: this.player.currentTime,
-                duration: this.player.duration,
-            });
+        const videoSession = new ArtPlayerVideoSession({
+            player,
+            sourceUrl: channel.url,
+            getStartTime: () => this.startTime(),
+            getDuration: () => sourceSession.resolveDuration(player.duration),
+            persistSharedVolume: this.sharedControls,
+            emitPlaybackIssue: (issue) => this.playbackIssue.emit(issue),
+            emitTimeUpdate: (value) => this.timeUpdate.emit(value),
+            emitPlaybackEnded: () => this.playbackEnded.emit(),
+            emitPlaybackStarted: () => this.playbackStarted.emit(),
         });
-    }
+        this.videoSession = videoSession;
+        videoSession.attach();
 
-    private handleHlsManifestParsed(
-        url: string,
-        data: ManifestParsedData
-    ): void {
-        const metadata = this.createSourceMetadata(
-            url,
-            'application/x-mpegURL',
-            data.levels
-                .map((level) => level.audioCodec)
-                .filter((codec): codec is string => Boolean(codec)),
-            data.levels
-                .map((level) => level.videoCodec)
-                .filter((codec): codec is string => Boolean(codec))
-        );
-        const issue = classifyUnsupportedHlsManifestCodecs(metadata);
-        if (issue) {
-            this.playbackIssue.emit(issue);
+        // ArtPlayer synchronously restores `artplayer_settings.volume` after
+        // applying the constructor option. Shared controls use the app-wide
+        // volume as authoritative, so reapply it directly to the media element.
+        if (this.sharedControls) {
+            this.applyVolume(this.volume());
         }
     }
 
-    private handleHlsError(url: string, data: ErrorData): void {
-        if (!data.fatal) {
+    private destroyPlayer(): void {
+        if (!this.sharedControls) {
+            releaseVideoPictureInPicture(this.player?.video);
+        }
+        const sourceSession = this.sourceSession;
+        this.sourceSession = null;
+        sourceSession?.destroy();
+
+        const videoSession = this.videoSession;
+        this.videoSession = null;
+        videoSession?.destroy();
+
+        const player = this.player;
+        this.player = null;
+        player?.destroy();
+    }
+
+    private applyVolume(value: number): void {
+        const player = this.player;
+        if (!player) {
             return;
         }
 
-        this.playbackIssue.emit(
-            classifyHlsPlaybackIssue(
-                {
-                    type: data.type,
-                    details: data.details,
-                    fatal: data.fatal,
-                    message: data.error?.message,
-                    error: data.error,
-                },
-                this.createSourceMetadata(url, 'application/x-mpegURL')
-            )
-        );
-    }
-
-    /**
-     * Listens for HLS.js audio tracks and adds a settings menu entry
-     * to ArtPlayer for switching between available audio tracks.
-     */
-    private setupHlsAudioTracks(): void {
-        if (!this.hls) return;
-
-        const hls = this.hls;
-
-        hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => {
-            const tracks = hls.audioTracks;
-            if (!tracks || tracks.length <= 1) return;
-
-            const audioTrackSetting = {
-                html: 'Audio',
-                icon: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="22" height="22" fill="white">
-                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                </svg>`,
-                width: 220,
-                tooltip: tracks[hls.audioTrack]?.name || '',
-                selector: tracks.map((track, index) => ({
-                    html: track.name || track.lang || `Track ${index + 1}`,
-                    default: index === hls.audioTrack,
-                })),
-                onSelect: function (
-                    this: ArtplayerInstance,
-                    item: AudioTrackSelector
-                ) {
-                    const selectedLabel =
-                        typeof item.html === 'string'
-                            ? item.html
-                            : (item.html.textContent ?? '');
-                    const selectedIndex = tracks.findIndex(
-                        (t, i) =>
-                            (t.name || t.lang || `Track ${i + 1}`) ===
-                            selectedLabel
-                    );
-                    if (selectedIndex >= 0) {
-                        hls.audioTrack = selectedIndex;
-                    }
-                },
-            };
-
-            this.player.setting.add(audioTrackSetting);
-        });
-    }
-
-    private getVideoType(url: string): string {
-        const extension = getPlaybackMediaExtensionFromUrl(url);
-        switch (extension) {
-            case 'mkv':
-                return 'video/matroska';
-            case 'm3u8':
-                return 'm3u8';
-            case 'mp4':
-                return 'mp4';
-            case 'ts':
-                return 'ts';
-            default:
-                // No recognized extension (e.g. IPTV proxy URL) → default to
-                // MPEG-TS which is the most common format for live IPTV streams.
-                return extension ? 'auto' : 'ts';
+        const volume = this.clampVolume(value);
+        if (this.sharedControls) {
+            player.video.volume = volume;
+            player.video.muted = volume <= 0;
+        } else {
+            player.volume = volume;
         }
     }
 
-    private createSourceMetadata(
-        url: string,
-        mimeType?: string,
-        audioCodecs: readonly string[] = [],
-        videoCodecs: readonly string[] = []
-    ) {
-        return createPlaybackSourceMetadata({
-            url,
-            mimeType,
-            player: InlinePlaybackPlayer.ArtPlayer,
-            audioCodecs,
-            videoCodecs,
-        });
+    private clampVolume(value: number): number {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue)) {
+            return 1;
+        }
+        return Math.max(0, Math.min(1, numericValue));
     }
 }

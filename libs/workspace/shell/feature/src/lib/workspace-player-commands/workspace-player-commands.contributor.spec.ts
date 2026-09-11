@@ -7,7 +7,7 @@ import {
     WorkspaceCommandContribution,
     WorkspaceViewCommandService,
 } from '@iptvnator/portal/shared/util';
-import { SettingsStore } from '@iptvnator/services';
+import { RuntimeCapabilitiesService, SettingsStore } from '@iptvnator/services';
 import { VideoPlayer } from '@iptvnator/shared/interfaces';
 import { WorkspacePlayerCommandsContributor } from './workspace-player-commands.contributor';
 
@@ -46,16 +46,25 @@ describe('WorkspacePlayerCommandsContributor', () => {
     let viewCommands: ViewCommandsMock;
     let settingsStore: SettingsStoreMock;
     let snackBar: SnackBarMock;
+    let runtime: {
+        supportsManagedExternalPlayers: boolean;
+        supportsEmbeddedMpv: boolean;
+    };
+    let electronStub:
+        | {
+              getEmbeddedMpvSupport: jest.Mock<
+                  Promise<{ supported: boolean }>,
+                  []
+              >;
+          }
+        | undefined;
     let translate: { instant: jest.Mock; onLangChange: ReturnType<typeof of> };
 
-    function bootstrap(options: { isDesktop: boolean }) {
-        if (options.isDesktop) {
-            window.electron = { platform: 'darwin' } as typeof window.electron;
-        } else {
-            // @ts-expect-error - simulating PWA environment
-            window.electron = undefined;
-        }
-
+    function bootstrap(options: {
+        supportsManagedExternalPlayers: boolean;
+        supportsEmbeddedMpv?: boolean;
+        embeddedMpvSupportResult?: { supported: boolean } | null;
+    }) {
         viewCommands = {
             registerCommand: jest.fn().mockReturnValue(() => undefined),
             commands: jest.fn().mockReturnValue([]),
@@ -65,12 +74,26 @@ describe('WorkspacePlayerCommandsContributor', () => {
             updateSettings: jest.fn().mockResolvedValue(undefined),
         };
         snackBar = { open: jest.fn() };
+        runtime = {
+            supportsManagedExternalPlayers:
+                options.supportsManagedExternalPlayers,
+            supportsEmbeddedMpv: options.supportsEmbeddedMpv ?? false,
+        };
+
+        electronStub = runtime.supportsEmbeddedMpv
+            ? {
+                  getEmbeddedMpvSupport: jest.fn().mockResolvedValue(
+                      options.embeddedMpvSupportResult ?? {
+                          supported: true,
+                      }
+                  ),
+              }
+            : undefined;
+        (window as unknown as { electron?: unknown }).electron = electronStub;
         translate = {
             instant: jest.fn(
                 (key: string, params?: Record<string, string | number>) =>
-                    params?.['name']
-                        ? `${key}:${params['name']}`
-                        : key
+                    params?.['name'] ? `${key}:${params['name']}` : key
             ),
             onLangChange: of(null),
         };
@@ -83,6 +106,7 @@ describe('WorkspacePlayerCommandsContributor', () => {
                     useValue: viewCommands,
                 },
                 { provide: SettingsStore, useValue: settingsStore },
+                { provide: RuntimeCapabilitiesService, useValue: runtime },
                 { provide: MatSnackBar, useValue: snackBar },
                 { provide: TranslateService, useValue: translate },
             ],
@@ -93,23 +117,25 @@ describe('WorkspacePlayerCommandsContributor', () => {
 
     afterEach(() => {
         TestBed.resetTestingModule();
+        delete (window as unknown as { electron?: unknown }).electron;
     });
 
-    it('registers all five player commands when running in Electron', () => {
-        bootstrap({ isDesktop: true });
+    it('registers all six player commands when running in Electron', () => {
+        bootstrap({ supportsManagedExternalPlayers: true });
 
         const ids = getRegistered(viewCommands).map((c) => c.id);
         expect(ids).toEqual([
             'switch-player-videojs',
             'switch-player-html5',
             'switch-player-artplayer',
+            'switch-player-embedded-mpv',
             'switch-player-mpv',
             'switch-player-vlc',
         ]);
     });
 
-    it('hides MPV and VLC when window.electron is unavailable', () => {
-        bootstrap({ isDesktop: false });
+    it('hides MPV and VLC when managed external players are unavailable', () => {
+        bootstrap({ supportsManagedExternalPlayers: false });
 
         const registered = getRegistered(viewCommands);
         const visibilityById = Object.fromEntries(
@@ -123,8 +149,75 @@ describe('WorkspacePlayerCommandsContributor', () => {
         expect(visibilityById['switch-player-vlc']).toBe(false);
     });
 
+    it('hides embedded MPV when it is unsupported', () => {
+        bootstrap({
+            supportsManagedExternalPlayers: true,
+            supportsEmbeddedMpv: false,
+        });
+
+        const embedded = getRegistered(viewCommands).find(
+            (c) => c.id === 'switch-player-embedded-mpv'
+        );
+        expect(resolveBoolean(embedded?.visible)).toBe(false);
+    });
+
+    it('does not verify embedded MPV support during contributor bootstrap', () => {
+        bootstrap({
+            supportsManagedExternalPlayers: true,
+            supportsEmbeddedMpv: true,
+        });
+
+        expect(electronStub?.getEmbeddedMpvSupport).not.toHaveBeenCalled();
+    });
+
+    it('shows embedded MPV once support resolves to supported', async () => {
+        const contributor = bootstrap({
+            supportsManagedExternalPlayers: true,
+            supportsEmbeddedMpv: true,
+            embeddedMpvSupportResult: { supported: true },
+        });
+
+        await contributor.ensureEmbeddedMpvSupportLoaded();
+
+        const embedded = getRegistered(viewCommands).find(
+            (c) => c.id === 'switch-player-embedded-mpv'
+        );
+        expect(resolveBoolean(embedded?.visible)).toBe(true);
+    });
+
+    it('keeps embedded MPV hidden when support resolves to unsupported', async () => {
+        const contributor = bootstrap({
+            supportsManagedExternalPlayers: true,
+            supportsEmbeddedMpv: true,
+            embeddedMpvSupportResult: { supported: false },
+        });
+
+        await contributor.ensureEmbeddedMpvSupportLoaded();
+
+        const embedded = getRegistered(viewCommands).find(
+            (c) => c.id === 'switch-player-embedded-mpv'
+        );
+        expect(resolveBoolean(embedded?.visible)).toBe(false);
+    });
+
+    it('switches to embedded MPV on run', () => {
+        bootstrap({
+            supportsManagedExternalPlayers: true,
+            supportsEmbeddedMpv: true,
+        });
+
+        const embedded = getRegistered(viewCommands).find(
+            (c) => c.id === 'switch-player-embedded-mpv'
+        );
+        embedded?.run({ query: '' });
+
+        expect(settingsStore.updateSettings).toHaveBeenCalledWith({
+            player: VideoPlayer.EmbeddedMpv,
+        });
+    });
+
     it('marks the active player command as disabled', () => {
-        bootstrap({ isDesktop: true });
+        bootstrap({ supportsManagedExternalPlayers: true });
         settingsStore.player.set(VideoPlayer.MPV);
 
         const registered = getRegistered(viewCommands);
@@ -138,7 +231,7 @@ describe('WorkspacePlayerCommandsContributor', () => {
     });
 
     it('updates settings and shows feedback on run', () => {
-        bootstrap({ isDesktop: true });
+        bootstrap({ supportsManagedExternalPlayers: true });
 
         const mpvCommand = getRegistered(viewCommands).find(
             (c) => c.id === 'switch-player-mpv'

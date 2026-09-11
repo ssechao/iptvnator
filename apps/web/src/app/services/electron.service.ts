@@ -3,10 +3,17 @@ import { MatSnackBar } from '@angular/material/snack-bar';
 import { Store } from '@ngrx/store';
 import { TranslateService } from '@ngx-translate/core';
 import { PlaylistActions } from '@iptvnator/m3u-state';
-import { DataService } from '@iptvnator/services';
+import { DialogService } from '@iptvnator/ui/components';
+import { DataService, SettingsStore } from '@iptvnator/services';
 import {
     AUTO_UPDATE_PLAYLISTS,
+    AutoUpdatePlaylistsResult,
+    CONNECTIVITY_GUARD_RESET,
+    ELECTRON_BRIDGE_SECURITY_ERROR_CODES,
     ERROR,
+    normalizeHost,
+    parseSecurityPolicyError,
+    PlayerContentInfo,
     Playlist,
     PLAYLIST_PARSE_BY_URL,
     PLAYLIST_UPDATE,
@@ -14,8 +21,14 @@ import {
     XTREAM_RESPONSE,
     XtreamCodeActions,
 } from '@iptvnator/shared/interfaces';
-import { AppConfig } from '../../environments/environment';
 import {
+    measureRendererPerformancePhase,
+    RENDERER_PERFORMANCE_PHASE,
+} from '@iptvnator/shared/logging';
+import { AppConfig } from '../../environments/environment';
+import { buildAutoUpdatePlaylistsFeedback } from './auto-update-playlists-feedback';
+import {
+    createLogger,
     createPortalDebugRequestContext,
     logPortalDebugEvent,
 } from '@iptvnator/portal/shared/util';
@@ -29,7 +42,7 @@ interface PlayerLaunchPayload {
     readonly title?: string;
     readonly url: string;
     readonly ['user-agent']?: string;
-    readonly contentInfo?: unknown;
+    readonly contentInfo?: PlayerContentInfo;
 }
 
 interface ErrorStatus {
@@ -44,8 +57,11 @@ export class ElectronService extends DataService {
     private eventListeners: { [key: string]: () => void } = {};
     private messageListeners = new Map<string, EventListener>();
     private readonly snackBar = inject(MatSnackBar);
+    private readonly dialogService = inject(DialogService);
     private readonly store = inject(Store);
+    private readonly settingsStore = inject(SettingsStore);
     private readonly translateService = inject(TranslateService);
+    private readonly logger = createLogger('ElectronService');
     private readonly silentXtreamActions = new Set<string>([
         XtreamCodeActions.GetAccountInfo,
         XtreamCodeActions.GetLiveCategories,
@@ -58,7 +74,6 @@ export class ElectronService extends DataService {
 
     constructor() {
         super();
-        console.log('Electron service initialized...');
         this.setupPlayerErrorListener();
         this.setupPortalDebugListener();
     }
@@ -72,7 +87,10 @@ export class ElectronService extends DataService {
                     error: string;
                     originalError: string;
                 }) => {
-                    console.error(`${data.player} Error:`, data.originalError);
+                    this.logger.error(
+                        `${data.player} Error:`,
+                        data.originalError
+                    );
                     this.snackBar.open(
                         `${data.player} Error: ${data.error}`,
                         'Close',
@@ -117,7 +135,7 @@ export class ElectronService extends DataService {
         payload?: unknown
     ): Promise<T> {
         if (type === PLAYLIST_PARSE_BY_URL) {
-            this.fetchM3uPlaylistFromUrl(payload);
+            this.fetchM3uPlaylistFromUrl(payload as Partial<Playlist>);
             return undefined as T;
         }
 
@@ -127,6 +145,7 @@ export class ElectronService extends DataService {
                     id: string;
                     filePath?: string;
                     url?: string;
+                    userAgent?: string;
                     title: string;
                 }
             );
@@ -149,6 +168,14 @@ export class ElectronService extends DataService {
             )) as T;
         }
 
+        if (type === CONNECTIVITY_GUARD_RESET) {
+            const { url } = payload as { url?: string };
+            if (url) {
+                await window.electron.resetHostConnectivityGuard(url);
+            }
+            return undefined as T;
+        }
+
         if (type === 'OPEN_MPV_PLAYER') {
             const data = payload as PlayerLaunchPayload;
             try {
@@ -156,7 +183,7 @@ export class ElectronService extends DataService {
                     data.url,
                     data.title ?? '',
                     data.thumbnail ?? '',
-                    data['user-agent'] ?? undefined,
+                    data['user-agent'],
                     data.referer ?? undefined,
                     data.origin ?? undefined,
                     data.contentInfo,
@@ -173,7 +200,7 @@ export class ElectronService extends DataService {
                         duration: 5000,
                     }
                 );
-                console.error('MPV launch error:', error);
+                this.logger.error('MPV launch error:', error);
                 throw error;
             }
         }
@@ -185,7 +212,7 @@ export class ElectronService extends DataService {
                     data.url,
                     data.title ?? '',
                     data.thumbnail ?? '',
-                    data['user-agent'] ?? undefined,
+                    data['user-agent'],
                     data.referer ?? undefined,
                     data.origin ?? undefined,
                     data.contentInfo,
@@ -202,31 +229,55 @@ export class ElectronService extends DataService {
                         duration: 5000,
                     }
                 );
-                console.error('VLC launch error:', error);
+                this.logger.error('VLC launch error:', error);
                 throw error;
             }
         }
 
         if (type === AUTO_UPDATE_PLAYLISTS) {
             const data = payload as Playlist[];
-            const playlists = await window.electron.autoUpdatePlaylists(data);
+            const result = await window.electron.autoUpdatePlaylists(
+                data,
+                this.settingsStore.getTrustOptions()
+            );
             this.store.dispatch(
                 PlaylistActions.updateManyPlaylists({
-                    playlists,
+                    playlists: result.playlists,
                 })
             );
-            this.snackBar.open(
-                this.translateService.instant(
-                    'HOME.PLAYLISTS.AUTO_REFRESH_UPDATE_SUCCESS'
-                ),
-                null,
-                { duration: 2000 }
-            );
-            return playlists as T;
+            this.reportAutoUpdatePlaylistsResult(result);
+            return result as T;
         }
 
-        console.log('Unknown type', type);
+        this.logger.debug('Unknown IPC event type:', type);
         return undefined as T;
+    }
+
+    private reportAutoUpdatePlaylistsResult(
+        result: AutoUpdatePlaylistsResult
+    ): void {
+        const unresolved = result.outcomes.filter(
+            (outcome) => outcome.status !== 'updated'
+        );
+        if (unresolved.length > 0) {
+            this.logger.warn(
+                'Playlist auto-refresh did not update every playlist:',
+                unresolved
+                    .map((outcome) => `${outcome.title} (${outcome.status})`)
+                    .join(', ')
+            );
+        }
+
+        const feedback = buildAutoUpdatePlaylistsFeedback(result);
+        this.snackBar.open(
+            this.translateService.instant(feedback.messageKey, feedback.params),
+            feedback.isError
+                ? this.translateService.instant('CLOSE')
+                : undefined,
+            feedback.isError
+                ? { duration: 6000, panelClass: ['error-snackbar'] }
+                : { duration: 2000 }
+        );
     }
 
     private async fetchStalkerData(payload: {
@@ -236,6 +287,10 @@ export class ElectronService extends DataService {
         requestId?: string;
         token?: string;
         serialNumber?: string;
+        /** Endpoint-discovery probes expect failures; no error snackbar. */
+        silent?: boolean;
+        /** Endpoint-discovery probes are exempt from the connectivity guard. */
+        skipConnectionGuard?: boolean;
     }) {
         const context = createPortalDebugRequestContext({
             provider: 'stalker',
@@ -253,32 +308,53 @@ export class ElectronService extends DataService {
             return response;
         } catch (err: unknown) {
             const errorInfo = this.getErrorDetails(err);
-            console.error('Stalker request error:', err);
-            this.snackBar.open(
-                `Error: ${errorInfo?.message ?? ' Not found'}, status: ${errorInfo?.status ?? 404}`,
-                'Close',
-                {
-                    duration: 5000,
-                }
-            );
+            this.logger.error('Stalker request error:', err);
+            if (!payload.silent) {
+                this.snackBar.open(
+                    `Error: ${errorInfo?.message ?? ' Not found'}, status: ${errorInfo?.status ?? 404}`,
+                    'Close',
+                    {
+                        duration: 5000,
+                    }
+                );
+            }
             throw err;
         }
     }
 
-    private async fetchM3uPlaylistFromUrl(payload: Partial<Playlist>) {
+    private async fetchM3uPlaylistFromUrl(payload?: Partial<Playlist>) {
+        if (!payload?.url) {
+            return;
+        }
+
         const title = payload.title?.trim() || undefined;
 
         window.electron
-            .fetchPlaylistByUrl(payload.url, title)
+            .fetchPlaylistByUrl(payload.url, title, {
+                ...this.settingsStore.getTrustOptions(),
+                userAgent: payload.userAgent,
+            })
             .then((result) => {
-                this.store.dispatch(
-                    PlaylistActions.handleAddingPlaylistByUrl({
-                        isTemporary: !!payload?.isTemporary,
-                        playlist: result,
-                    })
+                measureRendererPerformancePhase(
+                    RENDERER_PERFORMANCE_PHASE.M3U_IMPORT_DISPATCH,
+                    () =>
+                        this.store.dispatch(
+                            PlaylistActions.handleAddingPlaylistByUrl({
+                                isTemporary: !!payload?.isTemporary,
+                                playlist: result,
+                            })
+                        )
                 );
             })
             .catch((error: unknown) => {
+                if (
+                    this.handlePlaylistSecurityError(error, () =>
+                        this.fetchM3uPlaylistFromUrl(payload)
+                    )
+                ) {
+                    return;
+                }
+
                 const statusCode = this.extractHttpStatusCode(error);
                 let messageKey = 'HOME.URL_UPLOAD.ERROR_FETCH_FAILED';
                 if (statusCode === 403) {
@@ -317,6 +393,7 @@ export class ElectronService extends DataService {
         id: string;
         url?: string;
         filePath?: string;
+        userAgent?: string;
         title: string;
     }) {
         try {
@@ -324,7 +401,11 @@ export class ElectronService extends DataService {
             if (data.url && !data.filePath) {
                 playlistObject = await window.electron.fetchPlaylistByUrl(
                     data.url,
-                    data.title
+                    data.title,
+                    {
+                        ...this.settingsStore.getTrustOptions(),
+                        userAgent: data.userAgent,
+                    }
                 );
             } else if (data.filePath && !data.url) {
                 playlistObject =
@@ -333,7 +414,7 @@ export class ElectronService extends DataService {
                         data.title
                     );
             } else {
-                console.error(
+                this.logger.error(
                     'Either url or filePath must be provided, but not both.'
                 );
                 return;
@@ -346,6 +427,7 @@ export class ElectronService extends DataService {
                         _id: data.id,
                     },
                     playlistId: data.id,
+                    refreshEpg: true,
                 })
             );
 
@@ -353,11 +435,19 @@ export class ElectronService extends DataService {
                 this.translateService.instant(
                     'HOME.PLAYLISTS.PLAYLIST_UPDATE_SUCCESS'
                 ),
-                null,
+                undefined,
                 { duration: 2000 }
             );
         } catch (error: unknown) {
-            console.error('Playlist refresh error:', error);
+            this.logger.error('Playlist refresh error:', error);
+            if (
+                data.url &&
+                this.handlePlaylistSecurityError(error, () => {
+                    void this.updateM3uPlaylistFromFile(data);
+                })
+            ) {
+                return;
+            }
             this.snackBar.open(
                 this.getPlaylistRefreshErrorMessage(error, data),
                 this.translateService.instant('CLOSE'),
@@ -418,6 +508,86 @@ export class ElectronService extends DataService {
         return translated === key ? fallback : translated;
     }
 
+    private handlePlaylistSecurityError(
+        error: unknown,
+        retry: () => void
+    ): boolean {
+        const securityError = parseSecurityPolicyError(error);
+        if (
+            securityError?.code !==
+            ELECTRON_BRIDGE_SECURITY_ERROR_CODES.InvalidTlsCertificate
+        ) {
+            return false;
+        }
+
+        const ref = this.snackBar.open(
+            this.translateWithFallback(
+                'HOME.URL_UPLOAD.ERROR_INVALID_TLS',
+                'Certificate for this playlist host is invalid.'
+            ),
+            this.translateWithFallback(
+                'HOME.URL_UPLOAD.TRUST_TLS_HOST',
+                'Trust host'
+            ),
+            { duration: 10000 }
+        );
+
+        ref.onAction().subscribe(() => {
+            this.confirmTrustPlaylistHost(securityError.host, retry);
+        });
+        return true;
+    }
+
+    private confirmTrustPlaylistHost(
+        host: string | undefined,
+        retry: () => void
+    ): void {
+        if (!host) {
+            this.snackBar.open(
+                this.translateWithFallback(
+                    'HOME.URL_UPLOAD.ERROR_TLS_HOST_UNKNOWN',
+                    'Could not determine the playlist host. Please retry manually.'
+                ),
+                this.translateService.instant('CLOSE'),
+                { duration: 5000 }
+            );
+            return;
+        }
+
+        this.dialogService.openConfirmDialog({
+            title: this.translateWithFallback(
+                'HOME.URL_UPLOAD.TRUST_TLS_HOST_TITLE',
+                'Trust invalid certificate?'
+            ),
+            message: this.translateWithFallback(
+                'HOME.URL_UPLOAD.TRUST_TLS_HOST_WARNING',
+                'Only continue if you trust this playlist host. IPTVnator will allow invalid TLS certificates for this host, but other hosts still require valid certificates.'
+            ),
+            confirmLabel: this.translateWithFallback(
+                'HOME.URL_UPLOAD.TRUST_TLS_HOST',
+                'Trust host'
+            ),
+            width: '420px',
+            onConfirm: () => {
+                void this.trustPlaylistHost(host).then(retry);
+            },
+        });
+    }
+
+    private async trustPlaylistHost(host: string): Promise<void> {
+        const settings = this.settingsStore.getSettings();
+        const trustedHosts = new Set(
+            (settings.trustedInsecureTlsHosts ?? []).map((item) =>
+                normalizeHost(item)
+            )
+        );
+        trustedHosts.add(normalizeHost(host));
+
+        await this.settingsStore.updateSettings({
+            trustedInsecureTlsHosts: Array.from(trustedHosts),
+        });
+    }
+
     /* private getErrorMessageByStatusCode(status: number) {
         let message = 'Something went wrong';
         switch (status) {
@@ -472,12 +642,12 @@ export class ElectronService extends DataService {
 
             // Log error to console
             if (isSilentAction) {
-                console.log(
+                this.logger.debug(
                     `Background Xtream action failed (${action ?? 'unknown'}):`,
                     normalizedMessage
                 );
             } else {
-                console.error('Xtream request error:', normalizedMessage);
+                this.logger.error('Xtream request error:', normalizedMessage);
             }
 
             // Only show snackbar for user-triggered Xtream requests

@@ -1,5 +1,6 @@
 import { InjectionToken } from '@angular/core';
 import {
+    ContentMetadataPatch,
     PlaybackPositionData,
     XtreamPendingRestoreState,
     XtreamCategory,
@@ -33,6 +34,7 @@ export interface XtreamPlaylistData {
     referrer?: string;
     origin?: string;
     serverTimezone?: string;
+    allowedOutputFormats?: string[];
 }
 
 /**
@@ -47,6 +49,10 @@ export interface XtreamContentItem {
     rating: string;
     added: string;
     poster_url: string;
+    backdrop_url?: string | null;
+    tmdb_id?: number | null;
+    release_year?: number | null;
+    original_title?: string | null;
     epg_channel_id?: string | null;
     tv_archive?: number | null;
     tv_archive_duration?: number | null;
@@ -156,6 +162,23 @@ export interface IXtreamDataSource {
     updatePlaylist(
         playlistId: string,
         updates: Partial<XtreamPlaylistData>
+    ): Promise<void>;
+
+    /**
+     * Persist the panel clock a successful account-info check learned
+     * (`resolveXtreamServerTimezone`) onto the stored playlist row, which
+     * the Favorites / Recent catch-up resolver reads instead of the store
+     * (issue #1562). Each runtime applies it atomically against the row's
+     * current connection: the write lands only while the row still points
+     * at `credentials`, so an edit that moved the source meanwhile keeps
+     * the clock the edit flow dropped, and a row already carrying the value
+     * is left untouched. Never rejects — a failed write is retried by the
+     * next check.
+     */
+    rememberServerTimezone(
+        playlistId: string,
+        credentials: XtreamCredentials,
+        serverTimezone: string
     ): Promise<void>;
 
     /**
@@ -358,6 +381,19 @@ export interface IXtreamDataSource {
         contentType?: 'live' | 'movie' | 'series'
     ): Promise<XtreamContentItem | null>;
 
+    /**
+     * Persist what a detail view learned about an already-known content item —
+     * its backdrop, and the identity (TMDB id, release year, original title)
+     * that lets the dashboard repeat this view's lookup instead of rebuilding
+     * a weaker one from the display title. Never changes favorites or recent
+     * ordering, and never overwrites a column that already has a value.
+     */
+    setContentMetadataIfMissing(
+        contentId: number,
+        playlistId: string,
+        patch: ContentMetadataPatch
+    ): Promise<void>;
+
     // =========================================================================
     // Playback Position Operations
     // =========================================================================
@@ -409,6 +445,24 @@ export interface IXtreamDataSource {
         playlistId: string,
         contentXtreamId: number,
         contentType: 'vod' | 'episode'
+    ): Promise<void>;
+
+    /**
+     * Save/update many playback positions at once (season-level "mark as
+     * watched"). Rejects when nothing was persisted.
+     */
+    savePlaybackPositionsBatch(
+        playlistId: string,
+        items: PlaybackPositionData[]
+    ): Promise<void>;
+
+    /**
+     * Clear many playback positions at once (season-level "mark as
+     * unwatched"). Rejects when nothing was cleared.
+     */
+    clearPlaybackPositionsBatch(
+        playlistId: string,
+        items: { contentXtreamId: number; contentType: 'vod' | 'episode' }[]
     ): Promise<void>;
 
     // =========================================================================

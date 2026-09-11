@@ -29,8 +29,6 @@ const PLAYLIST_TWO: XtreamPlaylistData = {
 describe('XtreamCatalogFacadeService', () => {
     let service: XtreamCatalogFacadeService;
     const contentType = signal<'live' | 'vod' | 'series'>('vod');
-    const limit = signal(25);
-    const page = signal(0);
     const selectedCategory = signal<Record<string, unknown> | null>({
         id: 11,
         name: 'Movies',
@@ -44,25 +42,25 @@ describe('XtreamCatalogFacadeService', () => {
         { xtream_id: 2, title: 'B' },
     ]);
     const selectedItem = signal<Record<string, unknown> | null>(null);
-    const totalPages = signal(1);
+    const hasMoreContent = signal(false);
     const isPaginatedContentLoading = signal(false);
     const contentSortMode = signal<PortalCatalogSortMode>('date-desc');
+    const minRating = signal<number | null>(null);
     const currentPlaylist = signal<XtreamPlaylistData | null>(PLAYLIST_ONE);
 
     const xtreamStore = {
         selectedContentType: contentType,
-        limit,
-        page,
         getSelectedCategory: selectedCategory,
         selectedCategoryId,
         getPaginatedContent: paginatedContent,
         selectItemsFromSelectedCategory: selectedCategoryItems,
         selectedItem,
-        getTotalPages: totalPages,
+        hasMoreContent,
         isPaginatedContentLoading,
         contentSortMode,
+        minRating,
         currentPlaylist,
-        loadAllPositions: jest.fn(),
+        loadAllPositions: jest.fn().mockResolvedValue(undefined),
         setCategorySearchTerm: jest.fn(),
         setSelectedItem: jest.fn((item: Record<string, unknown> | null) => {
             selectedItem.set(item);
@@ -70,14 +68,14 @@ describe('XtreamCatalogFacadeService', () => {
         setSelectedCategory: jest.fn((categoryId: number | null) => {
             selectedCategoryId.set(categoryId);
         }),
-        setPage: jest.fn((nextPage: number) => {
-            page.set(nextPage);
-        }),
-        setLimit: jest.fn((nextLimit: number) => {
-            limit.set(nextLimit);
-        }),
+        loadMoreContent: jest.fn(),
+        saveCatalogScrollState: jest.fn(),
+        consumeCatalogScrollState: jest.fn().mockReturnValue(null),
         setContentSortMode: jest.fn((mode: PortalCatalogSortMode) => {
             contentSortMode.set(mode);
+        }),
+        setMinRating: jest.fn((value: number | null) => {
+            minRating.set(value);
         }),
         hasSeriesProgress: jest.fn().mockReturnValue(false),
         getProgressPercent: jest.fn().mockReturnValue(40),
@@ -87,8 +85,6 @@ describe('XtreamCatalogFacadeService', () => {
     beforeEach(() => {
         localStorage.removeItem('xtream-category-sort-mode');
         contentType.set('vod');
-        limit.set(25);
-        page.set(0);
         selectedCategory.set({ id: 11, name: 'Movies' });
         selectedCategoryId.set(11);
         paginatedContent.set([{ xtream_id: 1, title: 'A' }]);
@@ -97,18 +93,21 @@ describe('XtreamCatalogFacadeService', () => {
             { xtream_id: 2, title: 'B' },
         ]);
         selectedItem.set(null);
-        totalPages.set(1);
+        hasMoreContent.set(false);
         isPaginatedContentLoading.set(false);
         contentSortMode.set('date-desc');
+        minRating.set(null);
         currentPlaylist.set(PLAYLIST_ONE);
 
         xtreamStore.loadAllPositions.mockClear();
         xtreamStore.setCategorySearchTerm.mockClear();
         xtreamStore.setSelectedItem.mockClear();
         xtreamStore.setSelectedCategory.mockClear();
-        xtreamStore.setPage.mockClear();
-        xtreamStore.setLimit.mockClear();
+        xtreamStore.loadMoreContent.mockClear();
+        xtreamStore.saveCatalogScrollState.mockClear();
+        xtreamStore.consumeCatalogScrollState.mockClear();
         xtreamStore.setContentSortMode.mockClear();
+        xtreamStore.setMinRating.mockClear();
         xtreamStore.hasSeriesProgress.mockClear();
         xtreamStore.getProgressPercent.mockClear();
         xtreamStore.isWatched.mockClear();
@@ -134,11 +133,11 @@ describe('XtreamCatalogFacadeService', () => {
         );
     });
 
-    it('exposes store-driven paginated content, total pages, and category counts', () => {
+    it('exposes store-driven windowed content, hasMore, and category counts', () => {
         expect(service.paginatedContent()).toEqual([
             { xtream_id: 1, title: 'A' },
         ]);
-        expect(service.totalPages()).toBe(1);
+        expect(service.hasMore()).toBe(false);
         expect(service.categoryItemCount()).toBe(2);
 
         paginatedContent.set([
@@ -150,14 +149,30 @@ describe('XtreamCatalogFacadeService', () => {
             { xtream_id: 4, title: 'D' },
             { xtream_id: 5, title: 'E' },
         ]);
-        totalPages.set(4);
+        hasMoreContent.set(true);
 
         expect(service.paginatedContent()).toEqual([
             { xtream_id: 3, title: 'C' },
             { xtream_id: 4, title: 'D' },
         ]);
-        expect(service.totalPages()).toBe(4);
+        expect(service.hasMore()).toBe(true);
         expect(service.categoryItemCount()).toBe(3);
+    });
+
+    it('delegates loadMore and the scroll-position handoff to the store', () => {
+        service.loadMore();
+        expect(xtreamStore.loadMoreContent).toHaveBeenCalledTimes(1);
+
+        service.saveScrollPosition(420);
+        expect(xtreamStore.saveCatalogScrollState).toHaveBeenCalledWith(420);
+
+        xtreamStore.consumeCatalogScrollState.mockReturnValueOnce(420);
+        expect(service.consumeSavedScrollPosition()).toBe(420);
+        expect(service.consumeSavedScrollPosition()).toBeNull();
+
+        // Synchronous in-memory appends never surface async tail states.
+        expect(service.isAppending()).toBe(false);
+        expect(service.appendError()).toBe(false);
     });
 
     it('restores saved sort mode, sets the selected category, and loads positions once per playlist', () => {
@@ -189,5 +204,68 @@ describe('XtreamCatalogFacadeService', () => {
         expect(localStorage.getItem('xtream-category-sort-mode')).toBe(
             'name-desc'
         );
+    });
+
+    it('keeps rating sort modes out of live content', () => {
+        contentSortMode.set('rating-desc');
+        contentType.set('live');
+
+        expect(service.supportsRatingSort).toBe(false);
+        expect(service.contentSortMode()).toBe('date-desc');
+
+        service.setContentSortMode('rating-asc');
+
+        expect(xtreamStore.setContentSortMode).not.toHaveBeenCalled();
+        expect(localStorage.getItem('xtream-category-sort-mode')).toBeNull();
+
+        contentType.set('vod');
+
+        expect(service.supportsRatingSort).toBe(true);
+        expect(service.contentSortMode()).toBe('rating-desc');
+
+        service.setContentSortMode('rating-asc');
+
+        expect(xtreamStore.setContentSortMode).toHaveBeenCalledWith(
+            'rating-asc'
+        );
+        expect(localStorage.getItem('xtream-category-sort-mode')).toBe(
+            'rating-asc'
+        );
+    });
+
+    it('does not restore saved rating sort modes for live content', () => {
+        contentType.set('live');
+        localStorage.setItem('xtream-category-sort-mode', 'rating-desc');
+
+        service.initialize('42');
+
+        expect(xtreamStore.setContentSortMode).not.toHaveBeenCalled();
+        expect(service.contentSortMode()).toBe('date-desc');
+    });
+
+    it('exposes rating refinements only for VOD and series content', () => {
+        minRating.set(8);
+
+        expect(service.supportsRatingSort).toBe(true);
+        expect(service.minRating?.()).toBe(8);
+
+        service.setMinRating(7);
+
+        expect(xtreamStore.setMinRating).toHaveBeenCalledWith(7);
+
+        contentType.set('series');
+
+        expect(service.supportsRatingSort).toBe(true);
+        expect(service.minRating?.()).toBe(7);
+
+        xtreamStore.setMinRating.mockClear();
+        contentType.set('live');
+
+        expect(service.supportsRatingSort).toBe(false);
+        expect(service.minRating?.()).toBeNull();
+
+        service.setMinRating(9);
+
+        expect(xtreamStore.setMinRating).not.toHaveBeenCalled();
     });
 });

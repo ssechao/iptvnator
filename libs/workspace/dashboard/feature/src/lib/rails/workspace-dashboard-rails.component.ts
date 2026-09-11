@@ -5,205 +5,94 @@ import {
     effect,
     inject,
     signal,
+    untracked,
 } from '@angular/core';
+import { toObservable, toSignal } from '@angular/core/rxjs-interop';
+import { interval, map, of, startWith, switchMap } from 'rxjs';
+import { EpgService } from '@iptvnator/epg/data-access';
+import {
+    type EpgProgram,
+    isStalkerAccountPlaylist,
+    isXtreamAccountPlaylist,
+    normalizeDashboardRailsSettings,
+} from '@iptvnator/shared/interfaces';
 import { MatButtonModule } from '@angular/material/button';
 import { MatDialog } from '@angular/material/dialog';
 import { MatIcon } from '@angular/material/icon';
 import { MatSnackBar } from '@angular/material/snack-bar';
-import { RouterLink } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
+import { isPortalPlaybackWatched } from '@iptvnator/portal/shared/util';
 import { Store } from '@ngrx/store';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
 import {
     EmptyStateComponent,
     PlaylistInfoComponent,
+    PlaylistRefreshActionService,
 } from '@iptvnator/playlist/shared/ui';
-import { PlaylistRefreshActionService } from '@iptvnator/playlist/shared/util';
 import {
     WORKSPACE_SHELL_ACTIONS,
     WorkspacePlaylistType,
 } from '@iptvnator/workspace/shell/util';
 import { DialogService } from '@iptvnator/ui/components';
 import { PlaylistActions } from '@iptvnator/m3u-state';
-import { DatabaseService } from '@iptvnator/services';
+import {
+    PlaylistDeleteActionService,
+    RuntimeCapabilitiesService,
+    SettingsStore,
+} from '@iptvnator/services';
 import {
     DashboardDataService,
     DashboardFavoriteItem,
     DashboardRecentlyAddedItem,
+    DashboardRecommendationItem,
+    DashboardRecommendationsService,
+    DashboardSourceExpiryService,
+    DashboardTrendingItem,
+    DashboardTrendingService,
     GlobalRecentItem,
+    resolveSourceExpiryBadge,
+    SOURCE_EXPIRY_TICK_MS,
 } from '@iptvnator/workspace/dashboard/data-access';
+import type { DashboardHeroTmdbExtras } from './dashboard-hero-tmdb.service';
+import { DashboardHeroTmdbService } from './dashboard-hero-tmdb.service';
 import { DashboardRailComponent } from './dashboard-rail.component';
 import type {
-    DashboardRailAction,
     DashboardRailCard,
     DashboardRailActionSelection,
 } from './dashboard-rail.component';
 import type { PlaylistMeta } from '@iptvnator/shared/interfaces';
-
-// Cap dashboard rails at 20 items. Users get ~3× what's visible at once,
-// the DOM stays cheap, and the "Manage all" link is one click away for the
-// full list. Matches the single-rail density of Netflix / Apple TV+.
-const RAIL_ITEM_LIMIT = 20;
-
-// Six placeholder slots per skeleton rail — fills a typical viewport without
-// taking the whole page. Mirrors the recently-added skeleton density.
-const SKELETON_CARDS_PER_RAIL = [1, 2, 3, 4, 5, 6] as const;
-const SKELETON_RAILS = [1, 2, 3] as const;
-
-interface DashboardHeroModel {
-    readonly backdropUrl?: string;
-    readonly backdropSource: DashboardHeroBackdropSource;
-    readonly contentType?: 'live' | 'movie' | 'series';
-    readonly fallbackBackdropBackground: string;
-    readonly fallbackPosterBackground: string;
-    readonly hasBackdrop: boolean;
-    readonly icon: string;
-    readonly link: string[];
-    readonly posterUrl?: string;
-    readonly state?: Record<string, unknown>;
-    readonly subtitle: string;
-    readonly title: string;
-}
-
-export type DashboardHeroBackdropSource = 'backdrop' | 'poster' | 'fallback';
-
-export interface DashboardHeroArtworkInput {
-    readonly backdropUrl?: string | null;
-    readonly posterUrl?: string | null;
-    readonly title: string;
-}
-
-export interface DashboardHeroArtwork {
-    readonly backdropUrl?: string;
-    readonly backdropSource: DashboardHeroBackdropSource;
-    readonly fallbackBackdropBackground: string;
-    readonly fallbackPosterBackground: string;
-    readonly hasBackdrop: boolean;
-    readonly posterUrl?: string;
-}
-
-export function resolveDashboardHeroArtwork(
-    item: DashboardHeroArtworkInput,
-    failedImages: Record<string, true>
-): DashboardHeroArtwork {
-    const posterUrl =
-        item.posterUrl && !failedImages[item.posterUrl]
-            ? item.posterUrl
-            : undefined;
-    const explicitBackdropUrl =
-        item.backdropUrl && !failedImages[item.backdropUrl]
-            ? item.backdropUrl
-            : undefined;
-    const backdropUrl = explicitBackdropUrl ?? posterUrl;
-    const backdropSource: DashboardHeroBackdropSource = explicitBackdropUrl
-        ? 'backdrop'
-        : posterUrl
-          ? 'poster'
-          : 'fallback';
-
-    return {
-        backdropUrl,
-        backdropSource,
-        fallbackBackdropBackground: buildFallbackBackground(
-            item.title,
-            50,
-            15,
-            80,
-            5,
-            60
-        ),
-        fallbackPosterBackground: buildFallbackBackground(
-            item.title,
-            40,
-            25,
-            50,
-            15,
-            40
-        ),
-        hasBackdrop: backdropSource === 'backdrop',
-        posterUrl,
-    };
-}
-
-function buildFallbackBackground(
-    title: string,
-    saturationA: number,
-    lightnessA: number,
-    saturationB: number,
-    lightnessB: number,
-    hueOffset: number
-): string {
-    const hue = calculateHue(title || 'placeholder');
-    const h2 = (hue + hueOffset) % 360;
-    return `linear-gradient(135deg, hsl(${hue}, ${saturationA}%, ${lightnessA}%) 0%, hsl(${h2}, ${saturationB}%, ${lightnessB}%) 100%)`;
-}
-
-function calculateHue(text: string): number {
-    let hash = 0;
-    for (let i = 0; i < text.length; i++) {
-        hash = text.charCodeAt(i) + ((hash << 5) - hash);
-        hash = hash & hash;
-    }
-    return Math.abs(hash) % 360;
-}
-
-export type DashboardSourceActionId =
-    | 'refresh'
-    | 'playlist-info'
-    | 'account-info'
-    | 'remove';
-
-export function buildDashboardSourceActions(
-    playlist: PlaylistMeta,
-    canRefresh: boolean
-): DashboardRailAction[] {
-    const actions: DashboardRailAction[] = [];
-
-    if (canRefresh) {
-        actions.push({
-            id: 'refresh',
-            icon: 'sync',
-            labelKey: playlist.serverUrl
-                ? 'HOME.PLAYLISTS.REFRESH_XTREAM'
-                : 'HOME.PLAYLISTS.REFRESH',
-        });
-    }
-
-    actions.push({
-        id: 'playlist-info',
-        icon: 'edit',
-        labelKey: 'HOME.PLAYLISTS.SHOW_DETAILS',
-    });
-
-    if (isXtreamAccountPlaylist(playlist)) {
-        actions.push({
-            id: 'account-info',
-            icon: 'person',
-            labelKey: 'WORKSPACE.SHELL.ACCOUNT_INFO',
-        });
-    }
-
-    actions.push({
-        id: 'remove',
-        icon: 'delete',
-        labelKey: 'HOME.PLAYLISTS.REMOVE_DIALOG.TITLE',
-        destructive: true,
-        separatorBefore: true,
-    });
-
-    return actions;
-}
-
-function isXtreamAccountPlaylist(
-    playlist: PlaylistMeta
-): playlist is PlaylistMeta & {
-    serverUrl: string;
-    username: string;
-    password: string;
-} {
-    return Boolean(
-        playlist.serverUrl && playlist.username && playlist.password
-    );
-}
+import type { DashboardHeroModel } from './dashboard-hero.utils';
+import { resolveDashboardHeroArtwork } from './dashboard-hero.utils';
+import {
+    buildDashboardLiveEpgDetails,
+    buildLiveEpgCardsForEnabledRails,
+    buildLiveEpgLookupKeys,
+    getLiveEpgProgramForCard,
+    LIVE_EPG_TICK_MS,
+} from './dashboard-live-epg.utils';
+import type { DashboardLiveEpgDetails } from './dashboard-live-epg.utils';
+import {
+    buildPlaybackPositionReloadKey,
+    formatRemainingLabel,
+    isContinueWatchingRecentItem,
+    playbackProgressPercent,
+} from './dashboard-playback.utils';
+import {
+    buildDashboardCollectionViewState,
+    buildDashboardContinueWatchingActions,
+    buildDashboardRailSeeAllState,
+    buildDashboardSourceActions,
+    liveRailTitleKeyForSource,
+    RAIL_ITEM_LIMIT,
+    shouldShowLiveFavoritesSkeleton,
+    shouldShowRecentContentSkeleton,
+    SKELETON_CARDS_PER_RAIL,
+    SKELETON_RAILS,
+} from './dashboard-rail.utils';
+import type {
+    DashboardContinueWatchingActionId,
+    DashboardSourceActionId,
+} from './dashboard-rail.utils';
 
 @Component({
     selector: 'lib-workspace-dashboard-rails',
@@ -224,40 +113,97 @@ function isXtreamAccountPlaylist(
 })
 export class WorkspaceDashboardRailsComponent {
     readonly data = inject(DashboardDataService);
-    private readonly databaseService = inject(DatabaseService);
     private readonly dialog = inject(MatDialog);
     private readonly dialogService = inject(DialogService);
+    private readonly playlistDeleteAction = inject(PlaylistDeleteActionService);
     private readonly playlistRefreshAction = inject(
         PlaylistRefreshActionService
     );
+    private readonly router = inject(Router);
     private readonly snackBar = inject(MatSnackBar);
     private readonly store = inject(Store);
     private readonly translate = inject(TranslateService);
+    private readonly languageTick = toSignal(
+        this.translate.onLangChange.pipe(startWith(null)),
+        { initialValue: null }
+    );
     private readonly shellActions = inject(WORKSPACE_SHELL_ACTIONS);
+    private readonly epgService = inject(EpgService);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
+    private readonly settingsStore = inject(SettingsStore);
+    private readonly heroTmdb = inject(DashboardHeroTmdbService);
+    private readonly sourceExpiry = inject(DashboardSourceExpiryService);
+    readonly trendingService = inject(DashboardTrendingService);
+    readonly recommendationsService = inject(DashboardRecommendationsService);
 
     readonly hasPlaylists = computed(() => this.data.playlists().length > 0);
     readonly ready = this.data.dashboardReady;
     readonly xtreamPlaylistCount = this.data.xtreamPlaylistCount;
-    readonly isElectron = !!window.electron;
+    readonly isElectron = this.runtime.isElectron;
 
     readonly skeletonSlots = SKELETON_CARDS_PER_RAIL;
     readonly skeletonRails = SKELETON_RAILS;
+    readonly liveRailTitleKeyForSource = liveRailTitleKeyForSource;
     readonly failedHeroImages = signal<Record<string, true>>({});
+    readonly dashboardRails = computed(() =>
+        normalizeDashboardRailsSettings(this.settingsStore.dashboardRails?.())
+    );
+
+    private readonly heroRecentItem = computed(
+        () => this.data.globalRecentItems()[0] ?? null
+    );
+
+    /** TMDB extras for the current hero item, patched in after first paint */
+    private readonly heroTmdbExtras = signal<{
+        key: string;
+        extras: DashboardHeroTmdbExtras | null;
+    } | null>(null);
+
+    private readonly heroLiveCard = computed<DashboardRailCard | null>(() => {
+        const item = this.heroRecentItem();
+        return item?.type === 'live' ? this.toRecentCard(item) : null;
+    });
 
     readonly hero = computed<DashboardHeroModel | null>(() => {
-        const item = this.data.globalRecentItems()[0] ?? null;
+        const item = this.heroRecentItem();
         if (!item) {
             return null;
         }
 
+        // Single reactive read, gated on the TMDB opt-in so cached
+        // extras vanish immediately when the user opts out mid-session
+        const extrasState = this.heroTmdbExtras();
+        const extras =
+            this.heroTmdb.isEnabled() &&
+            extrasState?.key === this.heroTmdbKey(item)
+                ? extrasState.extras
+                : null;
         const artwork = resolveDashboardHeroArtwork(
             {
-                backdropUrl: item.backdrop_url,
+                backdropUrl: item.backdrop_url || (extras?.backdropUrl ?? null),
                 posterUrl: item.poster_url,
                 title: item.title,
             },
             this.failedHeroImages()
         );
+
+        const position = this.data.getPlaybackPositionForItem(item);
+        const liveEpgDetails =
+            item.type === 'live'
+                ? this.getLiveEpgDetailsForCard(this.heroLiveCard())
+                : null;
+        const episodeBadge =
+            item.type === 'series' &&
+            position?.seasonNumber != null &&
+            position?.episodeNumber != null
+                ? this.translate.instant(
+                      'WORKSPACE.DASHBOARD.SEASON_EPISODE_BADGE',
+                      {
+                          season: position.seasonNumber,
+                          episode: position.episodeNumber,
+                      }
+                  )
+                : null;
 
         return {
             ...artwork,
@@ -267,22 +213,125 @@ export class WorkspaceDashboardRailsComponent {
             state: this.data.getRecentItemNavigationState(item),
             subtitle: this.buildHeroSubtitle(item),
             title: item.title,
+            rating: extras?.rating ?? null,
+            genres: extras?.genres ?? [],
+            episodeBadge,
+            watchProgress:
+                item.type === 'live' ? null : playbackProgressPercent(position),
+            remainingLabel:
+                item.type === 'live' ? null : formatRemainingLabel(position),
+            nowPlayingTitle: liveEpgDetails?.nowPlayingTitle ?? null,
+            nowPlayingTimeRange: liveEpgDetails?.nowPlayingTimeRange ?? null,
+            nowPlayingProgress: liveEpgDetails?.nowPlayingProgress ?? null,
         };
     });
 
-    readonly recentlyWatchedCards = computed<DashboardRailCard[]>(() =>
+    readonly continueWatchingBaseCards = computed<DashboardRailCard[]>(() => {
+        this.languageTick();
+        return this.data
+            .globalRecentVodItems()
+            .filter(isContinueWatchingRecentItem)
+            .slice(0, RAIL_ITEM_LIMIT)
+            .map((item) => this.toRecentCard(item));
+    });
+
+    readonly continueWatchingCards = computed<DashboardRailCard[]>(() =>
+        this.continueWatchingBaseCards()
+    );
+
+    readonly liveFavoriteCards = computed<DashboardRailCard[]>(() =>
         this.data
-            .globalRecentItems()
+            .globalFavoriteLiveItems()
+            .slice(0, RAIL_ITEM_LIMIT)
+            .map((item) => this.toFavoriteCard(item))
+    );
+
+    readonly recentLiveCards = computed<DashboardRailCard[]>(() =>
+        this.data
+            .globalRecentLiveItems()
             .slice(0, RAIL_ITEM_LIMIT)
             .map((item) => this.toRecentCard(item))
     );
 
-    readonly favoriteCards = computed<DashboardRailCard[]>(() =>
+    readonly showLiveFavoritesSkeleton = computed(() =>
+        shouldShowLiveFavoritesSkeleton(this.dashboardRails(), {
+            globalFavoritesLoading: this.data.globalFavoritesLoading(),
+        })
+    );
+
+    readonly showRecentContentSkeleton = computed(() =>
+        shouldShowRecentContentSkeleton(this.dashboardRails(), {
+            continueWatchingCount: this.continueWatchingCards().length,
+            globalRecentLoading: this.data.globalRecentLoading(),
+            recentLiveCount: this.recentLiveCards().length,
+        })
+    );
+
+    // Best-effort EPG lookup keyed by the app-wide M3U XMLTV chain
+    // (tvg-id -> tvg-name -> name), with the card title as a final fallback.
+    // Xtream/Stalker live items often have no XMLTV side-channel and will
+    // simply return null — the card renders without the program row.
+    private readonly liveChannelLookupKeys = computed(() => {
+        const heroLiveCard = this.heroLiveCard();
+        return buildLiveEpgLookupKeys(
+            buildLiveEpgCardsForEnabledRails(
+                this.dashboardRails(),
+                heroLiveCard,
+                this.liveFavoriteCards(),
+                this.recentLiveCards()
+            )
+        );
+    });
+
+    private readonly playbackPositionReloadKey = computed(() =>
+        buildPlaybackPositionReloadKey(this.data.globalRecentVodItems())
+    );
+
+    // Re-fetch on rail change AND on a 30s heartbeat so the progress bar
+    // catches the boundary between programs without a full page revisit.
+    private readonly liveEpgPrograms = toSignal(
+        toObservable(this.liveChannelLookupKeys).pipe(
+            switchMap((keys) =>
+                keys.length === 0
+                    ? of(new Map<string, EpgProgram | null>())
+                    : interval(LIVE_EPG_TICK_MS).pipe(
+                          startWith(0),
+                          switchMap(() =>
+                              this.epgService.getCurrentProgramsForChannels(
+                                  keys
+                              )
+                          )
+                      )
+            )
+        ),
+        { initialValue: new Map<string, EpgProgram | null>() }
+    );
+
+    readonly liveFavoriteCardsEnriched = computed<DashboardRailCard[]>(() =>
+        this.enrichLiveCards(this.liveFavoriteCards())
+    );
+
+    readonly recentLiveCardsEnriched = computed<DashboardRailCard[]>(() =>
+        this.enrichLiveCards(this.recentLiveCards())
+    );
+
+    readonly favoriteMoviesAndSeriesCards = computed<DashboardRailCard[]>(() =>
         this.data
             .globalFavoriteItems()
+            .filter((item) => item.type === 'movie' || item.type === 'series')
             .slice(0, RAIL_ITEM_LIMIT)
             .map((item) => this.toFavoriteCard(item))
     );
+
+    readonly continueWatchingSeeAllState = computed(() =>
+        buildDashboardRailSeeAllState(this.continueWatchingBaseCards())
+    );
+
+    readonly favoriteMoviesAndSeriesSeeAllState = computed(() =>
+        this.buildNonLiveSeeAllState(this.favoriteMoviesAndSeriesCards())
+    );
+
+    readonly liveSeeAllState = buildDashboardCollectionViewState('live');
 
     readonly xtreamRecentlyAddedCards = computed<DashboardRailCard[]>(() =>
         this.data
@@ -291,8 +340,57 @@ export class WorkspaceDashboardRailsComponent {
             .map((item) => this.toRecentlyAddedCard(item))
     );
 
-    readonly sourceCards = computed<DashboardRailCard[]>(() =>
-        this.data.recentPlaylists().map((playlist) => ({
+    readonly trendingCards = computed<DashboardRailCard[]>(() => {
+        this.languageTick();
+        // isAvailable reads the TMDB settings signal — flipping the
+        // opt-in off mid-session hides the rail immediately
+        if (!this.trendingService.isAvailable) {
+            return [];
+        }
+        return this.trendingService
+            .items()
+            .map((item) => this.toTrendingCard(item));
+    });
+
+    readonly recommendationCards = computed<DashboardRailCard[]>(() => {
+        if (!this.recommendationsService.isAvailable) {
+            return [];
+        }
+        return this.recommendationsService
+            .items()
+            .map((item) => this.toRecommendationCard(item));
+    });
+
+    readonly recommendationsRailLabel = computed<string>(() => {
+        this.languageTick();
+        const seeds = this.recommendationsService.seedTitles();
+        // A single contributing seed earns the honest Netflix-style header;
+        // a mixed rail falls back to the generic one.
+        return seeds.length === 1
+            ? this.translate.instant(
+                  'WORKSPACE.DASHBOARD.TMDB_RECOMMENDED_BECAUSE',
+                  { title: seeds[0] }
+              )
+            : this.t('WORKSPACE.DASHBOARD.TMDB_RECOMMENDED');
+    });
+
+    // Minute heartbeat for the expiry badges: resolveSourceExpiryBadge reads
+    // the wall clock, so without a reactive tick a dashboard left open would
+    // never cross a day-countdown or expiration boundary. interval() emits
+    // 0 first — shifted by one so it differs from initialValue, otherwise
+    // the signal's equality check would swallow the first tick.
+    private readonly sourceExpiryTick = toSignal(
+        interval(SOURCE_EXPIRY_TICK_MS).pipe(map((tick) => tick + 1)),
+        { initialValue: 0 }
+    );
+
+    readonly sourceCards = computed<DashboardRailCard[]>(() => {
+        // Explicit language dependency for the translate.instant() calls
+        // below (title fallback, expiry-badge labels). getPlaylistProvider
+        // also reads the data service's language tick, but the labels must
+        // not rely on that indirection surviving refactors.
+        this.languageTick();
+        return this.data.recentPlaylists().map((playlist) => ({
             id: playlist._id,
             title:
                 playlist.title ||
@@ -309,8 +407,9 @@ export class WorkspaceDashboardRailsComponent {
                 playlist,
                 this.playlistRefreshAction.canRefresh(playlist)
             ),
-        }))
-    );
+            expiryBadge: this.buildSourceExpiryBadge(playlist._id),
+        }));
+    });
 
     constructor() {
         // Re-entering the dashboard should pick up any DB-backed recent/favorite
@@ -320,13 +419,93 @@ export class WorkspaceDashboardRailsComponent {
         void this.data.reloadGlobalFavorites();
 
         // Refresh when Xtream playlist count changes so a newly added provider
-        // populates the rail without a manual dashboard reload.
+        // populates the rail without a manual dashboard reload. The Xtream
+        // recently-added query can be the slowest dashboard worker request on
+        // startup, so let favorites claim the worker first.
         effect(() => {
-            if (this.xtreamPlaylistCount() === 0) {
+            if (
+                this.xtreamPlaylistCount() === 0 ||
+                !this.data.globalFavoritesLoaded()
+            ) {
                 return;
             }
 
             void this.data.reloadXtreamRecentlyAddedItems(RAIL_ITEM_LIMIT);
+        });
+
+        // Reload playback positions when the VOD/series recent set changes.
+        // The primitive key keeps live-only recent churn out of the IPC path.
+        effect(() => {
+            this.playbackPositionReloadKey();
+            untracked(() => void this.data.reloadPlaybackPositions());
+        });
+
+        // TMDB extras for the hero (backdrop/rating/genres) — async after
+        // first paint, staleness-guarded against hero changes in flight.
+        effect(() => {
+            const item = this.heroRecentItem();
+            if (!item || (item.type !== 'movie' && item.type !== 'series')) {
+                return;
+            }
+            const key = this.heroTmdbKey(item);
+            untracked(() => {
+                if (this.heroTmdbExtras()?.key === key) {
+                    return;
+                }
+                void this.heroTmdb.getExtras(item).then((extras) => {
+                    const current = untracked(() => this.heroRecentItem());
+                    if (current && this.heroTmdbKey(current) === key) {
+                        this.heroTmdbExtras.set({ key, extras });
+                    }
+                });
+            });
+        });
+
+        // Subscription-expiry badges for the source cards. Xtream rides the
+        // shared PortalStatusService cache; Stalker reads the import-time
+        // snapshot (memoized per playlist), so this stays cheap on re-entry.
+        // Gated on the sources rail being enabled — with the rail hidden no
+        // badge can render, so the status checks would be pure waste.
+        effect(() => {
+            if (!this.dashboardRails().recentSources) {
+                return;
+            }
+            const playlists = this.data.recentPlaylists();
+            untracked(() => void this.sourceExpiry.refresh(playlists));
+        });
+
+        // Trending rail: needs the TMDB opt-in and the Electron DB worker.
+        // Deferred until the dashboard's own recent/favorites data is in so
+        // the batched title match never competes for the worker at startup.
+        effect(() => {
+            if (
+                !this.dashboardRails().tmdbTrending ||
+                !this.data.globalFavoritesLoaded()
+            ) {
+                return;
+            }
+            untracked(() => void this.trendingService.load());
+        });
+
+        // Recommendations rail: same gating as trending, plus tracked
+        // reads of the seed source, the favorites (both feed the
+        // exclusion set) and the playlist set (feeds the catalog key) so
+        // a newly watched/favorited title or an imported/deleted playlist
+        // re-runs the load — the service keys loads by seed + exclusion +
+        // catalog set and skips no-ops.
+        effect(() => {
+            if (
+                !this.dashboardRails().tmdbRecommendations ||
+                !this.data.globalFavoritesLoaded()
+            ) {
+                return;
+            }
+            this.data.globalRecentVodItems();
+            this.data.globalFavoriteItems();
+            this.data.playlists();
+            // Language feeds the service's load key (localized payloads)
+            this.languageTick();
+            untracked(() => void this.recommendationsService.load());
         });
     }
 
@@ -357,12 +536,107 @@ export class WorkspaceDashboardRailsComponent {
                 this.dialog.open(PlaylistInfoComponent, { data: playlist });
                 break;
             case 'account-info':
-                this.openXtreamAccountInfo(playlist);
+                this.openAccountInfo(playlist);
                 break;
             case 'remove':
                 this.confirmRemovePlaylist(playlist);
                 break;
         }
+    }
+
+    onContinueWatchingActionSelected(
+        selection: DashboardRailActionSelection
+    ): void {
+        const item = this.data
+            .globalRecentVodItems()
+            .find(
+                (candidate) =>
+                    this.recentCardId(candidate) === selection.card.id
+            );
+
+        if (!item) {
+            return;
+        }
+
+        switch (selection.action.id as DashboardContinueWatchingActionId) {
+            case 'resume':
+                this.resumeRecentItem(item);
+                break;
+            case 'mark-watched':
+                this.runContinueWatchingMutation(() =>
+                    this.data.markRecentItemWatched(item)
+                );
+                break;
+            case 'remove-from-history':
+                this.runContinueWatchingMutation(() =>
+                    this.data.removeGlobalRecentItem(item)
+                );
+                break;
+        }
+    }
+
+    private resumeRecentItem(item: GlobalRecentItem): void {
+        const navigation = this.data.getRecentItemResumeNavigation(item);
+        if (!navigation) {
+            return;
+        }
+        void this.router.navigate(navigation.link, {
+            state: navigation.state,
+        });
+    }
+
+    /**
+     * A rejected persistence write leaves the card unchanged, so tell the
+     * user instead of failing silently with an unhandled rejection.
+     */
+    private runContinueWatchingMutation(
+        mutation: () => Promise<unknown>
+    ): void {
+        mutation().catch(() => {
+            this.snackBar.open(
+                this.t('WORKSPACE.DASHBOARD.ACTION_FAILED'),
+                undefined,
+                { duration: 5000 }
+            );
+        });
+    }
+
+    private enrichLiveCards(
+        cards: readonly DashboardRailCard[]
+    ): DashboardRailCard[] {
+        return cards.map((card) => {
+            const details = this.getLiveEpgDetailsForCard(card);
+            if (!details) {
+                return card;
+            }
+            return { ...card, ...details };
+        });
+    }
+
+    private getLiveEpgDetailsForCard(
+        card: DashboardRailCard | null
+    ): DashboardLiveEpgDetails | null {
+        if (!card) {
+            return null;
+        }
+        const program = getLiveEpgProgramForCard(card, this.liveEpgPrograms());
+        // Recompute the now-window each tick so progress moves between
+        // 30s ticks even if the program identity is unchanged.
+        return buildDashboardLiveEpgDetails(
+            program,
+            Date.now(),
+            this.settingsStore.resolvedEpgOffsetMinutes()
+        );
+    }
+
+    private buildNonLiveSeeAllState(
+        cards: readonly DashboardRailCard[]
+    ): Record<string, unknown> {
+        return buildDashboardCollectionViewState(
+            cards.some((card) => card.contentType === 'movie')
+                ? 'movie'
+                : 'series'
+        );
     }
 
     private buildHeroSubtitle(item: GlobalRecentItem): string {
@@ -375,16 +649,53 @@ export class WorkspaceDashboardRailsComponent {
     }
 
     private toRecentCard(item: GlobalRecentItem): DashboardRailCard {
+        const position = this.data.getPlaybackPositionForItem(item);
+        const watchProgress = playbackProgressPercent(position);
+        const episodeBadge =
+            item.type === 'series' &&
+            position?.seasonNumber != null &&
+            position?.episodeNumber != null
+                ? this.translate.instant(
+                      'WORKSPACE.DASHBOARD.SEASON_EPISODE_BADGE',
+                      {
+                          season: position.seasonNumber,
+                          episode: position.episodeNumber,
+                      }
+                  )
+                : null;
         return {
-            id: `recent-${item.id}-${item.playlist_id}-${item.viewed_at}`,
+            id: this.recentCardId(item),
             title: item.title,
             subtitle: `${this.data.getRecentItemProviderLabel(item)} · ${this.data.getRecentItemTypeLabel(item)}`,
             imageUrl: item.poster_url,
             icon: this.typeIcon(item.type),
             contentType: item.type,
+            epgLookupKey: item.epg_lookup_key,
             link: this.data.getRecentItemLink(item),
-            state: this.data.getRecentItemNavigationState(item),
+            // Default click is detail-only for every card — an in-progress
+            // series no longer auto-plays on click (issue #1441); resuming
+            // moved to the ⋮ menu below. The hero CTA keeps the resume state.
+            state: this.data.getRecentItemDetailNavigationState(item),
+            watchProgress,
+            episodeBadge,
+            ...(item.type === 'movie' || item.type === 'series'
+                ? {
+                      actions: buildDashboardContinueWatchingActions({
+                          canResume:
+                              this.data.getRecentItemResumeNavigation(item) !==
+                              null,
+                          canMarkWatched:
+                              !!position?.durationSeconds &&
+                              position.durationSeconds > 0 &&
+                              !isPortalPlaybackWatched(position),
+                      }),
+                  }
+                : {}),
         };
+    }
+
+    private recentCardId(item: GlobalRecentItem): string {
+        return `recent-${item.id}-${item.playlist_id}-${item.viewed_at}`;
     }
 
     private toFavoriteCard(item: DashboardFavoriteItem): DashboardRailCard {
@@ -395,6 +706,7 @@ export class WorkspaceDashboardRailsComponent {
             imageUrl: item.poster_url,
             icon: this.typeIcon(item.type),
             contentType: item.type,
+            epgLookupKey: item.epg_lookup_key,
             link: this.data.getGlobalFavoriteLink(item),
             state: this.data.getGlobalFavoriteNavigationState(item),
         };
@@ -419,32 +731,121 @@ export class WorkspaceDashboardRailsComponent {
         };
     }
 
+    private heroTmdbKey(item: GlobalRecentItem): string {
+        return this.heroTmdb.keyFor(item);
+    }
+
+    private toTrendingCard(item: DashboardTrendingItem): DashboardRailCard {
+        const subtitle = [
+            item.year !== null ? String(item.year) : null,
+            item.rating ? `★ ${item.rating}` : null,
+            item.match?.playlistName ?? null,
+        ]
+            .filter((value): value is string => Boolean(value))
+            .join(' · ');
+        return {
+            id: `trending-${item.mediaType}-${item.tmdbId}`,
+            title: item.title,
+            subtitle,
+            imageUrl: item.posterUrl ?? undefined,
+            icon: item.mediaType === 'movie' ? 'movie' : 'video_library',
+            contentType: item.mediaType === 'movie' ? 'movie' : 'series',
+            link: item.match
+                ? [
+                      '/workspace/xtreams',
+                      item.match.playlistId,
+                      item.match.type === 'movie' ? 'vod' : 'series',
+                      String(item.match.categoryId),
+                      String(item.match.xtreamId),
+                  ]
+                : ['/workspace/search'],
+            ...(item.match ? {} : { queryParams: { q: item.title } }),
+        };
+    }
+
+    private toRecommendationCard(
+        item: DashboardRecommendationItem
+    ): DashboardRailCard {
+        const subtitle = [
+            item.year !== null ? String(item.year) : null,
+            item.rating ? `★ ${item.rating}` : null,
+            item.match.playlistName,
+        ]
+            .filter((value): value is string => Boolean(value))
+            .join(' · ');
+        return {
+            id: `rec-${item.mediaType}-${item.tmdbId}`,
+            title: item.title,
+            subtitle,
+            imageUrl: item.posterUrl ?? undefined,
+            icon: item.mediaType === 'movie' ? 'movie' : 'video_library',
+            contentType: item.mediaType === 'movie' ? 'movie' : 'series',
+            link: [
+                '/workspace/xtreams',
+                item.match.playlistId,
+                item.match.type === 'movie' ? 'vod' : 'series',
+                String(item.match.categoryId),
+                String(item.match.xtreamId),
+            ],
+        };
+    }
+
+    private buildSourceExpiryBadge(
+        playlistId: string
+    ): DashboardRailCard['expiryBadge'] {
+        // Reactive read: ties the wall-clock evaluation below to the minute
+        // tick (this method only runs inside the sourceCards computed).
+        this.sourceExpiryTick();
+        const badge = resolveSourceExpiryBadge(
+            this.sourceExpiry.facts().get(playlistId),
+            Date.now()
+        );
+        if (!badge) {
+            return null;
+        }
+        return badge.kind === 'expired'
+            ? {
+                  kind: 'expired',
+                  label: this.t('WORKSPACE.DASHBOARD.SOURCE_EXPIRED'),
+              }
+            : {
+                  kind: 'expiring',
+                  label: this.translate.instant(
+                      'WORKSPACE.DASHBOARD.SOURCE_EXPIRES_IN_DAYS',
+                      { days: badge.daysLeft }
+                  ),
+              };
+    }
+
     private typeIcon(type: 'live' | 'movie' | 'series'): string {
         if (type === 'live') return 'live_tv';
         if (type === 'movie') return 'movie';
         return 'video_library';
     }
 
-    private openXtreamAccountInfo(playlist: PlaylistMeta): void {
-        if (!isXtreamAccountPlaylist(playlist)) {
+    private openAccountInfo(playlist: PlaylistMeta): void {
+        if (isXtreamAccountPlaylist(playlist)) {
+            const title =
+                playlist.title ||
+                playlist.filename ||
+                this.t('WORKSPACE.DASHBOARD.UNTITLED_SOURCE');
+
+            this.shellActions.openAccountInfo({
+                playlist: {
+                    id: playlist._id,
+                    name: title,
+                    title,
+                    serverUrl: playlist.serverUrl,
+                    username: playlist.username,
+                    password: playlist.password,
+                },
+            });
             return;
         }
 
-        const title =
-            playlist.title ||
-            playlist.filename ||
-            this.t('WORKSPACE.DASHBOARD.UNTITLED_SOURCE');
-
-        this.shellActions.openAccountInfo({
-            playlist: {
-                id: playlist._id,
-                name: title,
-                title,
-                serverUrl: playlist.serverUrl,
-                username: playlist.username,
-                password: playlist.password,
-            },
-        });
+        if (isStalkerAccountPlaylist(playlist)) {
+            this.shellActions.openStalkerAccountInfo({ playlist });
+        }
     }
 
     private confirmRemovePlaylist(playlist: PlaylistMeta): void {
@@ -460,14 +861,8 @@ export class WorkspaceDashboardRailsComponent {
     }
 
     private async removePlaylist(playlist: PlaylistMeta): Promise<void> {
-        const operationId = playlist.serverUrl
-            ? this.databaseService.createOperationId('playlist-delete')
-            : undefined;
-
-        const deleted = await this.databaseService.deletePlaylist(
-            playlist._id,
-            operationId ? { operationId } : undefined
-        );
+        const deleted =
+            await this.playlistDeleteAction.deletePlaylist(playlist);
 
         if (!deleted) {
             return;

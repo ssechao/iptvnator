@@ -3,6 +3,7 @@ import {
     Component,
     computed,
     effect,
+    inject,
     input,
     output,
     signal,
@@ -12,6 +13,8 @@ import { MatIcon } from '@angular/material/icon';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { TranslatePipe } from '@ngx-translate/core';
 import { ExternalPlayerSession } from '@iptvnator/shared/interfaces';
+import { SettingsStore } from '@iptvnator/services';
+import { applyChannelNameStrip } from '@iptvnator/shared/m3u-utils';
 
 @Component({
     selector: 'app-external-playback-dock',
@@ -26,36 +29,54 @@ import { ExternalPlayerSession } from '@iptvnator/shared/interfaces';
     changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class ExternalPlaybackDockComponent {
+    private readonly settingsStore = inject(SettingsStore);
+
     readonly session = input.required<ExternalPlayerSession>();
     readonly compact = input(false);
 
     readonly closeClicked = output<void>();
+    readonly dismissClicked = output<void>();
     readonly artworkClicked = output<void>();
     private readonly artworkFailed = signal(false);
+
+    /**
+     * Sessions with contentInfo are tracked VOD/episode playback — their
+     * titles are movie/episode names, so the channel-prefix strip is
+     * applied only to sessions without it (live channels).
+     */
+    readonly displayTitle = computed(() =>
+        applyChannelNameStrip(
+            this.session().title,
+            !this.session().contentInfo &&
+                this.settingsStore.stripCountryPrefix?.()
+        )
+    );
 
     readonly playerLabel = computed(() => this.session().player.toUpperCase());
     readonly artworkUrl = computed(
         () => this.session().thumbnail?.trim() ?? ''
     );
-    readonly statusLabel = computed(() => {
+    readonly statusLabelKey = computed(() => {
         const session = this.session();
 
         switch (session.status) {
             case 'launching':
-                return 'Launching…';
+                return 'WORKSPACE.SHELL.EXTERNAL_PLAYBACK_OPENING';
             case 'opened':
+                return 'WORKSPACE.SHELL.EXTERNAL_PLAYBACK_STARTED';
             case 'playing':
-                return 'Opened';
+                return 'WORKSPACE.SHELL.EXTERNAL_PLAYBACK_PLAYING';
             case 'error':
-                return session.error || 'Playback failed';
+                return 'WORKSPACE.SHELL.EXTERNAL_PLAYBACK_FAILED';
             default:
-                return 'Closed';
+                return 'WORKSPACE.SHELL.EXTERNAL_PLAYBACK_CLOSED';
         }
     });
 
     readonly statusIcon = computed(() => {
         const status = this.session().status;
         if (status === 'error') return 'error_outline';
+        if (status === 'playing') return 'play_circle';
         return 'open_in_new';
     });
 
@@ -83,8 +104,9 @@ export class ExternalPlaybackDockComponent {
     readonly artworkInteractive = computed(
         () => !!this.session().contentInfo?.playlistId
     );
-    readonly showCloseButton = computed(
-        () => this.session().canClose && this.session().status !== 'error'
+    readonly showCloseAction = computed(() => this.session().canClose);
+    readonly showDismissAction = computed(
+        () => this.session().status === 'error' && !this.session().canClose
     );
 
     constructor() {
@@ -101,5 +123,13 @@ export class ExternalPlaybackDockComponent {
     onArtworkClick(): void {
         if (!this.artworkInteractive()) return;
         this.artworkClicked.emit();
+    }
+
+    onCloseClick(): void {
+        this.closeClicked.emit();
+    }
+
+    onDismissClick(): void {
+        this.dismissClicked.emit();
     }
 }

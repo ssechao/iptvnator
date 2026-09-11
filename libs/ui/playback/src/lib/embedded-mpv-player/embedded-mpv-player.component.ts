@@ -2,13 +2,12 @@ import {
     ChangeDetectionStrategy,
     Component,
     ElementRef,
-    EventEmitter,
     OnDestroy,
-    Output,
     computed,
     effect,
     inject,
     input,
+    output,
     signal,
     untracked,
     viewChild,
@@ -17,10 +16,22 @@ import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { merge } from 'rxjs';
 import {
     EmbeddedMpvAudioTrack,
+    RecordingStartMetadata,
+    RecordingStoppedEvent,
     ResolvedPortalPlayback,
 } from '@iptvnator/shared/interfaces';
+import { PlayerControlsComponent } from '../player-controls/player-controls.component';
+import type { PlayerMediaTitle } from '../player-controls/player-controls.model';
+import type { SeriesPlaybackNavigation } from '../portal-inline-player/series-playback-navigation';
+import { EmbeddedMpvControlsAdapter } from './embedded-mpv-controls.adapter';
+import { EmbeddedMpvDockPanelComponent } from './embedded-mpv-dock-panel.component';
+import { EmbeddedMpvDockPanelState } from './embedded-mpv-dock-panels';
+import { EmbeddedMpvLegacyInteractions } from './embedded-mpv-legacy-interactions';
 import { EmbeddedMpvOverlayVisibilityService } from './embedded-mpv-overlay-visibility.service';
 import { EmbeddedMpvSessionController } from './embedded-mpv-session-controller';
 import { EmbeddedMpvShortcuts } from './embedded-mpv-shortcuts';
@@ -31,7 +42,6 @@ import {
 import {
     ASPECT_PRESETS,
     HIDDEN_BOUNDS,
-    MENU_OPEN_BOTTOM_CUTOUT_PX,
     SPEED_PRESETS,
     aspectLabel,
     audioTrackLabel,
@@ -42,24 +52,24 @@ import {
     speedLabel,
     subtitleTrackLabel,
     volumeIcon,
-    volumeLabel,
 } from './embedded-mpv-format.utils';
 
-const HIDE_CONTROLS_DELAY_MS = 2500;
 const RECORDING_MESSAGE_DISMISS_DELAY_MS = 5000;
-const VOLUME_POPOVER_CLOSE_DELAY_MS = 220;
 
 @Component({
     selector: 'app-embedded-mpv-player',
     templateUrl: './embedded-mpv-player.component.html',
     styleUrl: './embedded-mpv-player.component.scss',
     imports: [
+        EmbeddedMpvDockPanelComponent,
         MatButtonModule,
         MatIconModule,
         MatProgressSpinnerModule,
         MatTooltipModule,
+        PlayerControlsComponent,
+        TranslatePipe,
     ],
-    providers: [EmbeddedMpvSessionController],
+    providers: [EmbeddedMpvControlsAdapter, EmbeddedMpvSessionController],
     changeDetection: ChangeDetectionStrategy.OnPush,
     host: {
         class: 'embedded-mpv-player-host',
@@ -69,22 +79,60 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     readonly playback = input.required<ResolvedPortalPlayback>();
     readonly showControls = input(true);
     readonly recordingFolder = input('');
+    readonly recordingMetadata = input<RecordingStartMetadata | null>(null);
+    readonly seriesNavigation = input<SeriesPlaybackNavigation | null>(null);
+    readonly mediaTitle = input<PlayerMediaTitle | null>(null);
+    /** See `PlayerControlsComponent.fullscreenTarget`; null keeps the root. */
+    readonly fullscreenTarget = input<HTMLElement | null>(null);
 
-    @Output() timeUpdate = new EventEmitter<{
+    readonly timeUpdate = output<{
         currentTime: number;
         duration: number;
     }>();
+    readonly playbackEnded = output<void>();
+    readonly previousEpisodeRequested = output<void>();
+    readonly nextEpisodeRequested = output<void>();
+    /** Clean recording stop — the host answers with EPG stop enrichment. */
+    readonly recordingStopped = output<RecordingStoppedEvent>();
 
     private readonly overlayVisibility = inject(
         EmbeddedMpvOverlayVisibilityService
     );
-    private readonly controller = inject(EmbeddedMpvSessionController);
+    private readonly translate = inject(TranslateService);
+    /**
+     * Ticks when the active language or a loaded translation file changes.
+     * translate.instant() is invisible to the signal graph, so every
+     * computed()/template helper that calls it must read this signal first —
+     * otherwise labels keep the previous language (or the raw key when the
+     * component mounts before the translation file finishes loading).
+     */
+    private readonly translationsTick = toSignal(
+        merge(
+            this.translate.onLangChange,
+            this.translate.onTranslationChange,
+            this.translate.onDefaultLangChange
+        ),
+        { initialValue: null }
+    );
+    readonly controller = inject(EmbeddedMpvSessionController);
+    readonly sharedControls = inject(EmbeddedMpvControlsAdapter);
     private readonly shortcuts = new EmbeddedMpvShortcuts();
     readonly menus = new EmbeddedMpvMenuState();
     readonly feedback = new EmbeddedMpvFeedback();
+    readonly dockPanels: EmbeddedMpvDockPanelState;
 
     readonly viewport = viewChild<ElementRef<HTMLDivElement>>('viewport');
     readonly playerRoot = viewChild<ElementRef<HTMLDivElement>>('playerRoot');
+    readonly playerSurface = computed(
+        () => this.playerRoot()?.nativeElement ?? null
+    );
+    /** Element that owns DOM fullscreen: the host's target, else the root. */
+    readonly fullscreenSurface = computed(
+        () => this.fullscreenTarget() ?? this.playerSurface()
+    );
+    readonly sharedShortcutsEnabled = computed(
+        () => !this.overlayVisibility.overlayActive()
+    );
 
     readonly support = this.controller.support;
     readonly session = this.controller.session;
@@ -98,6 +146,9 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     readonly aspectPresets = ASPECT_PRESETS;
 
     readonly isSupported = computed(() => this.support()?.supported ?? false);
+    readonly isFrameCopyEngine = computed(
+        () => this.support()?.engine === 'frame-copy'
+    );
     readonly capabilities = computed(
         () =>
             this.support()?.capabilities ?? {
@@ -117,41 +168,86 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     readonly isPaused = computed(
         () =>
             this.session()?.status === 'paused' ||
-            this.session()?.status === 'idle'
+            this.session()?.status === 'idle' ||
+            this.session()?.status === 'ended'
     );
     readonly isPlaying = computed(() => this.session()?.status === 'playing');
     readonly isErrored = computed(() => this.session()?.status === 'error');
+    /**
+     * The main process is waiting to reload a dropped stream or has the
+     * reload in flight (see embedded-mpv-reconnect.ts); shown like an error
+     * with a countdown-free "attempt N of M" line, Retry still available.
+     */
+    readonly reconnectInfo = computed(() => this.session()?.reconnect ?? null);
+    readonly isReconnecting = computed(() => this.reconnectInfo() !== null);
+    readonly isLivePlayback = computed(() => {
+        const playback = this.playback();
+        if (typeof playback.isLive === 'boolean') {
+            return playback.isLive;
+        }
+
+        return !playback.contentInfo;
+    });
+    /**
+     * A live stream that ended and is not being reconnected: a broadcast
+     * never ends on its own, so this is a loss the viewer must be able to
+     * act on — the `ended` state otherwise looks like a paused player.
+     */
+    readonly isLiveEnded = computed(
+        () => this.isLivePlayback() && this.session()?.status === 'ended'
+    );
     readonly canSeek = computed(
-        () => (this.session()?.durationSeconds ?? 0) > 0
+        () =>
+            !this.isLivePlayback() && (this.session()?.durationSeconds ?? 0) > 0
     );
     readonly canFullscreen = computed(
         () =>
             typeof document !== 'undefined' &&
-            Boolean(this.playerRoot()?.nativeElement.requestFullscreen) &&
+            Boolean(this.fullscreenSurface()?.requestFullscreen) &&
             Boolean(document.exitFullscreen)
     );
     readonly statusLabel = computed(() => {
+        this.translationsTick();
         const session = this.session();
+        if (session?.reconnect) {
+            return this.translate.instant('EMBEDDED_MPV.PLAYER.RECONNECTING', {
+                attempt: session.reconnect.attempt,
+                maxAttempts: session.reconnect.maxAttempts,
+            });
+        }
         if (session?.status === 'error') {
-            return session.error ?? 'Embedded MPV playback failed.';
+            return (
+                session.error ??
+                this.translate.instant('EMBEDDED_MPV.PLAYER.PLAYBACK_FAILED')
+            );
+        }
+        if (session?.status === 'ended' && this.isLivePlayback()) {
+            return this.translate.instant('EMBEDDED_MPV.PLAYER.STREAM_ENDED');
         }
         if (!this.support()) {
-            return 'Checking embedded MPV support...';
+            return this.translate.instant(
+                'EMBEDDED_MPV.PLAYER.CHECKING_SUPPORT'
+            );
         }
         if (!this.isSupported()) {
             return (
                 this.support()?.reason ??
-                'Embedded MPV is not available in this environment.'
+                this.translate.instant('EMBEDDED_MPV.PLAYER.NOT_AVAILABLE')
             );
         }
         if (!session || session.status === 'loading') {
-            return 'Loading stream…';
+            return this.translate.instant('EMBEDDED_MPV.PLAYER.LOADING_STREAM');
         }
         return '';
     });
-    readonly fullscreenLabel = computed(() =>
-        this.isFullscreen() ? 'Exit fullscreen' : 'Enter fullscreen'
-    );
+    readonly fullscreenLabel = computed(() => {
+        this.translationsTick();
+        return this.translate.instant(
+            this.isFullscreen()
+                ? 'EMBEDDED_MPV.PLAYER.EXIT_FULLSCREEN'
+                : 'EMBEDDED_MPV.PLAYER.ENTER_FULLSCREEN'
+        );
+    });
     readonly audioTracks = computed(() => this.session()?.audioTracks ?? []);
     readonly hasAudioTracks = computed(() => this.audioTracks().length > 1);
     readonly subtitleTracks = computed(
@@ -168,9 +264,29 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
         () => this.session()?.aspectOverride ?? 'no'
     );
     readonly volumeIcon = computed(() => volumeIcon(this.volume()));
-    readonly volumeLabel = computed(() => volumeLabel(this.volume()));
-    readonly timelineValue = computed(() =>
-        Math.max(0, this.session()?.positionSeconds ?? 0)
+    readonly volumeLabel = computed(() => {
+        this.translationsTick();
+        return this.translate.instant('EMBEDDED_MPV.PLAYER.VOLUME_LABEL', {
+            percent: Math.round(this.volume() * 100),
+        });
+    });
+    readonly volumePercent = computed(
+        () => `${Math.round(this.volume() * 100)}%`
+    );
+    readonly dockPanelBackLabel = computed(() => {
+        this.translationsTick();
+        return this.translate.instant('EMBEDDED_MPV.PLAYER.BACK');
+    });
+    /**
+     * Non-null while the user drags the timeline: the slider and time label
+     * preview this value locally and the single seek IPC call is deferred to
+     * the release (`change`) event instead of firing per drag pixel.
+     */
+    readonly scrubPosition = signal<number | null>(null);
+    readonly timelineValue = computed(
+        () =>
+            this.scrubPosition() ??
+            Math.max(0, this.session()?.positionSeconds ?? 0)
     );
     readonly controlsAreVisible = computed(
         () =>
@@ -191,12 +307,25 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     readonly canRecord = computed(
         () =>
             this.capabilities().recording &&
-            this.playback().isLive === true &&
+            this.isLivePlayback() &&
             this.isSupported() &&
             !this.isErrored()
     );
     readonly isRecording = computed(
         () => this.session()?.recording?.active === true
+    );
+    readonly showSeriesNavigation = computed(
+        () => !this.isLivePlayback() && this.seriesNavigation() !== null
+    );
+    readonly canPreviousEpisode = computed(
+        () =>
+            this.showSeriesNavigation() &&
+            this.seriesNavigation()?.canPrevious === true
+    );
+    readonly canNextEpisode = computed(
+        () =>
+            this.showSeriesNavigation() &&
+            this.seriesNavigation()?.canNext === true
     );
     readonly recordingElapsed = computed(() => {
         const startedAt = this.session()?.recording?.startedAt;
@@ -218,75 +347,162 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     });
 
     private mutedVolume = 0;
-    private controlsHideTimer: number | null = null;
-    private volumeCloseTimer: number | null = null;
     private recordingMessageTimer: number | null = null;
+    private lastEndedSessionId: string | null = null;
     private readonly recordingTick = signal(Date.now());
     private readonly recordingMessage = signal<string | null>(null);
+    private readonly legacyInteractions: EmbeddedMpvLegacyInteractions;
 
-    private readonly onDocumentPointerDown = (event: PointerEvent) => {
-        const playerRoot = this.playerRoot()?.nativeElement;
-        if (!playerRoot || event.composedPath().includes(playerRoot)) {
-            return;
-        }
-        this.closePopovers();
-    };
-    private readonly onDocumentPointerMove = (event: PointerEvent) => {
-        const playerRoot = this.playerRoot()?.nativeElement;
-        if (
-            playerRoot &&
-            !event.composedPath().includes(playerRoot) &&
-            this.isPointerInsidePlayer(event)
-        ) {
-            this.revealControls();
-        }
-    };
     private readonly onFullscreenChange = () => {
-        const playerRoot = this.playerRoot()?.nativeElement;
-        this.isFullscreen.set(
-            Boolean(playerRoot && document.fullscreenElement === playerRoot)
-        );
-        this.revealControls();
+        this.syncFullscreenState();
+        this.legacyInteractions.revealControls();
         this.controller.triggerBoundsSync();
     };
 
+    private syncFullscreenState(): void {
+        const surface = this.fullscreenSurface();
+        this.isFullscreen.set(
+            Boolean(
+                surface &&
+                typeof document !== 'undefined' &&
+                document.fullscreenElement === surface
+            )
+        );
+    }
+
     constructor() {
+        this.legacyInteractions = new EmbeddedMpvLegacyInteractions({
+            isAvailable: () => !this.isFrameCopyEngine(),
+            playerRoot: () => this.playerRoot()?.nativeElement ?? null,
+            menus: this.menus,
+            controlsVisible: this.controlsVisible,
+            isLoading: this.isLoading,
+            isErrored: this.isErrored,
+            isStalled: this.stalled,
+            isPlaying: this.isPlaying,
+            statusLabel: this.statusLabel,
+            togglePaused: () => this.togglePaused(),
+            toggleFullscreen: () => this.toggleFullscreen(),
+        });
+        this.legacyInteractions.attach();
+
+        this.dockPanels = new EmbeddedMpvDockPanelState({
+            menus: this.menus,
+            audioTracks: this.audioTracks,
+            subtitleTracks: this.subtitleTracks,
+            selectedSubtitleTrackId: this.selectedSubtitleTrackId,
+            playbackSpeed: this.playbackSpeed,
+            aspectOverride: this.aspectOverride,
+            translateLabel: (key) => {
+                this.translationsTick();
+                return this.translate.instant(key);
+            },
+            audioTrackLabel: (track, index) => this.trackLabel(track, index),
+            subtitleTrackLabel: (track, index) =>
+                this.subtitleLabel(track, index),
+            aspectLabel: (aspect) => this.aspectLabel(aspect),
+            selectAudioTrack: (trackId) => void this.selectAudioTrack(trackId),
+            selectSubtitleTrack: (trackId) =>
+                void this.selectSubtitleTrack(trackId),
+            selectSpeed: (speed) => void this.selectSpeed(speed),
+            selectAspect: (aspect) => void this.selectAspect(aspect),
+            closePanels: () => this.legacyInteractions.closePopovers(),
+            playerRoot: () => this.playerRoot()?.nativeElement ?? null,
+            revealControls: () => this.legacyInteractions.revealControls(),
+        });
+
+        this.sharedControls.configure({
+            playback: this.playback,
+            seriesNavigation: this.seriesNavigation,
+            recordingFolder: this.recordingFolder,
+            recordingMetadata: this.recordingMetadata,
+        });
+
+        // Single owner of the "a recording just stopped" edge, for every
+        // engine and every trigger — the controls button, the download
+        // manager's Stop (which talks to the main process directly and never
+        // reaches this component's own toggle), or mpv stopping on its own.
+        // The host answers with EPG stop enrichment.
+        let previousRecording: {
+            targetPath: string;
+            startedAt: string | null;
+            epgChannelId: string | null;
+            sourceItemKey: string | null;
+        } | null = null;
+        effect(() => {
+            const recording = this.controller.session()?.recording;
+            untracked(() => {
+                if (recording?.active && recording.targetPath) {
+                    previousRecording = {
+                        targetPath: recording.targetPath,
+                        startedAt: recording.startedAt ?? null,
+                        // Captured while it is still the recorded channel: a
+                        // channel switch auto-stops the recording and moves
+                        // the host's state on before the stop is handled.
+                        epgChannelId:
+                            previousRecording?.epgChannelId ??
+                            this.recordingMetadata()?.epgChannelId ??
+                            null,
+                        sourceItemKey:
+                            previousRecording?.sourceItemKey ??
+                            this.recordingMetadata()?.sourceItemKey ??
+                            null,
+                    };
+                    return;
+                }
+                if (!previousRecording) {
+                    return;
+                }
+                const stopped = previousRecording;
+                previousRecording = null;
+                this.recordingStopped.emit({
+                    targetPath: stopped.targetPath,
+                    startedAt: stopped.startedAt,
+                    endedAt: new Date().toISOString(),
+                    epgChannelId: stopped.epgChannelId,
+                    sourceItemKey: stopped.sourceItemKey,
+                });
+            });
+        });
+
         if (typeof document !== 'undefined') {
             document.addEventListener(
                 'fullscreenchange',
                 this.onFullscreenChange
             );
-            document.addEventListener(
-                'pointerdown',
-                this.onDocumentPointerDown
-            );
-            document.addEventListener(
-                'pointermove',
-                this.onDocumentPointerMove,
-                { passive: true }
-            );
         }
+        // A player remounted for the next episode can start inside the
+        // host-owned fullscreen; no `fullscreenchange` fires for it, so the
+        // state is read once the fullscreen surface resolves.
+        effect(() => {
+            void this.fullscreenSurface();
+            untracked(() => this.syncFullscreenState());
+        });
 
         this.controller.setBoundsProvider((host) => {
+            // The frame-copy engine paints into an ordinary DOM canvas:
+            // dialogs and overlays stack above it natively, so the
+            // hide-offscreen compositor workaround must not shrink its
+            // render size.
+            if (this.isFrameCopyEngine()) {
+                return measureBounds(host);
+            }
             if (this.overlayVisibility.overlayActive()) {
                 return HIDDEN_BOUNDS;
             }
-            const rect = measureBounds(host);
-            if (this.menus.anyOpen()) {
-                return {
-                    ...rect,
-                    height: Math.max(
-                        1,
-                        rect.height - MENU_OPEN_BOTTOM_CUTOUT_PX
-                    ),
-                };
-            }
-            return rect;
+            // Control menus render as horizontal panels inside the
+            // fixed-height dock strip below the video host, so open menus
+            // never require shrinking the native MPV view.
+            return measureBounds(host);
         });
 
         this.shortcuts.attach({
-            isAvailable: () => !this.overlayVisibility.overlayActive(),
-            onEscape: () => this.closePopovers(),
+            isAvailable: () =>
+                this.legacyInteractions.isAvailable() &&
+                !this.overlayVisibility.overlayActive(),
+            hostElement: () => this.playerRoot()?.nativeElement ?? null,
+            arrowKeysBlocked: () => this.menus.dockPanelOpen(),
+            onEscape: () => this.legacyInteractions.closePopovers(),
             togglePaused: () => void this.togglePaused(),
             toggleFullscreen: () => void this.toggleFullscreen(),
             seekBy: (delta) => void this.seekBy(delta),
@@ -324,13 +540,18 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
 
         effect(() => {
             this.overlayVisibility.overlayActive();
-            this.menus.anyOpen();
             this.controller.triggerBoundsSync();
+        });
+
+        effect(() => {
+            const panelOpen = this.menus.dockPanelOpen();
+            untracked(() => this.dockPanels.handlePanelOpenChange(panelOpen));
         });
 
         effect(() => {
             const session = this.session();
             if (!session) {
+                this.lastEndedSessionId = null;
                 return;
             }
             // Side effects must not pull in transitive signal deps via
@@ -343,12 +564,25 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
                     currentTime: session.positionSeconds,
                     duration: session.durationSeconds ?? 0,
                 });
-                this.scheduleControlsHide();
+                this.legacyInteractions.scheduleControlsHide();
             });
         });
 
+        effect(() => {
+            const session = this.session();
+            if (!session || session.status !== 'ended') {
+                return;
+            }
+            if (this.lastEndedSessionId === session.id) {
+                return;
+            }
+
+            this.lastEndedSessionId = session.id;
+            this.playbackEnded.emit();
+        });
+
         effect((onCleanup) => {
-            if (!this.isRecording()) {
+            if (this.isFrameCopyEngine() || !this.isRecording()) {
                 return;
             }
             this.recordingTick.set(Date.now());
@@ -357,6 +591,17 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
                 1000
             );
             onCleanup(() => window.clearInterval(intervalId));
+        });
+
+        effect(() => {
+            const isFrameCopyEngine = this.isFrameCopyEngine();
+            untracked(() => {
+                this.feedback.clear();
+                this.setRecordingMessage(null);
+                this.legacyInteractions.handleEngineTransition(
+                    isFrameCopyEngine
+                );
+            });
         });
     }
 
@@ -368,51 +613,39 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
                 'fullscreenchange',
                 this.onFullscreenChange
             );
-            document.removeEventListener(
-                'pointerdown',
-                this.onDocumentPointerDown
-            );
-            document.removeEventListener(
-                'pointermove',
-                this.onDocumentPointerMove
-            );
         }
-        if (this.volumeCloseTimer !== null) {
-            clearTimeout(this.volumeCloseTimer);
-            this.volumeCloseTimer = null;
-        }
+        this.legacyInteractions.dispose();
         this.clearRecordingMessageTimer();
-        this.clearControlsHideTimer();
     }
 
     onPlayerInteraction(): void {
-        this.revealControls();
+        this.legacyInteractions.onPlayerInteraction();
+    }
+
+    onViewportClick(event: MouseEvent): void {
+        this.legacyInteractions.onViewportClick(event);
     }
 
     onPlayerDblClick(event: MouseEvent): void {
-        const target = event.target as HTMLElement | null;
-        if (target?.closest('button, input, [role="slider"]')) {
-            return;
-        }
-        void this.toggleFullscreen();
+        this.legacyInteractions.onPlayerDblClick(event);
     }
 
     async togglePaused(): Promise<void> {
-        this.revealControls();
+        this.legacyInteractions.revealControls();
         await this.controller.togglePaused();
     }
 
     async toggleFullscreen(): Promise<void> {
-        this.revealControls();
-        const playerRoot = this.playerRoot()?.nativeElement;
-        if (!playerRoot || !this.canFullscreen()) {
+        this.legacyInteractions.revealControls();
+        const surface = this.fullscreenSurface();
+        if (!surface || !this.canFullscreen()) {
             return;
         }
         try {
-            if (document.fullscreenElement === playerRoot) {
+            if (document.fullscreenElement === surface) {
                 await document.exitFullscreen();
             } else {
-                await playerRoot.requestFullscreen();
+                await surface.requestFullscreen();
             }
         } catch {
             return;
@@ -422,7 +655,7 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     }
 
     async seekBy(deltaSeconds: number): Promise<void> {
-        this.revealControls();
+        this.legacyInteractions.revealControls();
         const ok = await this.controller.seekBy(deltaSeconds);
         if (ok) {
             this.feedback.flash(
@@ -432,16 +665,39 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
         }
     }
 
-    async onTimelineInput(event: Event): Promise<void> {
-        this.revealControls();
+    requestPreviousEpisode(): void {
+        this.legacyInteractions.revealControls();
+        if (!this.canPreviousEpisode()) {
+            return;
+        }
+        this.previousEpisodeRequested.emit();
+    }
+
+    requestNextEpisode(): void {
+        this.legacyInteractions.revealControls();
+        if (!this.canNextEpisode()) {
+            return;
+        }
+        this.nextEpisodeRequested.emit();
+    }
+
+    onTimelineInput(event: Event): void {
+        this.legacyInteractions.revealControls();
+        this.scrubPosition.set(
+            Number((event.target as HTMLInputElement).value)
+        );
+    }
+
+    async onTimelineCommit(event: Event): Promise<void> {
         const target = Number((event.target as HTMLInputElement).value);
+        this.scrubPosition.set(null);
         await this.controller.seekTo(target);
     }
 
     onVolumeInput(event: Event): void {
         const next = Number((event.target as HTMLInputElement).value);
         this.applyVolume(next);
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
     }
 
     onVolumeWheel(event: WheelEvent): void {
@@ -450,21 +706,11 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     }
 
     onVolumeHoverEnter(): void {
-        if (this.volumeCloseTimer !== null) {
-            clearTimeout(this.volumeCloseTimer);
-            this.volumeCloseTimer = null;
-        }
-        this.menus.open('volume');
+        this.legacyInteractions.onVolumeHoverEnter();
     }
 
     onVolumeHoverLeave(): void {
-        if (this.volumeCloseTimer !== null) {
-            clearTimeout(this.volumeCloseTimer);
-        }
-        this.volumeCloseTimer = window.setTimeout(() => {
-            this.menus.close('volume');
-            this.volumeCloseTimer = null;
-        }, VOLUME_POPOVER_CLOSE_DELAY_MS);
+        this.legacyInteractions.onVolumeHoverLeave();
     }
 
     toggleMute(): void {
@@ -472,7 +718,10 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
         if (current > 0) {
             this.mutedVolume = current;
             this.applyVolume(0);
-            this.feedback.flash('volume_off', 'Muted');
+            this.feedback.flash(
+                'volume_off',
+                this.translate.instant('EMBEDDED_MPV.PLAYER.MUTED')
+            );
         } else {
             const restored = this.mutedVolume || 0.5;
             this.applyVolume(restored);
@@ -481,52 +730,48 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
                 `${Math.round(restored * 100)}%`
             );
         }
-        this.revealControls();
+        this.legacyInteractions.revealControls();
     }
 
     toggleAudioMenu(): void {
-        this.menus.toggle('audio');
-        this.revealControls();
+        this.dockPanels.toggle('audio');
     }
     toggleSubtitleMenu(): void {
-        this.menus.toggle('subtitle');
-        this.revealControls();
+        this.dockPanels.toggle('subtitle');
     }
     toggleSpeedMenu(): void {
-        this.menus.toggle('speed');
-        this.revealControls();
+        this.dockPanels.toggle('speed');
     }
     toggleAspectMenu(): void {
-        this.menus.toggle('aspect');
-        this.revealControls();
+        this.dockPanels.toggle('aspect');
     }
 
     async selectAudioTrack(trackId: number): Promise<void> {
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
         await this.controller.setAudioTrack(trackId);
         this.menus.close('audio');
-        this.scheduleControlsHide();
+        this.legacyInteractions.scheduleControlsHide();
     }
 
     async selectSubtitleTrack(trackId: number): Promise<void> {
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
         await this.controller.setSubtitleTrack(trackId);
         this.menus.close('subtitle');
-        this.scheduleControlsHide();
+        this.legacyInteractions.scheduleControlsHide();
     }
 
     async selectSpeed(speed: number): Promise<void> {
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
         await this.controller.setSpeed(speed);
         this.menus.close('speed');
-        this.scheduleControlsHide();
+        this.legacyInteractions.scheduleControlsHide();
     }
 
     async selectAspect(aspect: string): Promise<void> {
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
         await this.controller.setAspect(aspect);
         this.menus.close('aspect');
-        this.scheduleControlsHide();
+        this.legacyInteractions.scheduleControlsHide();
     }
 
     async toggleRecording(): Promise<void> {
@@ -534,50 +779,113 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
             return;
         }
 
-        this.revealControls(false);
+        this.legacyInteractions.revealControls(false);
         if (this.isRecording()) {
             const recording = await this.controller.stopRecording();
             if (recording?.targetPath) {
-                this.setRecordingMessage(`Saved to ${recording.targetPath}`, {
-                    autoDismiss: true,
-                });
-                this.feedback.flash('check_circle', 'Recording saved', 1200);
+                // recordingStopped is emitted by the session watcher in the
+                // constructor, which also covers stops triggered elsewhere.
+                this.setRecordingMessage(
+                    this.translate.instant('EMBEDDED_MPV.PLAYER.SAVED_TO', {
+                        path: recording.targetPath,
+                    }),
+                    {
+                        autoDismiss: true,
+                    }
+                );
+                this.feedback.flash(
+                    'check_circle',
+                    this.translate.instant(
+                        'EMBEDDED_MPV.PLAYER.RECORDING_SAVED'
+                    ),
+                    1200
+                );
             } else if (recording?.error) {
                 this.setRecordingMessage(recording.error);
-                this.feedback.flash('error_outline', 'Recording failed', 1200);
+                this.flashRecordingFailed();
             } else {
-                this.setRecordingMessage('Recording failed to stop.');
-                this.feedback.flash('error_outline', 'Recording failed', 1200);
+                this.setRecordingMessage(
+                    this.translate.instant(
+                        'EMBEDDED_MPV.PLAYER.RECORDING_FAILED_TO_STOP'
+                    )
+                );
+                this.flashRecordingFailed();
             }
-            this.scheduleControlsHide();
+            this.legacyInteractions.scheduleControlsHide();
             return;
         }
 
         this.setRecordingMessage(null);
         const recording = await this.controller.startRecording(
             this.recordingFolder(),
-            this.playback().title
+            this.playback().title,
+            this.recordingMetadata() ?? undefined
         );
         if (recording?.active) {
-            this.feedback.flash('fiber_manual_record', 'Recording', 900);
+            this.feedback.flash(
+                'fiber_manual_record',
+                this.translate.instant('EMBEDDED_MPV.PLAYER.RECORDING'),
+                900
+            );
         } else if (recording?.error) {
             this.setRecordingMessage(recording.error);
-            this.feedback.flash('error_outline', 'Recording failed', 1200);
+            this.flashRecordingFailed();
         } else {
-            this.setRecordingMessage('Recording failed to start.');
-            this.feedback.flash('error_outline', 'Recording failed', 1200);
+            this.setRecordingMessage(
+                this.translate.instant(
+                    'EMBEDDED_MPV.PLAYER.RECORDING_FAILED_TO_START'
+                )
+            );
+            this.flashRecordingFailed();
         }
+    }
+
+    private flashRecordingFailed(): void {
+        this.feedback.flash(
+            'error_outline',
+            this.translate.instant('EMBEDDED_MPV.PLAYER.RECORDING_FAILED'),
+            1200
+        );
     }
 
     retry(): void {
         this.controller.retry();
     }
 
+    // These helpers run inside the template's reactive context, so the
+    // translationsTick() read makes them re-evaluate on language changes.
     formatTime = formatTime;
-    trackLabel = audioTrackLabel;
-    subtitleLabel = subtitleTrackLabel;
+    trackLabel = (track: EmbeddedMpvAudioTrack, index: number) => {
+        this.translationsTick();
+        return audioTrackLabel(track, index, {
+            fallback: this.translate.instant(
+                'EMBEDDED_MPV.PLAYER.AUDIO_TRACK_FALLBACK',
+                { index: index + 1 }
+            ),
+            defaultLabel: this.translate.instant(
+                'EMBEDDED_MPV.PLAYER.TRACK_DEFAULT'
+            ),
+        });
+    };
+    subtitleLabel = (track: EmbeddedMpvAudioTrack, index: number) => {
+        this.translationsTick();
+        return subtitleTrackLabel(track, index, {
+            fallback: this.translate.instant(
+                'EMBEDDED_MPV.PLAYER.SUBTITLE_TRACK_FALLBACK',
+                { index: index + 1 }
+            ),
+            defaultLabel: this.translate.instant(
+                'EMBEDDED_MPV.PLAYER.TRACK_DEFAULT'
+            ),
+        });
+    };
     speedLabel = speedLabel;
-    aspectLabel = aspectLabel;
+    aspectLabel = (aspect: string) => {
+        this.translationsTick();
+        return aspect === 'no'
+            ? this.translate.instant('EMBEDDED_MPV.PLAYER.ASPECT_DEFAULT')
+            : aspectLabel(aspect);
+    };
 
     private setRecordingMessage(
         message: string | null,
@@ -609,7 +917,7 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
     private adjustVolume(delta: number): void {
         const next = Math.max(0, Math.min(1, this.volume() + delta));
         this.applyVolume(next);
-        this.revealControls();
+        this.legacyInteractions.revealControls();
         this.feedback.flash(volumeIcon(next), `${Math.round(next * 100)}%`);
     }
 
@@ -617,68 +925,6 @@ export class EmbeddedMpvPlayerComponent implements OnDestroy {
         this.volume.set(value);
         persistVolume(value);
         void this.controller.applyVolume(value);
-    }
-
-    private closePopovers(): void {
-        if (!this.menus.anyOpen()) {
-            return;
-        }
-        this.menus.closeAll();
-        this.controller.triggerBoundsSync();
-        this.scheduleControlsHide();
-    }
-
-    private revealControls(scheduleHide = true): void {
-        this.controlsVisible.set(true);
-        if (scheduleHide) {
-            this.clearControlsHideTimer();
-            this.scheduleControlsHide();
-        }
-    }
-
-    private scheduleControlsHide(): void {
-        if (
-            !this.isPlaying() ||
-            this.menus.anyOpen() ||
-            Boolean(this.statusLabel())
-        ) {
-            this.clearControlsHideTimer();
-            return;
-        }
-        if (!this.controlsVisible() || this.controlsHideTimer !== null) {
-            return;
-        }
-        this.controlsHideTimer = window.setTimeout(() => {
-            if (
-                this.isPlaying() &&
-                !this.menus.anyOpen() &&
-                !this.statusLabel()
-            ) {
-                this.controlsVisible.set(false);
-            }
-        }, HIDE_CONTROLS_DELAY_MS);
-    }
-
-    private clearControlsHideTimer(): void {
-        if (this.controlsHideTimer === null) {
-            return;
-        }
-        window.clearTimeout(this.controlsHideTimer);
-        this.controlsHideTimer = null;
-    }
-
-    private isPointerInsidePlayer(event: PointerEvent): boolean {
-        const playerRoot = this.playerRoot()?.nativeElement;
-        if (!playerRoot) {
-            return false;
-        }
-        const rect = playerRoot.getBoundingClientRect();
-        return (
-            event.clientX >= rect.left &&
-            event.clientX <= rect.right &&
-            event.clientY >= rect.top &&
-            event.clientY <= rect.bottom
-        );
     }
 }
 

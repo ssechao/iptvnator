@@ -1,6 +1,6 @@
 import { TestBed } from '@angular/core/testing';
 import { signalStore, withState } from '@ngrx/signals';
-import { DataService, SettingsStore } from '@iptvnator/services';
+import { RuntimeCapabilitiesService, SettingsStore } from '@iptvnator/services';
 import { EpgItem } from '@iptvnator/shared/interfaces';
 import { XtreamApiService } from '../../services/xtream-api.service';
 import { XtreamXmltvFallbackService } from '../../services/xtream-xmltv-fallback.service';
@@ -43,8 +43,10 @@ function buildProgram(
 }
 
 interface TestStoreSetup {
+    appEnvironment?: 'electron' | 'pwa';
     selectedItem: { xtream_id: number; epg_channel_id?: string | null };
     preferUploaded?: boolean;
+    epgOffsetMinutes?: number;
 }
 
 function configureStore(setup: TestStoreSetup) {
@@ -71,12 +73,20 @@ function configureStore(setup: TestStoreSetup) {
         preferUploadedEpgOverXtream: jest.fn(
             () => setup.preferUploaded ?? false
         ),
+        resolvedEpgOffsetMinutes: jest.fn(() => setup.epgOffsetMinutes ?? 0),
     };
 
     TestBed.configureTestingModule({
         providers: [
             TestEpgStore,
-            { provide: DataService, useValue: { isElectron: true } },
+            {
+                provide: RuntimeCapabilitiesService,
+                useValue: {
+                    get supportsEpg() {
+                        return (setup.appEnvironment ?? 'electron') !== 'pwa';
+                    },
+                },
+            },
             { provide: XtreamApiService, useValue: xtreamApiService },
             {
                 provide: XtreamXmltvFallbackService,
@@ -92,6 +102,25 @@ function configureStore(setup: TestStoreSetup) {
 
 describe('withEpg', () => {
     afterEach(() => TestBed.resetTestingModule());
+
+    it('selects the current program in the provider clock when a display offset is set', async () => {
+        const { store, xtreamApiService } = configureStore({
+            selectedItem: { xtream_id: 101 },
+            epgOffsetMinutes: 60,
+        });
+        const now = Math.floor(Date.now() / 1000);
+        // The guide runs an hour ahead of the real schedule, so the show the
+        // provider files under "an hour ago" is the one actually on air.
+        const programs = [
+            buildProgram('Really On Air', now - 5400, now - 1800),
+            buildProgram('Provider Says Now', now - 1800, now + 1800),
+        ];
+        xtreamApiService.getFullEpg.mockResolvedValue(programs);
+
+        await store.loadEpg();
+
+        expect(store.currentEpgItem()).toEqual(programs[0]);
+    });
 
     it('loads the full electron epg and derives the current program from timestamps', async () => {
         const { store, xtreamApiService, fallbackService } = configureStore({
@@ -152,6 +181,22 @@ describe('withEpg', () => {
         const result = await store.loadEpg();
 
         expect(result).toEqual([]);
+        expect(fallbackService.getProgramsForChannel).not.toHaveBeenCalled();
+    });
+
+    it('does not load Xtream or XMLTV EPG in browser/PWA mode', async () => {
+        const { store, xtreamApiService, fallbackService } = configureStore({
+            appEnvironment: 'pwa',
+            selectedItem: { xtream_id: 101, epg_channel_id: 'rtl.de' },
+        });
+
+        const result = await store.loadEpg();
+
+        expect(result).toEqual([]);
+        expect(store.epgItems()).toEqual([]);
+        expect(store.isLoadingEpg()).toBe(false);
+        expect(xtreamApiService.getFullEpg).not.toHaveBeenCalled();
+        expect(xtreamApiService.getShortEpg).not.toHaveBeenCalled();
         expect(fallbackService.getProgramsForChannel).not.toHaveBeenCalled();
     });
 

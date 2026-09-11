@@ -4,23 +4,33 @@ import {
     Component,
     Injector,
     Type,
+    computed,
     effect,
     inject,
     input,
     signal,
     untracked,
 } from '@angular/core';
-import { ActivatedRoute } from '@angular/router';
-import { ContentHeroComponent } from '@iptvnator/ui/components';
-import { UnifiedCollectionItem } from '@iptvnator/portal/shared/util';
+import { ActivatedRoute, Router } from '@angular/router';
+import {
+    PortalDetailShellComponent,
+    VIEW_IN_PORTAL_HANDOFF,
+    ViewInPortalHandoff,
+} from '@iptvnator/ui/components';
+import {
+    SeriesResumeTarget,
+    UnifiedCollectionItem,
+    getUnifiedCollectionDetailNavigation,
+} from '@iptvnator/portal/shared/util';
 import {
     XtreamPlaylistData,
     XtreamStore,
 } from '@iptvnator/portal/xtream/data-access';
 import { PlaylistsService } from '@iptvnator/services';
 import { Playlist } from '@iptvnator/shared/interfaces';
-import { firstValueFrom } from 'rxjs';
+import { firstValueFrom, of } from 'rxjs';
 import { SerialDetailsComponent } from './serial-details/serial-details.component';
+import { XTREAM_SERIES_RESUME_TARGET } from './serial-details/serial-details-resume-target.token';
 import { VodDetailsRouteComponent } from './vod-details/vod-details-route.component';
 
 interface XtreamCollectionStateSnapshot {
@@ -35,17 +45,20 @@ interface XtreamCollectionStateSnapshot {
 
 @Component({
     selector: 'app-xtream-collection-detail',
-    imports: [ContentHeroComponent, NgComponentOutlet],
+    imports: [PortalDetailShellComponent, NgComponentOutlet],
     template: `
         @if (detailComponent() && detailInjector()) {
             <ng-container
                 *ngComponentOutlet="
                     detailComponent();
-                    injector: detailInjector()
+                    injector: detailInjector() ?? undefined
                 "
             />
         } @else {
-            <app-content-hero [isLoading]="true" />
+            <app-portal-detail-shell
+                [isLoading]="true"
+                [backAvailable]="false"
+            />
         }
     `,
     changeDetection: ChangeDetectionStrategy.OnPush,
@@ -60,12 +73,34 @@ interface XtreamCollectionStateSnapshot {
         `,
     ],
 })
-export class XtreamCollectionDetailComponent {
+export class XtreamCollectionDetailComponent implements ViewInPortalHandoff {
     readonly item = input<UnifiedCollectionItem | null>(null);
+    readonly seriesResume = input<SeriesResumeTarget | null>(null);
 
     private readonly parentInjector = inject(Injector);
     private readonly playlistsService = inject(PlaylistsService);
+    private readonly router = inject(Router);
     private readonly xtreamStore = inject(XtreamStore);
+
+    readonly viewInPortalAvailable = computed(() => {
+        const item = this.item();
+        return !!item && getUnifiedCollectionDetailNavigation(item) !== null;
+    });
+    readonly viewInPortalPlaylistName = computed(
+        () => this.item()?.playlistName ?? null
+    );
+
+    openInPortal(): void {
+        const item = this.item();
+        const navigation = item
+            ? getUnifiedCollectionDetailNavigation(item)
+            : null;
+        if (navigation) {
+            void this.router.navigate(navigation.link, {
+                state: navigation.state,
+            });
+        }
+    }
     private readonly originalState = this.captureStoreState();
     readonly detailComponent = signal<Type<unknown> | null>(null);
     readonly detailInjector = signal<Injector | null>(null);
@@ -82,6 +117,7 @@ export class XtreamCollectionDetailComponent {
     }
 
     ngOnDestroy(): void {
+        this.xtreamStore.cancelDetailsRequest();
         this.restoreStoreState();
     }
 
@@ -132,29 +168,35 @@ export class XtreamCollectionDetailComponent {
                 ? VodDetailsRouteComponent
                 : SerialDetailsComponent
         );
+        const routeParams =
+            item.contentType === 'movie'
+                ? {
+                      categoryId: this.toPathSegment(item.categoryId),
+                      vodId: xtreamId,
+                  }
+                : {
+                      categoryId: this.toPathSegment(item.categoryId),
+                      serialId: xtreamId,
+                  };
         this.detailInjector.set(
             Injector.create({
                 providers: [
                     {
                         provide: ActivatedRoute,
+                        // The detail components read both snapshot.params and
+                        // the params observable (via toSignal) — provide both.
                         useValue: {
-                            snapshot: {
-                                params:
-                                    item.contentType === 'movie'
-                                        ? {
-                                              categoryId: this.toPathSegment(
-                                                  item.categoryId
-                                              ),
-                                              vodId: xtreamId,
-                                          }
-                                        : {
-                                              categoryId: this.toPathSegment(
-                                                  item.categoryId
-                                              ),
-                                              serialId: xtreamId,
-                                          },
-                            },
+                            snapshot: { params: routeParams },
+                            params: of(routeParams),
                         },
+                    },
+                    {
+                        provide: XTREAM_SERIES_RESUME_TARGET,
+                        useValue: this.seriesResume,
+                    },
+                    {
+                        provide: VIEW_IN_PORTAL_HANDOFF,
+                        useValue: this,
                     },
                 ],
                 parent: this.parentInjector,

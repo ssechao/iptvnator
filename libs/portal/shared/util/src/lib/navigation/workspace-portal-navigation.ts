@@ -36,6 +36,14 @@ export interface OpenLiveCollectionItemState {
 
 export interface OpenCollectionDetailItemState {
     item: UnifiedCollectionItem;
+    seriesResume?: SeriesResumeTarget;
+}
+
+export interface SeriesResumeTarget {
+    seriesXtreamId: number;
+    contentXtreamId: number;
+    seasonNumber: number;
+    episodeNumber: number;
 }
 
 export interface CollectionViewState {
@@ -44,12 +52,21 @@ export interface CollectionViewState {
 }
 
 export function getRecentItemNavigation(
-    item: PortalRecentItem
+    item: PortalRecentItem,
+    seriesResume?: SeriesResumeTarget | null,
+    options?: {
+        /**
+         * Use `seriesResume` only to rewrite an episode-keyed recent row to
+         * its parent series identity, without carrying the auto-play resume
+         * handoff in the navigation state (detail-only clicks, issue #1441).
+         */
+        resumeIdentityOnly?: boolean;
+    }
 ): WorkspaceNavigationTarget {
     if (item.type === 'live') {
         return buildLiveCollectionNavigationTarget({
             mode: 'recent',
-            sourceType: item.source,
+            sourceType: normalizeCollectionSourceType(item.source) ?? 'm3u',
             playlistId: item.playlist_id,
             itemId: item.xtream_id ?? item.id,
             title: item.title,
@@ -59,9 +76,26 @@ export function getRecentItemNavigation(
 
     const collectionItem = buildDashboardCollectionDetailItem(item);
     if (collectionItem) {
+        const detailItem =
+            item.source === 'xtream' &&
+            item.type === 'series' &&
+            seriesResume
+                ? {
+                      ...collectionItem,
+                      uid: buildXtreamCollectionUid(
+                          item.playlist_id,
+                          'series',
+                          seriesResume.seriesXtreamId
+                      ),
+                      xtreamId: seriesResume.seriesXtreamId,
+                  }
+                : collectionItem;
         return buildGlobalCollectionDetailNavigationTarget(
             'recent',
-            collectionItem
+            detailItem,
+            item.type === 'series' && !options?.resumeIdentityOnly
+                ? seriesResume
+                : null
         );
     }
 
@@ -91,7 +125,7 @@ export function getGlobalFavoriteNavigation(
     if (item.type === 'live') {
         return buildLiveCollectionNavigationTarget({
             mode: 'favorites',
-            sourceType: item.source,
+            sourceType: normalizeCollectionSourceType(item.source) ?? 'm3u',
             playlistId: item.playlist_id,
             itemId: item.xtream_id ?? item.id,
             title: item.title,
@@ -180,7 +214,8 @@ export function buildLiveCollectionNavigationTarget(params: {
 
 export function buildGlobalCollectionDetailNavigationTarget(
     mode: 'favorites' | 'recent',
-    item: UnifiedCollectionItem
+    item: UnifiedCollectionItem,
+    seriesResume?: SeriesResumeTarget | null
 ): WorkspaceNavigationTarget {
     return {
         link: [
@@ -189,7 +224,7 @@ export function buildGlobalCollectionDetailNavigationTarget(
         ],
         state: {
             [OPEN_COLLECTION_DETAIL_STATE_KEY]:
-                buildOpenCollectionDetailItemState(item),
+                buildOpenCollectionDetailItemState(item, seriesResume),
         },
     };
 }
@@ -228,10 +263,13 @@ export function getCollectionViewState(
 }
 
 export function buildOpenCollectionDetailItemState(
-    item: UnifiedCollectionItem
+    item: UnifiedCollectionItem,
+    seriesResume?: SeriesResumeTarget | null
 ): OpenCollectionDetailItemState {
+    const normalizedResume = normalizeSeriesResumeTarget(seriesResume);
     return {
-        item: normalizeCollectionDetailItem(item),
+        item: normalizeCollectionDetailItem(item) ?? item,
+        ...(normalizedResume ? { seriesResume: normalizedResume } : {}),
     };
 }
 
@@ -241,8 +279,18 @@ export function getOpenCollectionDetailItemState(
     const record = toStateRecord(state);
     const candidate = toStateRecord(record?.[OPEN_COLLECTION_DETAIL_STATE_KEY]);
     const item = normalizeCollectionDetailItem(candidate?.['item']);
+    const seriesResume = normalizeSeriesResumeTarget(
+        candidate?.['seriesResume']
+    );
 
-    return item ? { item } : null;
+    return item
+        ? {
+              item,
+              ...(item.contentType === 'series' && seriesResume
+                  ? { seriesResume }
+                  : {}),
+          }
+        : null;
 }
 
 export function buildOpenLiveCollectionItemState(params: {
@@ -539,6 +587,14 @@ function normalizeCollectionScope(
     return value === 'playlist' || value === 'all' ? value : null;
 }
 
+function normalizeCollectionSourceType(
+    value: unknown
+): CollectionSourceType | null {
+    return value === 'm3u' || value === 'xtream' || value === 'stalker'
+        ? value
+        : null;
+}
+
 function buildDashboardCollectionDetailItem(
     item: PortalFavoriteItem | PortalRecentItem
 ): UnifiedCollectionItem | null {
@@ -660,6 +716,40 @@ function toOptionalNumber(value: unknown): number | undefined {
     return Number.isFinite(normalized) ? normalized : undefined;
 }
 
+function normalizeSeriesResumeTarget(
+    candidate: unknown
+): SeriesResumeTarget | null {
+    const record = toStateRecord(candidate);
+    if (!record) {
+        return null;
+    }
+
+    const seriesXtreamId = toOptionalNumber(record['seriesXtreamId']);
+    const contentXtreamId = toOptionalNumber(record['contentXtreamId']);
+    const seasonNumber = toOptionalNumber(record['seasonNumber']);
+    const episodeNumber = toOptionalNumber(record['episodeNumber']);
+
+    if (
+        !Number.isInteger(seriesXtreamId) ||
+        (seriesXtreamId ?? 0) <= 0 ||
+        !Number.isInteger(contentXtreamId) ||
+        (contentXtreamId ?? 0) <= 0 ||
+        !Number.isInteger(seasonNumber) ||
+        (seasonNumber ?? -1) < 0 ||
+        !Number.isInteger(episodeNumber) ||
+        (episodeNumber ?? -1) < 0
+    ) {
+        return null;
+    }
+
+    return {
+        seriesXtreamId: seriesXtreamId as number,
+        contentXtreamId: contentXtreamId as number,
+        seasonNumber: seasonNumber as number,
+        episodeNumber: episodeNumber as number,
+    };
+}
+
 function normalizeCollectionDetailItem(
     candidate: unknown
 ): UnifiedCollectionItem | null {
@@ -669,9 +759,7 @@ function normalizeCollectionDetailItem(
     }
 
     const contentType = toPathSegment(record['contentType']);
-    const sourceType = toPathSegment(
-        record['sourceType']
-    ) as CollectionSourceType;
+    const sourceType = normalizeCollectionSourceType(record['sourceType']);
     const uid = toPathSegment(record['uid']);
     const name = toPathSegment(record['name']);
     const playlistId = toPathSegment(record['playlistId']);
@@ -680,6 +768,7 @@ function normalizeCollectionDetailItem(
         !uid ||
         !name ||
         !playlistId ||
+        !sourceType ||
         (contentType !== 'movie' && contentType !== 'series') ||
         (sourceType !== 'xtream' && sourceType !== 'stalker')
     ) {

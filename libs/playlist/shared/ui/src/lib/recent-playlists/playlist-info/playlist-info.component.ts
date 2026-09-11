@@ -1,16 +1,21 @@
 import { Clipboard, ClipboardModule } from '@angular/cdk/clipboard';
 import { DatePipe } from '@angular/common';
-import { Component, inject } from '@angular/core';
+import { Component, DestroyRef, inject, signal } from '@angular/core';
 import {
     FormControl,
     ReactiveFormsModule,
+    UntypedFormArray,
     UntypedFormBuilder,
     UntypedFormGroup,
     Validators,
 } from '@angular/forms';
 import { MatButton, MatIconButton } from '@angular/material/button';
 import { MatCheckboxModule } from '@angular/material/checkbox';
-import { MAT_DIALOG_DATA, MatDialogModule } from '@angular/material/dialog';
+import {
+    MAT_DIALOG_DATA,
+    MatDialogModule,
+    MatDialogRef,
+} from '@angular/material/dialog';
 import { MatIcon } from '@angular/material/icon';
 import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
@@ -18,15 +23,46 @@ import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatTooltip } from '@angular/material/tooltip';
 import { Store } from '@ngrx/store';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
 import { PlaylistActions } from '@iptvnator/m3u-state';
 import { firstValueFrom } from 'rxjs';
-import { DatabaseService, PlaylistsService } from '@iptvnator/services';
 import {
+    DatabaseService,
+    PlaylistsService,
+    RuntimeCapabilitiesService,
+    SettingsStore,
+} from '@iptvnator/services';
+import {
+    createStalkerMacAddressValidator,
     DEFAULT_PLAYLIST_AUTO_REFRESH_INTERVAL_HOURS,
-    PLAYLIST_AUTO_REFRESH_INTERVAL_OPTIONS,
+    normalizeStalkerIdentityValue,
+    normalizeStalkerMacAddress,
+    normalizeXtreamServerUrl,
     Playlist,
     PlaylistMeta,
+    PlaylistMetaUpdate,
+    PLAYLIST_AUTO_REFRESH_INTERVAL_OPTIONS,
 } from '@iptvnator/shared/interfaces';
+import {
+    normalizeEpgUrls,
+    resolvePlaylistEpgSourceState,
+} from '@iptvnator/shared/m3u-utils';
+import {
+    hasStalkerConnectionChanged,
+    omitStalkerConnection,
+    STALKER_PORTAL_URL_PATTERN,
+} from './stalker-playlist-edit.utils';
+import {
+    STALKER_PLAYLIST_CONNECTION_EDITOR,
+    STALKER_PLAYLIST_CONNECTION_EDITOR_STATUS,
+} from './stalker-playlist-connection-editor.token';
+
+type DesktopFileSaveBridge = Pick<
+    typeof window.electron,
+    'saveFileDialog' | 'writeFile'
+>;
+
+const EPG_URL_PATTERN = /^\s*(http|https|file):\/\/[^ "]+\s*$/;
 
 @Component({
     selector: 'app-playlist-info',
@@ -35,6 +71,13 @@ import {
         `
             .spacer {
                 flex: 1 1 auto;
+            }
+
+            .playlist-info-fields {
+                min-width: 0;
+                margin: 0;
+                padding: 0;
+                border: 0;
             }
 
             mat-dialog-content {
@@ -57,9 +100,64 @@ import {
 
             mat-dialog-content p {
                 margin: 0;
-                color: var(--app-muted-color);
+                color: var(--mat-sys-on-surface-variant);
                 font-size: 12.5px;
                 line-height: 1.45;
+            }
+
+            mat-dialog-content p.stalker-device-id-warning {
+                color: var(--mat-sys-error);
+            }
+
+            .playlist-epg-sources {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                padding: 12px;
+                border: 1px solid
+                    var(
+                        --app-widget-header-border,
+                        var(--mat-sys-outline-variant)
+                    );
+                border-radius: 8px;
+                background: var(--mat-sys-surface-container-low);
+            }
+
+            .playlist-epg-sources__header {
+                display: flex;
+                gap: 10px;
+                align-items: flex-start;
+            }
+
+            .playlist-epg-sources__header mat-icon {
+                color: var(--mat-sys-primary);
+            }
+
+            .playlist-epg-sources__title {
+                margin: 0 0 2px;
+                font-size: 14px;
+                font-weight: 600;
+                line-height: 1.25;
+            }
+
+            .playlist-epg-source-row {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto auto auto;
+                gap: 6px;
+                align-items: center;
+            }
+
+            .playlist-epg-source-actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                justify-content: flex-end;
+            }
+
+            @media (max-width: 520px) {
+                .playlist-epg-source-row {
+                    grid-template-columns: minmax(0, 1fr);
+                }
             }
         `,
     ],
@@ -87,10 +185,116 @@ export class PlaylistInfoComponent {
     private databaseService = inject(DatabaseService);
     private snackBar = inject(MatSnackBar);
     private translate = inject(TranslateService);
+    private runtime = inject(RuntimeCapabilitiesService);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
+    private readonly settingsStore = inject(SettingsStore);
+    private readonly destroyRef = inject(DestroyRef);
+    private readonly stalkerConnectionEditor = inject(
+        STALKER_PLAYLIST_CONNECTION_EDITOR
+    );
+    private dialogRef = inject(MatDialogRef<PlaylistInfoComponent>, {
+        optional: true,
+    });
     public playlistData = inject<Playlist & { id: string }>(MAT_DIALOG_DATA);
-
-    readonly isDesktop = !!window.electron;
+    readonly isSaving = signal(false);
+    readonly isHydratingStalkerPlaylist = signal(false);
+    readonly stalkerPlaylistHydrationFailed = signal(false);
     readonly autoRefreshIntervals = PLAYLIST_AUTO_REFRESH_INTERVAL_OPTIONS;
+    private dialogClosing = false;
+    private readonly stalkerPlaylistHydration: Promise<void>;
+
+    get isDesktop(): boolean {
+        return this.runtime.supportsDesktopFileSave;
+    }
+
+    get playlistEpgUrls(): string[] {
+        return this.normalizeEpgUrls(this.playlist.epgUrls);
+    }
+
+    get playlistDetectedEpgUrls(): string[] {
+        const detectedUrls = this.normalizeEpgUrls(
+            this.playlist.detectedEpgUrls
+        );
+        return detectedUrls.length > 0 ? detectedUrls : this.playlistEpgUrls;
+    }
+
+    get hiddenDetectedPlaylistEpgSourceCount(): number {
+        const enabledUrls = new Set(this.playlistEpgUrls);
+        return this.playlistDetectedEpgUrls.filter(
+            (url) => !enabledUrls.has(url)
+        ).length;
+    }
+
+    get canRefreshPlaylistEpg(): boolean {
+        return this.epgBridge.supportsDataManagement;
+    }
+
+    get canManagePlaylistEpgSources(): boolean {
+        return !this.playlist.serverUrl && !this.playlist.macAddress;
+    }
+
+    /**
+     * True once a device ID has actually reached the portal, which is the
+     * point of no return: the stock server pins the first non-empty
+     * `device_id`/`device_id2` to the MAC permanently, refuses a different one
+     * as a device conflict, and treats a later empty value as a lockout. The
+     * fields stay editable — a value that was never accepted may well need
+     * correcting — but the consequence has to be on screen.
+     *
+     * Storage is not transmission, so `isFullStalkerPortal` gates it.
+     * `device_id` travels only on `get_profile`/`do_auth`, which simple
+     * panel-style portals never run; the import's offline fallback also
+     * persists whatever was typed and records the playlist as simple. Warning
+     * those users that a change "will lock this source out" would be false,
+     * and would discourage them from fixing an ID that was never pinned.
+     */
+    get hasStoredStalkerDeviceIds(): boolean {
+        if (!this.playlist.isFullStalkerPortal) {
+            return false;
+        }
+
+        return Boolean(
+            normalizeStalkerIdentityValue(this.playlist.stalkerDeviceId1) ??
+            normalizeStalkerIdentityValue(this.playlist.stalkerDeviceId2)
+        );
+    }
+
+    /**
+     * Canonicalizes an edited MAC on blur, so the stored value is the one the
+     * portal's own format check accepts.
+     *
+     * Only an EDIT normalizes it. Merely focusing the field and tabbing on
+     * must leave it alone: rewriting it there would mark the form dirty and
+     * make the value differ from the stored one, which is exactly what the
+     * submit-path guard reads — so a later title-only save would carry the
+     * rewritten identity through and move the session fingerprint without the
+     * user having touched the MAC at all.
+     */
+    onMacAddressBlur(): void {
+        const control = this.playlistDetails.get('macAddress');
+
+        if (!control || !this.isStalkerMacAddressEdited(control.value)) {
+            return;
+        }
+
+        const normalized = normalizeStalkerMacAddress(control.value);
+
+        if (normalized && normalized !== control.value) {
+            control.setValue(normalized);
+            control.markAsDirty();
+        }
+    }
+
+    /** Whether a MAC value differs from the one the playlist was loaded with. */
+    private isStalkerMacAddressEdited(value: unknown): boolean {
+        return value !== this.playlist.macAddress;
+    }
+
+    get playlistEpgSourceInputs(): UntypedFormArray {
+        return this.playlistDetails.get(
+            'playlistEpgSourceInputs'
+        ) as UntypedFormArray;
+    }
 
     /** Playlist object */
     playlist: Playlist & { id: string };
@@ -99,8 +303,18 @@ export class PlaylistInfoComponent {
     playlistDetails!: UntypedFormGroup;
 
     constructor() {
+        this.dialogRef?.beforeClosed().subscribe(() => {
+            this.dialogClosing = true;
+        });
         this.playlist = this.playlistData;
         this.createForm();
+        if (this.playlist.portalUrl) {
+            this.isHydratingStalkerPlaylist.set(true);
+            this.stalkerPlaylistHydration =
+                this.hydrateCompleteStalkerPlaylist();
+        } else {
+            this.stalkerPlaylistHydration = Promise.resolve();
+        }
     }
 
     /**
@@ -139,8 +353,23 @@ export class PlaylistInfoComponent {
             serverUrl: new FormControl(this.playlist.serverUrl),
             username: new FormControl(this.playlist.username),
             password: new FormControl(this.playlist.password),
-            macAddress: new FormControl(this.playlist.macAddress),
-            portalUrl: new FormControl(this.playlist.portalUrl),
+            macAddress: new FormControl(
+                this.playlist.macAddress,
+                // Grandfathered: a playlist stored before this validation
+                // existed may hold anything, and on a panel that ignores the
+                // MAC it works. Blocking Save over it would strand the user's
+                // title/URL/EPG edits too.
+                createStalkerMacAddressValidator(this.playlist.macAddress)
+            ),
+            portalUrl: new FormControl(
+                this.playlist.portalUrl,
+                this.playlist.portalUrl
+                    ? [
+                          Validators.required,
+                          Validators.pattern(STALKER_PORTAL_URL_PATTERN),
+                      ]
+                    : []
+            ),
             stalkerSerialNumber: new FormControl(
                 this.playlist.stalkerSerialNumber
             ),
@@ -148,6 +377,9 @@ export class PlaylistInfoComponent {
             stalkerDeviceId2: new FormControl(this.playlist.stalkerDeviceId2),
             stalkerSignature1: new FormControl(this.playlist.stalkerSignature1),
             stalkerSignature2: new FormControl(this.playlist.stalkerSignature2),
+            playlistEpgSourceInputs: new UntypedFormArray([
+                this.createPlaylistEpgSourceControl(),
+            ]),
         });
     }
 
@@ -170,21 +402,113 @@ export class PlaylistInfoComponent {
     }
 
     async saveChanges(playlist: PlaylistMeta): Promise<void> {
+        if (this.isSaving()) {
+            return;
+        }
+
+        this.isSaving.set(true);
+        if (this.dialogRef) {
+            this.dialogRef.disableClose = true;
+        }
         try {
+            let submittedPlaylist = playlist;
+            if (this.isHydratingStalkerPlaylist()) {
+                await this.stalkerPlaylistHydration;
+                submittedPlaylist = this.playlistDetails.value as PlaylistMeta;
+            }
+            if (
+                this.stalkerPlaylistHydrationFailed() ||
+                this.playlistDetails.invalid
+            ) {
+                return;
+            }
+
+            let resolvedStalkerConnection = false;
+            let resolvedStalkerSessionPatch:
+                PlaylistMetaUpdate['stalkerSessionPatch'] | undefined;
+            let preserveCurrentMetadata = false;
+            let normalizedPlaylist: PlaylistMetaUpdate =
+                this.normalizeStalkerPlaylistMeta(
+                    this.normalizeXtreamPlaylistMeta(submittedPlaylist)
+                );
+            if (this.playlist.portalUrl) {
+                if (
+                    hasStalkerConnectionChanged(
+                        this.playlist,
+                        normalizedPlaylist
+                    )
+                ) {
+                    const result =
+                        await this.stalkerConnectionEditor.resolveConnection(
+                            normalizedPlaylist,
+                            this.playlist
+                        );
+                    if (
+                        result.status !==
+                        STALKER_PLAYLIST_CONNECTION_EDITOR_STATUS.RESOLVED
+                    ) {
+                        this.snackBar.open(
+                            result.message,
+                            this.translate.instant('CLOSE'),
+                            { duration: 8000 }
+                        );
+                        return;
+                    }
+                    normalizedPlaylist = result.playlist;
+                    resolvedStalkerSessionPatch =
+                        result.playlist.stalkerSessionPatch;
+                    resolvedStalkerConnection = true;
+                    preserveCurrentMetadata =
+                        this.dialogClosing || this.destroyRef.destroyed;
+                } else {
+                    normalizedPlaylist =
+                        omitStalkerConnection(normalizedPlaylist);
+                }
+            }
             const isXtream =
-                this.playlist &&
+                !this.playlist.portalUrl &&
                 this.playlist.username &&
                 this.playlist.password &&
                 this.playlist.serverUrl;
 
-            if (isXtream) {
-                await this.updateXtreamPlaylist(playlist);
+            if (isXtream && this.runtime.supportsXtreamSqliteDataSource) {
+                await this.updateXtreamPlaylist(normalizedPlaylist);
             }
 
-            // Dispatch store action to update UI
+            if (resolvedStalkerConnection) {
+                normalizedPlaylist = preserveCurrentMetadata
+                    ? await this.stalkerConnectionEditor.applyResolvedConnection(
+                          normalizedPlaylist,
+                          { preserveCurrentMetadata: true }
+                      )
+                    : await this.stalkerConnectionEditor.applyResolvedConnection(
+                          normalizedPlaylist
+                      );
+                normalizedPlaylist = {
+                    ...normalizedPlaylist,
+                    stalkerSessionPatch: resolvedStalkerSessionPatch,
+                };
+            }
+
+            // Resolved Stalker edits cross an awaited, atomic persistence
+            // boundary above. Their action updates NgRx only; every other
+            // metadata edit keeps the effect-owned persistence path.
             this.store.dispatch(
-                PlaylistActions.updatePlaylistMeta({ playlist })
+                PlaylistActions.updatePlaylistMeta({
+                    playlist: normalizedPlaylist,
+                    ...(resolvedStalkerConnection ? { persist: false } : {}),
+                })
             );
+
+            // Save already authorized this connection change, and a full
+            // portal's completed get_profile may have pinned the submitted
+            // serial/device identity remotely. Navigation cannot recall that
+            // request, so the resolved identity/session is persisted above
+            // even when the dialog disappears. Only view-side completion is
+            // suppressed after destruction/close animation begins.
+            if (this.dialogClosing || this.destroyRef.destroyed) {
+                return;
+            }
 
             this.snackBar.open(
                 this.translate.instant(
@@ -193,6 +517,7 @@ export class PlaylistInfoComponent {
                 this.translate.instant('CLOSE'),
                 { duration: 3000 }
             );
+            this.dialogRef?.close();
         } catch (error) {
             console.error('Error updating playlist:', error);
             this.snackBar.open(
@@ -202,7 +527,98 @@ export class PlaylistInfoComponent {
                     duration: 3000,
                 }
             );
+        } finally {
+            if (this.dialogRef) {
+                this.dialogRef.disableClose = false;
+            }
+            this.isSaving.set(false);
         }
+    }
+
+    /**
+     * Electron's startup metadata projection deliberately excludes the
+     * payload-only Stalker identity and session fields. Editing that summary
+     * directly would render the identity controls empty and could clear a
+     * portal-pinned serial/device identity on the next discovery. Hydrate the
+     * authoritative row before enabling the form in every runtime so Edit
+     * always starts from the same persisted connection that playback uses.
+     */
+    private async hydrateCompleteStalkerPlaylist(): Promise<void> {
+        try {
+            const persistedPlaylist = await firstValueFrom(
+                this.playlistsService.getPlaylistById(this.playlist._id)
+            );
+            if (!persistedPlaylist) {
+                throw new Error('Stored Stalker playlist was not found');
+            }
+
+            this.playlist = {
+                ...this.playlistData,
+                ...persistedPlaylist,
+                id: this.playlistData.id ?? persistedPlaylist._id,
+            };
+            this.createForm();
+        } catch (error) {
+            console.error('Failed to load complete Stalker playlist:', error);
+            this.stalkerPlaylistHydrationFailed.set(true);
+            this.snackBar.open(
+                this.translate.instant('HOME.PLAYLISTS.PLAYLIST_UPDATE_FAILED'),
+                this.translate.instant('CLOSE'),
+                { duration: 3000 }
+            );
+        } finally {
+            this.isHydratingStalkerPlaylist.set(false);
+        }
+    }
+
+    /**
+     * Canonicalizes the MAC on the submit path as well as on blur. Pressing
+     * Enter inside the field submits the dialog without the field losing
+     * focus, so the blur handler never runs and the raw `00-1a-79-…` the user
+     * typed would be persisted and sent to a portal whose format check
+     * refuses it.
+     *
+     * Only an ACTUAL edit is normalized. A MAC the user never touched is
+     * passed through byte for byte, even when it is non-canonical: those
+     * bytes are what a permissive portal registered, and rewriting them
+     * because someone renamed the playlist would move the session
+     * fingerprint and re-authenticate under a spelling the portal never saw.
+     * That is the same reason a stored MAC is not rewritten on load.
+     *
+     * A value that does not parse is left alone too — the grandfathered case,
+     * where a playlist stored before this validation existed may be working
+     * on a panel that ignores the MAC entirely.
+     */
+    private normalizeStalkerPlaylistMeta(playlist: PlaylistMeta): PlaylistMeta {
+        if (!this.isStalkerMacAddressEdited(playlist.macAddress)) {
+            return playlist;
+        }
+
+        const normalizedMac = normalizeStalkerMacAddress(playlist.macAddress);
+
+        if (!normalizedMac || normalizedMac === playlist.macAddress) {
+            return playlist;
+        }
+
+        return { ...playlist, macAddress: normalizedMac };
+    }
+
+    private normalizeXtreamPlaylistMeta(playlist: PlaylistMeta): PlaylistMeta {
+        if (
+            this.playlist.portalUrl ||
+            !playlist.serverUrl ||
+            !playlist.username ||
+            !playlist.password
+        ) {
+            return playlist;
+        }
+
+        return {
+            ...playlist,
+            password: playlist.password.trim(),
+            serverUrl: normalizeXtreamServerUrl(playlist.serverUrl),
+            username: playlist.username.trim(),
+        };
     }
 
     async updateXtreamPlaylist(playlist: PlaylistMeta) {
@@ -229,14 +645,169 @@ export class PlaylistInfoComponent {
         }); */
     }
 
+    async refreshPlaylistEpgSource(url: string): Promise<void> {
+        const normalizedUrl = url.trim();
+        if (!normalizedUrl) {
+            return;
+        }
+
+        const result = await this.epgBridge.forceFetchEpg(
+            normalizedUrl,
+            this.settingsStore.getTrustOptions()
+        );
+
+        if (!result) {
+            return;
+        }
+
+        this.snackBar.open(
+            this.translate.instant(
+                result.success ? 'EPG.FETCH_SUCCESS' : 'EPG.ERROR'
+            ),
+            this.translate.instant('CLOSE'),
+            { duration: 3000 }
+        );
+    }
+
+    async addPlaylistEpgSourceToSettings(url: string): Promise<void> {
+        const epgUrl = url.trim();
+        if (!epgUrl || this.isGlobalEpgSource(epgUrl)) {
+            return;
+        }
+
+        const currentSettings = this.settingsStore.getSettings();
+        await this.settingsStore.updateSettings({
+            epgUrl: this.normalizeEpgUrls([
+                ...(currentSettings.epgUrl ?? []),
+                epgUrl,
+            ]),
+        });
+
+        this.snackBar.open(
+            this.translate.instant('SETTINGS.ADD_EPG_SOURCE'),
+            this.translate.instant('CLOSE'),
+            { duration: 3000 }
+        );
+    }
+
+    isGlobalEpgSource(url: string): boolean {
+        const normalizedUrl = url.trim();
+        if (!normalizedUrl) {
+            return false;
+        }
+
+        return this.normalizeEpgUrls(
+            this.settingsStore.getSettings().epgUrl
+        ).includes(normalizedUrl);
+    }
+
+    async removePlaylistEpgSource(url: string): Promise<void> {
+        const epgUrl = url.trim();
+        if (!epgUrl) {
+            return;
+        }
+
+        if (this.epgBridge.supportsDataManagement) {
+            try {
+                const result =
+                    await this.epgBridge.clearEpgDataForSource(epgUrl);
+                if (result && result.success === false) {
+                    throw new Error('Clear EPG source returned false');
+                }
+            } catch (error) {
+                console.error(
+                    'Failed to clear playlist EPG source data:',
+                    error
+                );
+                this.snackBar.open(
+                    this.translate.instant('SETTINGS.EPG_DATA_CLEAR_FAILED'),
+                    this.translate.instant('CLOSE'),
+                    { duration: 3000 }
+                );
+                return;
+            }
+        }
+
+        const detectedEpgUrls = this.getRawDetectedPlaylistEpgUrls();
+        const disabledEpgUrls = this.normalizeEpgUrls(
+            this.playlist.disabledEpgUrls
+        );
+        const nextDisabledEpgUrls = detectedEpgUrls.includes(epgUrl)
+            ? this.normalizeEpgUrls([...disabledEpgUrls, epgUrl])
+            : disabledEpgUrls.filter((disabledUrl) => disabledUrl !== epgUrl);
+
+        const state = resolvePlaylistEpgSourceState({
+            detectedEpgUrls,
+            enabledEpgUrls: this.playlistEpgUrls.filter(
+                (enabledUrl) => enabledUrl !== epgUrl
+            ),
+            manualEpgUrls: this.normalizeEpgUrls(
+                this.playlist.manualEpgUrls
+            ).filter((manualUrl) => manualUrl !== epgUrl),
+            disabledEpgUrls: nextDisabledEpgUrls,
+        });
+
+        this.applyPlaylistEpgSourceState(state);
+    }
+
+    addPlaylistEpgSourceInput(): void {
+        this.playlistEpgSourceInputs.push(
+            this.createPlaylistEpgSourceControl()
+        );
+    }
+
+    removePlaylistEpgSourceInput(index: number): void {
+        if (this.playlistEpgSourceInputs.length <= 1) {
+            this.playlistEpgSourceInputs.at(0).reset('');
+            return;
+        }
+
+        this.playlistEpgSourceInputs.removeAt(index);
+    }
+
+    savePlaylistEpgSources(): void {
+        if (this.playlistEpgSourceInputs.invalid) {
+            this.playlistEpgSourceInputs.markAllAsTouched();
+            return;
+        }
+
+        const addedUrls = this.normalizeEpgUrls(
+            this.playlistEpgSourceInputs.value as string[]
+        );
+        if (addedUrls.length === 0) {
+            return;
+        }
+
+        const addedUrlSet = new Set(addedUrls);
+        const state = resolvePlaylistEpgSourceState({
+            detectedEpgUrls: this.getRawDetectedPlaylistEpgUrls(),
+            enabledEpgUrls: this.normalizeEpgUrls([
+                ...this.playlistEpgUrls,
+                ...addedUrls,
+            ]),
+            manualEpgUrls: this.normalizeEpgUrls([
+                ...(this.playlist.manualEpgUrls ?? []),
+                ...addedUrls,
+            ]),
+            disabledEpgUrls: this.normalizeEpgUrls(
+                this.playlist.disabledEpgUrls
+            ).filter((url) => !addedUrlSet.has(url)),
+        });
+
+        this.applyPlaylistEpgSourceState(state);
+        this.resetPlaylistEpgSourceInputs();
+    }
+
     async exportPlaylist() {
         const playlistAsString = await firstValueFrom(
             this.playlistsService.getRawPlaylistById(this.playlist._id)
         );
 
-        if (this.isDesktop) {
+        if (this.runtime.supportsDesktopFileSave) {
+            const desktopFileBridge = window.electron as DesktopFileSaveBridge;
+
             try {
-                const savePath = await window.electron.saveFileDialog(
+                const savePath = await desktopFileBridge.saveFileDialog(
                     `${this.playlist.title || 'exported'}.m3u8`,
                     [
                         {
@@ -247,7 +818,10 @@ export class PlaylistInfoComponent {
                 );
 
                 if (savePath) {
-                    await window.electron.writeFile(savePath, playlistAsString);
+                    await desktopFileBridge.writeFile(
+                        savePath,
+                        playlistAsString
+                    );
                     this.snackBar.open(
                         this.translate.instant(
                             'HOME.PLAYLISTS.INFO_DIALOG.PLAYLIST_EXPORT_SUCCESS'
@@ -256,6 +830,8 @@ export class PlaylistInfoComponent {
                         { duration: 3000 }
                     );
                 }
+
+                return;
             } catch (error) {
                 console.error('Failed to export playlist:', error);
                 this.snackBar.open(
@@ -267,23 +843,25 @@ export class PlaylistInfoComponent {
                         duration: 3000,
                     }
                 );
+                return;
             }
-        } else {
-            const element = document.createElement('a');
-            element.setAttribute(
-                'href',
-                'data:text/plain;charset=utf-8,' +
-                    encodeURIComponent(playlistAsString)
-            );
-            element.setAttribute(
-                'download',
-                this.playlist.title || 'exported.m3u'
-            );
-            element.style.display = 'none';
-            document.body.appendChild(element);
-            element.click();
-            document.body.removeChild(element);
         }
+
+        this.downloadPlaylistFile(playlistAsString);
+    }
+
+    private downloadPlaylistFile(playlistAsString: string): void {
+        const element = document.createElement('a');
+        element.setAttribute(
+            'href',
+            'data:text/plain;charset=utf-8,' +
+                encodeURIComponent(playlistAsString)
+        );
+        element.setAttribute('download', this.playlist.title || 'exported.m3u');
+        element.style.display = 'none';
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
     }
 
     /**
@@ -303,5 +881,47 @@ export class PlaylistInfoComponent {
                 );
             }
         }
+    }
+
+    private normalizeEpgUrls(urls?: string[] | null): string[] {
+        return normalizeEpgUrls(urls ?? []);
+    }
+
+    private createPlaylistEpgSourceControl(value = ''): FormControl<string> {
+        return new FormControl(value, {
+            nonNullable: true,
+            validators: [Validators.pattern(EPG_URL_PATTERN)],
+        });
+    }
+
+    private getRawDetectedPlaylistEpgUrls(): string[] {
+        return this.normalizeEpgUrls(this.playlist.detectedEpgUrls);
+    }
+
+    private applyPlaylistEpgSourceState(
+        state: ReturnType<typeof resolvePlaylistEpgSourceState>
+    ): void {
+        const playlistMeta = {
+            _id: this.playlist._id,
+            epgUrls: state.epgUrls,
+            detectedEpgUrls: state.detectedEpgUrls,
+            manualEpgUrls: state.manualEpgUrls,
+            disabledEpgUrls: state.disabledEpgUrls,
+        } as PlaylistMeta;
+
+        this.playlist = {
+            ...this.playlist,
+            ...playlistMeta,
+        };
+        this.store.dispatch(
+            PlaylistActions.updatePlaylistMeta({ playlist: playlistMeta })
+        );
+    }
+
+    private resetPlaylistEpgSourceInputs(): void {
+        this.playlistEpgSourceInputs.clear();
+        this.playlistEpgSourceInputs.push(
+            this.createPlaylistEpgSourceControl()
+        );
     }
 }

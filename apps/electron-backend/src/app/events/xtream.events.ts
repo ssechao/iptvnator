@@ -5,8 +5,30 @@
 
 import axios, { AxiosRequestConfig } from 'axios';
 import { ipcMain } from 'electron';
-import { PortalDebugEvent, XTREAM_CANCEL_SESSION } from '@iptvnator/shared/interfaces';
+import {
+    PortalDebugEvent,
+    XTREAM_CANCEL_SESSION,
+    XTREAM_CLIENT_USER_AGENT,
+    XTREAM_MAIN_PERFORMANCE_PHASE,
+    normalizeXtreamServerUrl,
+} from '@iptvnator/shared/interfaces';
+import { redactSensitiveData } from '@iptvnator/shared/logging';
 import { emitPortalDebugEvent } from './portal-debug.events';
+import { formatPortalRequestError } from './portal-request-error.util';
+import { requestWithValidatedRedirects } from '../util/validated-axios';
+import {
+    HostConnectivityGuardError,
+    HostRequestToken,
+    beginGuardedHostRequest,
+    reportGuardedHostFailure,
+    reportGuardedHostSuccess,
+    releaseGuardedHostRequest,
+} from '../util/host-connectivity-guard';
+import {
+    createXtreamMainPerformanceCaptureForRequest,
+    createXtreamMeasuredTransformResponse,
+} from './xtream-performance';
+import { cancelXtreamSessionRequests } from './xtream-session-cancellation';
 
 export default class XtreamEvents {
     static bootstrapXtreamEvents(): Electron.IpcMain {
@@ -14,41 +36,17 @@ export default class XtreamEvents {
     }
 }
 
-function formatXtreamError(error: unknown, requestUrl: string, action?: string) {
-    const parsedUrl = new URL(requestUrl);
-    const base = {
-        action,
-        host: parsedUrl.host,
-        pathname: parsedUrl.pathname,
-    };
+function buildXtreamApiUrl(url: string, params: Record<string, string>): URL {
+    const baseUrl = normalizeXtreamServerUrl(url);
+    const apiUrl = new URL(`${baseUrl}/player_api.php`);
+    Object.entries(params).forEach(([key, value]) => {
+        apiUrl.searchParams.append(
+            key,
+            key === 'username' || key === 'password' ? value.trim() : value
+        );
+    });
 
-    if (axios.isAxiosError(error)) {
-        return {
-            ...base,
-            type: 'AxiosError',
-            code: error.code,
-            status: error.response?.status,
-            message: error.message,
-            syscall: (error as NodeJS.ErrnoException).syscall,
-            hostname: (error as any).hostname,
-        };
-    }
-
-    if (error && typeof error === 'object') {
-        const errObj = error as Record<string, unknown>;
-        return {
-            ...base,
-            type: 'ErrorObject',
-            status: errObj.status,
-            message: errObj.message,
-        };
-    }
-
-    return {
-        ...base,
-        type: 'UnknownError',
-        message: String(error),
-    };
+    return apiUrl;
 }
 
 /**
@@ -67,16 +65,23 @@ ipcMain.handle(
         }
     ) => {
         const startedAt = Date.now();
+        const performanceCapture = createXtreamMainPerformanceCaptureForRequest(
+            payload.requestId
+        );
         let activeRequestKey: string | null = null;
+        let requestUrlForLog = payload.url;
+        let guardToken: HostRequestToken | null = null;
         try {
             const { url, params, requestId, sessionId } = payload;
 
             // Build URL with query parameters
             // Xtream API endpoint is always at /player_api.php
-            const apiUrl = new URL(`${url}/player_api.php`);
-            Object.entries(params).forEach(([key, value]) => {
-                apiUrl.searchParams.append(key, value);
-            });
+            const apiUrl = buildXtreamApiUrl(url, params);
+            requestUrlForLog = apiUrl.toString();
+
+            // Browsing a dead portal would otherwise queue dozens of 30-second
+            // timeouts in a row. Throws once the host has stopped answering.
+            guardToken = beginGuardedHostRequest(requestUrlForLog);
 
             const controller = new AbortController();
             if (requestId || sessionId) {
@@ -92,16 +97,40 @@ ipcMain.handle(
                 method: 'GET',
                 url: apiUrl.toString(),
                 headers: {
-                    'User-Agent':
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'User-Agent': XTREAM_CLIENT_USER_AGENT,
                     Accept: 'application/json',
                 },
                 timeout: 30000, // 30 seconds timeout for Xtream API
                 validateStatus: (status) => status < 500, // Don't throw on 4xx errors
                 signal: controller.signal,
             };
+            if (performanceCapture) {
+                config.transformResponse =
+                    createXtreamMeasuredTransformResponse(
+                        performanceCapture,
+                        axios.defaults.transformResponse
+                    );
+            }
 
-            const response = await axios(config);
+            const response = performanceCapture
+                ? await performanceCapture.measureAsync(
+                      XTREAM_MAIN_PERFORMANCE_PHASE.NETWORK_TOTAL,
+                      () =>
+                          requestWithValidatedRedirects<unknown>(
+                              apiUrl.toString(),
+                              config,
+                              { allowPrivateNetworks: true }
+                          )
+                  )
+                : await requestWithValidatedRedirects<unknown>(
+                      apiUrl.toString(),
+                      config,
+                      { allowPrivateNetworks: true }
+                  );
+
+            // The host answered — whatever the status says, it is reachable.
+            reportGuardedHostSuccess(guardToken);
+            guardToken = null;
 
             // Check if response is successful
             if (response.status >= 400) {
@@ -133,17 +162,29 @@ ipcMain.handle(
             }
 
             // Xtream API returns JSON data
-            return {
+            const result = {
                 payload: response.data,
                 action: params.action,
             };
+            return performanceCapture
+                ? performanceCapture.measure(
+                      XTREAM_MAIN_PERFORMANCE_PHASE.RESPONSE_READY,
+                      () => result
+                  )
+                : result;
         } catch (error) {
             const requestId = payload.requestId;
             if (requestId) {
-                const apiUrl = new URL(`${payload.url}/player_api.php`);
-                Object.entries(payload.params ?? {}).forEach(([key, value]) => {
-                    apiUrl.searchParams.append(key, value);
-                });
+                const apiUrl = (() => {
+                    try {
+                        return buildXtreamApiUrl(
+                            payload.url,
+                            payload.params ?? {}
+                        ).toString();
+                    } catch {
+                        return requestUrlForLog;
+                    }
+                })();
 
                 const debugEvent: PortalDebugEvent = {
                     requestId,
@@ -155,10 +196,9 @@ ipcMain.handle(
                     status: 'error',
                     request: {
                         method: 'GET',
-                        url: apiUrl.toString(),
+                        url: apiUrl,
                         headers: {
-                            'User-Agent':
-                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            'User-Agent': XTREAM_CLIENT_USER_AGENT,
                             Accept: 'application/json',
                         },
                         timeout: 30000,
@@ -169,10 +209,27 @@ ipcMain.handle(
                 emitPortalDebugEvent(debugEvent);
             }
 
+            if (error instanceof HostConnectivityGuardError) {
+                // The failures that tripped the guard were logged when they
+                // happened; a line per skipped request would be the very log
+                // spam the guard exists to stop.
+                throw error;
+            }
+
+            reportGuardedHostFailure(guardToken, error, {
+                requestUrl: requestUrlForLog,
+            });
+
             if (!payload.suppressErrorLog) {
                 console.error(
                     '[XTREAM_REQUEST] Failed',
-                    formatXtreamError(error, payload.url, payload.params?.action)
+                    redactSensitiveData(
+                        formatPortalRequestError(
+                            error,
+                            requestUrlForLog,
+                            payload.params?.action
+                        )
+                    )
                 );
             }
 
@@ -209,6 +266,7 @@ ipcMain.handle(
                 };
             }
         } finally {
+            releaseGuardedHostRequest(guardToken);
             if (activeRequestKey) {
                 activeXtreamRequests.delete(activeRequestKey);
             }
@@ -218,25 +276,24 @@ ipcMain.handle(
 
 ipcMain.handle(
     XTREAM_CANCEL_SESSION,
-    async (_event, sessionId: string): Promise<{ success: boolean; cancelled: number }> => {
-        if (!sessionId) {
-            return { success: false, cancelled: 0 };
-        }
-
-        let cancelled = 0;
-        for (const activeRequest of activeXtreamRequests.values()) {
-            if (activeRequest.sessionId !== sessionId) {
-                continue;
-            }
-
-            activeRequest.controller.abort();
-            cancelled += 1;
-        }
-
-        return {
-            success: cancelled > 0,
-            cancelled,
-        };
+    async (
+        _event,
+        sessionId: string
+    ): Promise<{ success: boolean; cancelled: number }> => {
+        const capture = createXtreamMainPerformanceCaptureForRequest();
+        return capture
+            ? capture.measure(
+                  XTREAM_MAIN_PERFORMANCE_PHASE.CANCEL_SESSION,
+                  () =>
+                      cancelXtreamSessionRequests(
+                          activeXtreamRequests.values(),
+                          sessionId
+                      )
+              )
+            : cancelXtreamSessionRequests(
+                  activeXtreamRequests.values(),
+                  sessionId
+              );
     }
 );
 type ActiveXtreamRequest = {
@@ -245,46 +302,3 @@ type ActiveXtreamRequest = {
 };
 
 const activeXtreamRequests = new Map<string, ActiveXtreamRequest>();
-
-ipcMain.handle(
-    'XTREAM_PROBE_URL',
-    async (
-        _event,
-        payload: {
-            url: string;
-            method?: 'GET' | 'HEAD';
-        }
-    ) => {
-        const config: AxiosRequestConfig = {
-            method: payload.method ?? 'HEAD',
-            url: payload.url,
-            headers: {
-                'User-Agent':
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
-            timeout: 10000,
-            maxRedirects: 5,
-            validateStatus: () => true,
-        };
-
-        try {
-            const response = await axios(config);
-            return {
-                status: response.status,
-                url: payload.url,
-            };
-        } catch (error) {
-            if (axios.isAxiosError(error) && error.response) {
-                return {
-                    status: error.response.status,
-                    url: payload.url,
-                };
-            }
-
-            return {
-                status: 0,
-                url: payload.url,
-            };
-        }
-    }
-);

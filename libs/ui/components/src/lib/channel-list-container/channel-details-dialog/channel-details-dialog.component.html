@@ -2,12 +2,12 @@
     <div class="channel-dialog__hero-copy">
         <div class="channel-dialog__eyebrow">
             <span class="channel-dialog__eyebrow-mark"></span>
-            {{ channel.group?.title || 'M3U' }}
+            {{ channel.group.title || 'M3U' }}
         </div>
 
         <div class="channel-dialog__headline-row">
             <div class="channel-dialog__headline-text">
-                @if (channel.tvg?.logo) {
+                @if (channel.tvg.logo) {
                     <img
                         class="channel-dialog__logo"
                         [src]="channel.tvg.logo"
@@ -227,6 +227,12 @@
 </mat-dialog-content>
 
 <mat-dialog-actions class="channel-dialog__actions">
+    @if (supportsEpgMapping) {
+        <button mat-stroked-button (click)="openEpgMapping()">
+            <mat-icon>settings_remote</mat-icon>
+            {{ 'CHANNELS.MAP_EPG' | translate }}
+        </button>
+    }
     <button mat-stroked-button mat-dialog-close class="channel-dialog__close">
         {{ 'CLOSE' | translate }}
     </button>

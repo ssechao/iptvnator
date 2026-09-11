@@ -5,12 +5,17 @@ import {
     withMethods,
     withState,
 } from '@ngrx/signals';
-import { GlobalSearchResult } from '@iptvnator/services';
+import { GlobalSearchResult } from '@iptvnator/shared/interfaces';
+import {
+    measureRendererPerformancePhase,
+    RENDERER_PERFORMANCE_PHASE,
+} from '@iptvnator/shared/logging';
 import {
     XTREAM_DATA_SOURCE,
     XtreamContentItem,
 } from '../../data-sources/xtream-data-source.interface';
 import { createLogger } from '@iptvnator/portal/shared/util';
+import { XtreamSearchResultItem } from '../../xtream-state';
 
 /**
  * Search filters configuration
@@ -27,7 +32,7 @@ export interface SearchFilters {
 export interface SearchState {
     searchTerm: string;
     searchFilters: SearchFilters;
-    searchResults: XtreamContentItem[];
+    searchResults: XtreamSearchResultItem[];
     globalSearchResults: GlobalSearchResult[];
     isSearching: boolean;
 }
@@ -126,10 +131,15 @@ export function withSearch() {
                             return results;
                         }
 
-                        patchState(store, {
-                            searchResults: results,
-                            isSearching: false,
-                        });
+                        measureRendererPerformancePhase(
+                            RENDERER_PERFORMANCE_PHASE.XTREAM_SEARCH_RESULTS,
+                            () =>
+                                patchState(store, {
+                                    searchResults: results,
+                                    isSearching: false,
+                                }),
+                            () => ({ items: results.length })
+                        );
 
                         return results;
                     } catch (error) {

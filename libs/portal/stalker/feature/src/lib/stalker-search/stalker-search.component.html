@@ -1,15 +1,23 @@
 <app-search-layout
     [searchTerm]="searchTerm()"
     [resultsCount]="resultsCount"
-    [isLoading]="searchResultsResource.isLoading()"
+    [isLoading]="isInitialSearchLoading()"
     [showResultsCount]="true"
     [showSearchInput]="!isWorkspaceLayout"
+    [showBackButton]="isWorkspaceLayout"
     [showDetails]="showingDetails"
+    [nearEndHasMore]="searchHasMore()"
+    [nearEndAppending]="isAppendingSearchResults()"
+    [nearEndRenderedCount]="resultsCount"
+    [nearEndResetKey]="searchScrollResetKey()"
     (searchTermChange)="updateSearchTerm($event)"
+    (backClick)="goBack()"
+    (nearEnd)="loadMoreSearchResults()"
 >
     @if (showingDetails) {
         <app-stalker-inline-detail
             details
+            [playbackSessionKey]="playbackSessionKey()"
             [categoryId]="inlineDetail().categoryId"
             [seriesItem]="inlineDetail().seriesItem"
             [isSeries]="inlineDetail().isSeries"
@@ -23,7 +31,9 @@
             (inlineTimeUpdated)="handleInlineTimeUpdate($event)"
             (inlinePlaybackClosed)="closeInlinePlayer()"
             (streamUrlCopied)="showCopyNotification()"
-            (inlineExternalFallbackRequested)="handleExternalFallbackRequest($event)"
+            (inlineExternalFallbackRequested)="
+                handleExternalFallbackRequest($event)
+            "
             (favoriteToggled)="onVodFavoriteToggled($event)"
             (backClicked)="onVodBack()"
         />
@@ -44,9 +54,9 @@
     <!-- Results -->
     <ng-container results>
         <div class="results-grid">
-            @for (item of searchResultsResource.value(); track item.id) {
+            @for (item of searchResults(); track item.id) {
                 <app-content-card
-                    [title]="item.o_name || item.name"
+                    [title]="item.o_name || item.name || ''"
                     [posterUrl]="item.screenshot_uri"
                     [type]="selectedFilterType() === 'vod' ? 'movie' : 'series'"
                     [showPlaceholder]="true"
@@ -54,5 +64,20 @@
                 />
             }
         </div>
+        <!-- Explicit retry: repeated append failures exhaust the scroll
+             auto-fill budget while the user sits at the bottom, so recovery
+             must not depend on producing another scroll event. -->
+        @if (searchAppendError()) {
+            <div class="search-append-error" role="alert">
+                <span>{{ 'PORTALS.GRID.LOAD_MORE_FAILED' | translate }}</span>
+                <button
+                    type="button"
+                    mat-stroked-button
+                    (click)="loadMoreSearchResults()"
+                >
+                    {{ 'PORTALS.GRID.RETRY' | translate }}
+                </button>
+            </div>
+        }
     </ng-container>
 </app-search-layout>

@@ -1,4 +1,7 @@
-import { EmbeddedMpvAudioTrack, EmbeddedMpvBounds } from '@iptvnator/shared/interfaces';
+import {
+    EmbeddedMpvAudioTrack,
+    EmbeddedMpvBounds,
+} from '@iptvnator/shared/interfaces';
 
 export const HIDDEN_BOUNDS: EmbeddedMpvBounds = Object.freeze({
     x: -100000,
@@ -6,16 +9,6 @@ export const HIDDEN_BOUNDS: EmbeddedMpvBounds = Object.freeze({
     width: 1,
     height: 1,
 }) as EmbeddedMpvBounds;
-
-/**
- * Vertical pixels to subtract from the MPV view's height when a control
- * popover (volume, audio, subtitle, speed, aspect) is open above the
- * controls strip. The native NSView paints over the WebContents, so we
- * shrink it from the bottom to expose the popover region in DOM. Sized to
- * cover the tallest popover (audio/subtitle list capped at ~240 px plus
- * title + padding); video keeps playing in the upper region.
- */
-export const MENU_OPEN_BOTTOM_CUTOUT_PX = 300;
 
 export const SPEED_PRESETS: ReadonlyArray<{ value: number; label: string }> = [
     { value: 0.5, label: '0.5×' },
@@ -49,20 +42,39 @@ export function formatTime(value: number | null | undefined): string {
     return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
+export interface TrackLabelTexts {
+    /** Used when the track carries neither title nor language. */
+    fallback?: string;
+    /** Suffix marker for the stream's default track. */
+    defaultLabel?: string;
+}
+
 export function audioTrackLabel(
     track: EmbeddedMpvAudioTrack,
-    index: number
+    index: number,
+    texts: TrackLabelTexts = {}
 ): string {
-    const label = track.title || track.language || `Audio ${index + 1}`;
-    return track.defaultTrack ? `${label} · Default` : label;
+    const label =
+        track.title ||
+        track.language ||
+        (texts.fallback ?? `Audio ${index + 1}`);
+    return track.defaultTrack
+        ? `${label} · ${texts.defaultLabel ?? 'Default'}`
+        : label;
 }
 
 export function subtitleTrackLabel(
     track: EmbeddedMpvAudioTrack,
-    index: number
+    index: number,
+    texts: TrackLabelTexts = {}
 ): string {
-    const label = track.title || track.language || `Subtitle ${index + 1}`;
-    return track.defaultTrack ? `${label} · Default` : label;
+    const label =
+        track.title ||
+        track.language ||
+        (texts.fallback ?? `Subtitle ${index + 1}`);
+    return track.defaultTrack
+        ? `${label} · ${texts.defaultLabel ?? 'Default'}`
+        : label;
 }
 
 export function speedLabel(speed: number): string {
@@ -98,12 +110,19 @@ export function persistVolume(value: number): void {
     localStorage.setItem('volume', String(value));
 }
 
+/**
+ * Measures the host element in CSS pixels without rounding. The main process
+ * converts these bounds to native units (page zoom × display scale) and
+ * rounds exactly once, after scaling — pre-rounding here would bake up to
+ * ±0.5px of CSS error that the scale factor then amplifies into visible
+ * off-by-one seams (e.g. a 10.49px edge at 200% renders at 21px, not 20px).
+ */
 export function measureBounds(host: HTMLElement): EmbeddedMpvBounds {
     const rect = host.getBoundingClientRect();
     return {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top),
-        width: Math.max(1, Math.round(rect.width)),
-        height: Math.max(1, Math.round(rect.height)),
+        x: rect.left,
+        y: rect.top,
+        width: Math.max(1, rect.width),
+        height: Math.max(1, rect.height),
     };
 }

@@ -25,6 +25,7 @@ export type XtreamLiveStream = {
 export type XtreamVodStream = {
     added?: string;
     category_id?: string;
+    container_extension?: string;
     name?: string;
     stream_id?: number | string;
 };
@@ -202,7 +203,7 @@ export async function fetchXtreamEpgFixture(
 
 export async function fetchStalkerCategoryFixture(
     request: APIRequestContext,
-    type: 'itv' | 'series' | 'vod'
+    type: 'itv' | 'radio' | 'series' | 'vod'
 ): Promise<StalkerCategoryFixture> {
     const categoriesResponse = await fetchJson<
         StalkerProxyPayload<StalkerCategory[]>

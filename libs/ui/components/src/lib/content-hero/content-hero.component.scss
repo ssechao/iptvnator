@@ -22,9 +22,7 @@
     --tag-border: rgba(0, 0, 0, 0.12);
 
     width: 100%;
-    height: 100%;
     display: block;
-    overflow: hidden;
     background: var(--surface-bg);
     color: var(--text-primary);
 }
@@ -51,44 +49,13 @@
 .hero {
     position: relative;
     width: 100%;
-    height: 100%;
+    // Natural height: the page scroll container lives outside the hero
+    // (PortalDetailShellComponent). `overflow: hidden` clips the scaled
+    // blurred backdrop fallback.
     overflow: hidden;
     background: var(
         --surface-bg
     ); // Solid background prevents any bleed-through
-
-    // Floating back button over backdrop
-    &__back-button {
-        position: absolute;
-        top: 16px;
-        left: 16px;
-        z-index: 10;
-        app-region: no-drag;
-        -webkit-app-region: no-drag;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 40px;
-        height: 40px;
-        border-radius: 50%;
-        background: rgba(0, 0, 0, 0.5);
-        backdrop-filter: blur(8px);
-        border: none;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        color: #fff;
-
-        &:hover {
-            background: rgba(0, 0, 0, 0.7);
-            transform: scale(1.05);
-        }
-
-        mat-icon {
-            font-size: 24px;
-            width: 24px;
-            height: 24px;
-        }
-    }
 
     // Backdrop image layer - fixed at top, never repeats
     &__backdrop {
@@ -103,6 +70,14 @@
         background-repeat: no-repeat;
         z-index: 0;
         overflow: hidden;
+
+        &-image {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            object-position: center 20%;
+        }
 
         // Fallback blur effect when using poster as backdrop
         &--blurred {
@@ -161,10 +136,9 @@
         }
     }
 
-    // Scrollable content area
+    // Content area (page scroll lives in the surrounding detail shell)
     &__content {
-        position: absolute;
-        inset: 0;
+        position: relative;
         z-index: 2;
         display: flex;
         gap: 32px;
@@ -172,16 +146,7 @@
         padding: 140px 40px 60px;
         max-width: var(--content-max-width);
         margin: 0 auto;
-        overflow-y: auto;
-        overflow-x: hidden;
         box-sizing: border-box;
-
-        // Hide scrollbar but keep functionality
-        scrollbar-width: none;
-        -ms-overflow-style: none;
-        &::-webkit-scrollbar {
-            display: none;
-        }
     }
 
     // Error state
@@ -191,6 +156,7 @@
         justify-content: center;
         text-align: center;
         gap: 16px;
+        min-height: 50vh;
 
         .error-icon {
             font-size: 64px;
@@ -319,6 +285,30 @@
         &--rating {
             color: #ffd700;
             border-color: rgba(255, 215, 0, 0.3);
+        }
+
+        // Rendered as a <button> so the facet is keyboard-operable; the
+        // UA's own font and appearance have to be neutralized to keep it
+        // visually identical to the informational chips beside it.
+        &--clickable {
+            appearance: none;
+            cursor: pointer;
+            font-family: inherit;
+            letter-spacing: inherit;
+            line-height: inherit;
+            transition:
+                border-color 0.15s ease,
+                background 0.15s ease;
+
+            &:hover {
+                background: var(--tag-border);
+                border-color: var(--text-secondary, rgba(255, 255, 255, 0.5));
+            }
+
+            &:focus-visible {
+                outline: 2px solid var(--text-primary, #fff);
+                outline-offset: 2px;
+            }
         }
     }
 
@@ -455,8 +445,23 @@
     }
 
     ::ng-deep .favorite-btn,
-    ::ng-deep .download-btn {
+    ::ng-deep .download-btn,
+    // The sources chip is a peer secondary action, so it wears the same
+    // surface, height and radius. Without this it reads as a link floating
+    // between three solid buttons.
+    ::ng-deep app-vod-sources-chip .sources-chip {
         @include detail-actions.secondary-action-button;
+    }
+
+    // Match the chip to its neighbouring icon buttons' tag surfaces. Its own
+    // pressed state (.sources-chip--open) is more specific and still wins.
+    ::ng-deep app-vod-sources-chip .sources-chip {
+        background: var(--tag-bg);
+        border-color: var(--tag-border);
+
+        &:hover {
+            background: var(--tag-border);
+        }
     }
 
     ::ng-deep .favorite-btn {
@@ -539,6 +544,26 @@
     }
 }
 
+// A phone cannot carry the poster and the details side by side: the details
+// column drops to ~200px, and the action buttons are then squeezed below
+// their own labels ("Play" clipped down to its icon). Stack them instead.
+@media (max-width: 640px) {
+    .hero__content {
+        flex-direction: column;
+        align-items: stretch;
+        padding-inline: 16px;
+    }
+
+    .poster {
+        width: 140px;
+        align-self: center;
+    }
+
+    .details__title {
+        text-align: center;
+    }
+}
+
 // ============================================================================
 // Animations
 // ============================================================================
@@ -583,4 +608,15 @@ ngx-skeleton-loader {
     // Ensure poster container has height/ratio for skeleton
     min-height: 330px; // Fallback
     aspect-ratio: 2 / 3;
+}
+
+// After the rule above so it wins the cascade at equal specificity: that
+// 330px skeleton fallback is sized for the desktop poster width, while the
+// stacked phone hero renders the poster 140px wide — its aspect-ratio height
+// is ~210px, and the leftover minimum was pure empty space pushing the title
+// and actions ~120px down on every loaded detail page.
+@media (max-width: 640px) {
+    .poster {
+        min-height: 0;
+    }
 }

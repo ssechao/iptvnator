@@ -1,5 +1,8 @@
+import { EpgSourceSettingsService } from '@iptvnator/services';
+import { CdkFixedSizeVirtualScroll } from '@angular/cdk/scrolling';
 import { signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { By } from '@angular/platform-browser';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
 import { ActivatedRoute } from '@angular/router';
 import { TranslateService } from '@ngx-translate/core';
@@ -10,8 +13,10 @@ import {
     FavoritesService,
     XtreamStore,
 } from '@iptvnator/portal/xtream/data-access';
-import { SettingsStore } from '@iptvnator/services';
+import { RuntimeCapabilitiesService, SettingsStore } from '@iptvnator/services';
+import { ChannelListItemComponent } from '@iptvnator/ui/components';
 import { PortalChannelsListComponent } from './portal-channels-list.component';
+import { XtreamFavoriteMarksService } from './xtream-favorite-marks.service';
 
 function buildEpgItem(params: {
     id: string;
@@ -37,6 +42,8 @@ function buildEpgItem(params: {
 }
 
 describe('PortalChannelsListComponent', () => {
+    const testWindow = window as unknown as { electron?: unknown };
+    const originalElectron = testWindow.electron;
     let fixture: ComponentFixture<PortalChannelsListComponent>;
     const selectedChannels = signal<unknown[]>([]);
     const selectedItem = signal<unknown>(null);
@@ -60,8 +67,18 @@ describe('PortalChannelsListComponent', () => {
     const favoritesService = {
         getFavorites: jest.fn().mockReturnValue(of([] as FavoriteItem[])),
     };
+    const epgQueueService = {
+        epgResult$: epgResults$,
+        getCached: jest.fn().mockReturnValue(null),
+        enqueue: jest.fn(),
+    };
 
     beforeEach(async () => {
+        Object.defineProperty(window, 'electron', {
+            configurable: true,
+            writable: true,
+            value: { platform: 'darwin' },
+        });
         storeSignals.setSelectedCategory.mockClear();
         storeSignals.toggleFavorite.mockClear();
         selectedChannels.set([]);
@@ -72,6 +89,8 @@ describe('PortalChannelsListComponent', () => {
         currentPlaylist.set(null);
         selectedCategoryId.set(1);
         favoritesService.getFavorites.mockReturnValue(of([] as FavoriteItem[]));
+        epgQueueService.getCached.mockReturnValue(null);
+        epgQueueService.enqueue.mockClear();
 
         await TestBed.configureTestingModule({
             imports: [PortalChannelsListComponent, NoopAnimationsModule],
@@ -112,16 +131,21 @@ describe('PortalChannelsListComponent', () => {
                 },
                 {
                     provide: EpgQueueService,
+                    useValue: epgQueueService,
+                },
+                {
+                    provide: RuntimeCapabilitiesService,
                     useValue: {
-                        epgResult$: epgResults$,
-                        getCached: jest.fn().mockReturnValue(null),
-                        enqueue: jest.fn(),
+                        get supportsEpg() {
+                            return Boolean(window.electron);
+                        },
                     },
                 },
                 {
                     provide: SettingsStore,
                     useValue: {
                         openStreamOnDoubleClick: signal(false),
+                        resolvedEpgOffsetMinutes: signal(0),
                     },
                 },
                 {
@@ -140,6 +164,20 @@ describe('PortalChannelsListComponent', () => {
 
     afterEach(() => {
         jest.useRealTimers();
+        Object.defineProperty(window, 'electron', {
+            configurable: true,
+            writable: true,
+            value: originalElectron,
+        });
+    });
+
+    it('clears visible cached XMLTV previews and re-enqueues after a source changes', () => {
+        const component = fixture.componentInstance;
+        component.epgPrograms.set(50, { title: 'Removed programme' } as never);
+        component.currentProgramsProgress.set(50, 20);
+        TestBed.inject(EpgSourceSettingsService).changed$.next();
+        expect(component.epgPrograms.size).toBe(0);
+        expect(component.currentProgramsProgress.size).toBe(0);
     });
 
     it('renders a loading placeholder instead of the empty state while xtream live content is still loading', () => {
@@ -234,6 +272,92 @@ describe('PortalChannelsListComponent', () => {
         expect(component.currentProgramsProgress.get(50)).toBeCloseTo(50, 1);
     });
 
+    it('does not derive or subscribe to row EPG previews in browser/PWA mode', async () => {
+        Object.defineProperty(window, 'electron', {
+            configurable: true,
+            writable: true,
+            value: undefined,
+        });
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set([
+            {
+                title: 'Cartoon Network',
+                xtream_id: 50,
+            },
+        ]);
+        selectedItem.set({ xtream_id: 50 });
+        epgItems.set([
+            buildEpgItem({
+                id: 'current',
+                title: 'Current Show',
+                start: new Date(Date.now() - 60_000).toISOString(),
+                stop: new Date(Date.now() + 60_000).toISOString(),
+                startTimestamp: Math.floor((Date.now() - 60_000) / 1000),
+                stopTimestamp: Math.floor((Date.now() + 60_000) / 1000),
+            }),
+        ]);
+
+        fixture.destroy();
+        fixture = TestBed.createComponent(PortalChannelsListComponent);
+        fixture.detectChanges();
+        await fixture.whenStable();
+        fixture.detectChanges();
+
+        epgResults$.next({
+            streamId: 50,
+            items: [
+                buildEpgItem({
+                    id: 'queued-current',
+                    title: 'Queued Current Show',
+                    start: new Date(Date.now() - 60_000).toISOString(),
+                    stop: new Date(Date.now() + 60_000).toISOString(),
+                    startTimestamp: Math.floor((Date.now() - 60_000) / 1000),
+                    stopTimestamp: Math.floor((Date.now() + 60_000) / 1000),
+                }),
+            ],
+        });
+
+        const pwaComponent = fixture.componentInstance;
+        expect(pwaComponent.supportsEpg).toBe(false);
+        expect(pwaComponent.channelItemSize).toBe(52);
+        expect(pwaComponent.epgPrograms.size).toBe(0);
+        expect(pwaComponent.currentProgramsProgress.size).toBe(0);
+
+        const virtualScrollElement = fixture.debugElement.query(
+            By.css('cdk-virtual-scroll-viewport')
+        );
+        if (!virtualScrollElement) {
+            throw new Error(
+                `Expected PWA channel viewport, received: ${fixture.nativeElement.innerHTML.slice(0, 1000)}`
+            );
+        }
+        const virtualScroll = virtualScrollElement.injector.get(
+            CdkFixedSizeVirtualScroll
+        );
+        Object.defineProperty(
+            virtualScrollElement.nativeElement,
+            'clientHeight',
+            {
+                configurable: true,
+                value: 520,
+            }
+        );
+        pwaComponent.viewport()?.checkViewportSize();
+        fixture.detectChanges();
+        await fixture.whenStable();
+        fixture.detectChanges();
+        const channelRow = fixture.debugElement
+            .query(By.directive(ChannelListItemComponent))
+            .injector.get(ChannelListItemComponent);
+        expect(virtualScroll.itemSize).toBe(52);
+        expect(channelRow.showEpg()).toBe(false);
+        expect(
+            fixture.nativeElement
+                .querySelector('.channel-list-item')
+                .classList.contains('compact')
+        ).toBe(true);
+    });
+
     it('does not mark a live item as favorite when only a colliding movie ID is favorited', () => {
         favoritesService.getFavorites.mockReturnValue(
             of([
@@ -276,6 +400,143 @@ describe('PortalChannelsListComponent', () => {
         ).toBe('live:290');
     });
 
+    it('scrolls the virtual list to the selected live channel', () => {
+        const channels = Array.from({ length: 20 }, (_, index) => ({
+            title: `Channel ${index + 1}`,
+            xtream_id: index + 1,
+        }));
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set(channels);
+        fixture.detectChanges();
+
+        const viewport = fixture.componentInstance.viewport();
+        if (!viewport) {
+            throw new Error('Expected virtual scroll viewport');
+        }
+        const scrollToIndex = jest.spyOn(viewport, 'scrollToIndex');
+
+        selectedItem.set({ xtream_id: 16 });
+        fixture.detectChanges();
+
+        expect(scrollToIndex).toHaveBeenCalledWith(15, 'smooth');
+    });
+
+    it('explicitly reveals and focuses an unchanged selected channel after browsing away', () => {
+        const requestFrame = jest
+            .spyOn(window, 'requestAnimationFrame')
+            .mockReturnValue(100000);
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set(
+            Array.from({ length: 20 }, (_, index) => ({
+                xtream_id: index + 1,
+                title: `Channel ${index + 1}`,
+            }))
+        );
+        selectedItem.set({ xtream_id: 16 });
+        fixture.detectChanges();
+        const viewport = fixture.componentInstance.viewport();
+        if (!viewport) throw new Error('Expected channel viewport');
+        const scroll = jest.spyOn(viewport, 'scrollToIndex');
+        const focus = jest.spyOn(viewport.elementRef.nativeElement, 'focus');
+        fixture.componentRef.setInput('revealRequest', {
+            channelId: 16,
+            sequence: 1,
+        });
+        fixture.detectChanges();
+        expect(scroll).not.toHaveBeenCalled();
+        const frame =
+            requestFrame.mock.calls[requestFrame.mock.calls.length - 1]?.[0];
+        frame?.(0);
+        requestFrame.mockRestore();
+        expect(scroll).toHaveBeenCalledWith(15, 'auto');
+        expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+        scroll.mockClear();
+        selectedChannels.set([...selectedChannels()]);
+        fixture.detectChanges();
+        expect(scroll).not.toHaveBeenCalled();
+    });
+
+    it('does not start smooth alignment when a selected row is already visible', () => {
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set(
+            Array.from({ length: 20 }, (_, index) => ({
+                title: `Channel ${index + 1}`,
+                xtream_id: index + 1,
+            }))
+        );
+        fixture.detectChanges();
+        const viewport = fixture.componentInstance.viewport()!;
+        jest.spyOn(viewport, 'getViewportSize').mockReturnValue(400);
+        jest.spyOn(viewport, 'measureScrollOffset').mockReturnValue(0);
+        const scroll = jest.spyOn(viewport, 'scrollToIndex');
+        selectedItem.set({ xtream_id: 2 });
+        fixture.detectChanges();
+        expect(scroll).not.toHaveBeenCalled();
+    });
+
+    it('does not realign after an update to the same selected channel', () => {
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set(
+            Array.from({ length: 20 }, (_, index) => ({
+                title: `Channel ${index + 1}`,
+                xtream_id: index + 1,
+            }))
+        );
+        fixture.detectChanges();
+        const viewport = fixture.componentInstance.viewport()!;
+        selectedItem.set({ xtream_id: 2 });
+        fixture.detectChanges();
+        const scroll = jest.spyOn(viewport, 'scrollToIndex');
+        selectedItem.set({ xtream_id: 2 });
+        fixture.detectChanges();
+        expect(scroll).not.toHaveBeenCalled();
+    });
+
+    it('does not re-scroll the virtual list when the search filter changes', () => {
+        const channels = Array.from({ length: 20 }, (_, index) => ({
+            title: `Channel ${index + 1}`,
+            xtream_id: index + 1,
+        }));
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set(channels);
+        fixture.detectChanges();
+
+        const viewport = fixture.componentInstance.viewport();
+        if (!viewport) {
+            throw new Error('Expected virtual scroll viewport');
+        }
+        const scrollToIndex = jest.spyOn(viewport, 'scrollToIndex');
+
+        selectedItem.set({ xtream_id: 16 });
+        fixture.detectChanges();
+        expect(scrollToIndex).toHaveBeenCalledWith(15, 'smooth');
+
+        scrollToIndex.mockClear();
+        fixture.componentRef.setInput('searchTermInput', 'Channel 16');
+        fixture.detectChanges();
+
+        expect(scrollToIndex).not.toHaveBeenCalled();
+    });
+
+    it('carries the live-channels pane id only outside the fullscreen panel copy', () => {
+        // The category list's ArrowRight hand-off looks the pane up by id,
+        // so the panel's second instance must not duplicate it.
+        selectedTypeContentLoading.set(false);
+        selectedChannels.set([{ title: 'Channel 1', xtream_id: 1 }]);
+        fixture.detectChanges();
+        const viewport = () =>
+            fixture.nativeElement.querySelector(
+                'cdk-virtual-scroll-viewport'
+            ) as HTMLElement;
+        expect(viewport().id).toBe('live-channels');
+        expect(viewport().hasAttribute('tabindex')).toBe(true);
+
+        fixture.componentRef.setInput('fullscreenPanelCopy', true);
+        fixture.detectChanges();
+        expect(viewport().hasAttribute('id')).toBe(false);
+        expect(viewport().hasAttribute('tabindex')).toBe(true);
+    });
+
     it('passes the live content type when toggling a channel favorite', async () => {
         selectedTypeContentLoading.set(false);
         currentPlaylist.set({
@@ -287,13 +548,10 @@ describe('PortalChannelsListComponent', () => {
 
         fixture.detectChanges();
 
-        fixture.componentInstance.toggleFavorite(
-            new MouseEvent('click'),
-            {
-                title: 'Cartoon Network',
-                xtream_id: 253,
-            }
-        );
+        fixture.componentInstance.toggleFavorite(new MouseEvent('click'), {
+            title: 'Cartoon Network',
+            xtream_id: 253,
+        });
         await Promise.resolve();
 
         expect(storeSignals.toggleFavorite).toHaveBeenCalledWith(
@@ -302,5 +560,58 @@ describe('PortalChannelsListComponent', () => {
             'live'
         );
         expect(fixture.componentInstance.favorites.get('live:253')).toBe(true);
+    });
+
+    it('shares favorite toggles with the other list instances of the playlist', async () => {
+        // The sidebar and the fullscreen channel panel each mount their own
+        // instance; a heart toggled in one must flip in the other too.
+        selectedTypeContentLoading.set(false);
+        currentPlaylist.set({
+            id: 'playlist-1',
+            password: 'secret',
+            serverUrl: 'http://demo.example',
+            username: 'demo',
+        });
+        fixture.detectChanges();
+
+        const marks = TestBed.inject(XtreamFavoriteMarksService);
+        const published: unknown[] = [];
+        marks.changes$.subscribe((change) => published.push(change));
+
+        // A toggle here is announced to every instance.
+        fixture.componentInstance.toggleFavorite(new MouseEvent('click'), {
+            title: 'Cartoon Network',
+            xtream_id: 253,
+        });
+        await Promise.resolve();
+        expect(published).toEqual([
+            { playlistId: 'playlist-1', key: 'live:253', isFavorite: true },
+        ]);
+
+        // A toggle announced by another instance lands here …
+        marks.notify({
+            playlistId: 'playlist-1',
+            key: 'live:7',
+            isFavorite: true,
+        });
+        expect(fixture.componentInstance.favorites.get('live:7')).toBe(true);
+        marks.notify({
+            playlistId: 'playlist-1',
+            key: 'live:253',
+            isFavorite: false,
+        });
+        expect(
+            fixture.componentInstance.favorites.get('live:253')
+        ).toBeUndefined();
+
+        // … unless it belongs to another playlist.
+        marks.notify({
+            playlistId: 'playlist-2',
+            key: 'live:9',
+            isFavorite: true,
+        });
+        expect(
+            fixture.componentInstance.favorites.get('live:9')
+        ).toBeUndefined();
     });
 });

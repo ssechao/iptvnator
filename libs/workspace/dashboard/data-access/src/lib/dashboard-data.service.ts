@@ -19,10 +19,16 @@ import {
     DatabaseService,
     GlobalRecentlyAddedKind,
     PlaylistsService,
+    RuntimeCapabilitiesService,
 } from '@iptvnator/services';
+import {
+    XTREAM_DATA_SOURCE,
+    XtreamContentItem,
+} from '@iptvnator/portal/xtream/data-access';
 import {
     buildPlaylistRecentItems,
     Channel,
+    M3uFavoriteChannel,
     Playlist,
     PortalAddedItem,
     PortalActivityItem,
@@ -42,15 +48,58 @@ import {
     toTimestamp,
 } from './dashboard-mappers';
 import {
-    buildStalkerDetailNavigationTarget,
-    buildStalkerStateItem,
-    buildXtreamNavigationTarget,
-    getGlobalFavoriteNavigation,
-    getRecentItemNavigation,
+    PORTAL_PLAYBACK_POSITIONS,
     WorkspaceNavigationTarget,
 } from '@iptvnator/portal/shared/util';
+import type { PlaybackPositionData } from '@iptvnator/shared/interfaces';
+import {
+    getGlobalFavoriteLink as getGlobalFavoriteLinkUtil,
+    getGlobalFavoriteNavigationState as getGlobalFavoriteNavigationStateUtil,
+    getPlaylistLink as getPlaylistLinkUtil,
+    getRecentItemDetailNavigationState as getRecentItemDetailNavigationStateUtil,
+    getRecentItemLink as getRecentItemLinkUtil,
+    getRecentItemNavigationState as getRecentItemNavigationStateUtil,
+    getRecentItemResumeNavigation as getRecentItemResumeNavigationUtil,
+    getRecentlyAddedLink as getRecentlyAddedLinkUtil,
+    getRecentlyAddedNavigationState as getRecentlyAddedNavigationStateUtil,
+    isTypeInKind as isTypeInKindUtil,
+    type DashboardContentKind,
+} from './dashboard-navigation.util';
 
-export type DashboardContentKind = 'all' | 'channels' | 'vod' | 'series';
+export type { DashboardContentKind };
+
+// Compound key for looking up a playback position by recent item — a single
+// playlist can contain the same xtream-id for a VOD and an episode (rare,
+// but the schema allows it), so contentType is part of the key.
+function playbackPositionMapKey(
+    playlistId: string,
+    contentXtreamId: number,
+    contentType: 'vod' | 'episode'
+): string {
+    return `${playlistId}::${contentXtreamId}::${contentType}`;
+}
+
+function seriesPlaybackPositionMapKey(
+    playlistId: string,
+    seriesXtreamId: number
+): string {
+    return `${playlistId}::${seriesXtreamId}`;
+}
+
+function newestPlaybackPosition(
+    current: PlaybackPositionData | null | undefined,
+    candidate: PlaybackPositionData | null | undefined
+): PlaybackPositionData | null {
+    if (!current) {
+        return candidate ?? null;
+    }
+    if (!candidate) {
+        return current;
+    }
+    return (candidate.updatedAt ?? '') > (current.updatedAt ?? '')
+        ? candidate
+        : current;
+}
 
 /** @deprecated Use {@link PortalRecentItem} from `@iptvnator/shared/interfaces` instead. */
 export type GlobalRecentItem = PortalRecentItem;
@@ -64,10 +113,13 @@ export type DashboardRecentlyAddedFilterKind = GlobalRecentlyAddedKind;
 export class DashboardDataService {
     private readonly store = inject(Store);
     private readonly dbService = inject(DatabaseService);
+    private readonly xtreamDataSource = inject(XTREAM_DATA_SOURCE);
     private readonly playlistsService = inject(PlaylistsService);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
     private readonly ngZone = inject(NgZone);
     private readonly translate = inject(TranslateService);
-    private favoritesAutoRefreshEnabled = false;
+    private readonly playbackPositions = inject(PORTAL_PLAYBACK_POSITIONS);
+    private readonly favoritesAutoRefreshEnabled = signal(false);
     private readonly languageTick = toSignal(
         this.translate.onLangChange.pipe(startWith(null)),
         { initialValue: null }
@@ -117,9 +169,13 @@ export class DashboardDataService {
     );
     private readonly globalRecentLoadingState = signal(true);
     private readonly globalRecentLoadedState = signal(false);
-    private readonly globalRecentDbLoadedState = signal(!window.electron);
+    private readonly globalRecentDbLoadedState = signal(
+        !this.hasPortalActivityStorage
+    );
     private readonly globalFavoritesLoadingState = signal(true);
     private readonly globalFavoritesLoadedState = signal(false);
+    private readonly xtreamGlobalFavoritesLoadedState = signal(false);
+    private readonly playlistBackedGlobalFavoritesLoadedState = signal(false);
     private readonly xtreamRecentlyAddedLoadingState = signal(true);
     private readonly xtreamRecentlyAddedLoadedState = signal(false);
     readonly playlists = this.store.selectSignal(selectAllPlaylistsMeta);
@@ -144,6 +200,11 @@ export class DashboardDataService {
         this.xtreamRecentlyAddedLoadedState.asReadonly();
     readonly xtreamRecentlyAddedItems =
         this.xtreamRecentlyAddedItemsState.asReadonly();
+
+    private get hasPortalActivityStorage(): boolean {
+        return this.runtime.supportsPortalActivityStorage;
+    }
+
     readonly dashboardReady = computed(
         () =>
             this.playlistsLoaded() &&
@@ -196,6 +257,145 @@ export class DashboardDataService {
             .slice(0, 200)
     );
 
+    // Split the recent list by content type so the dashboard can render
+    // movies/series ("Continue watching") separately from live channels
+    // ("Live now on your favorites"). Two card formats — one rail each.
+    readonly globalRecentVodItems = computed<GlobalRecentItem[]>(() =>
+        this.globalRecentItems().filter(
+            (item) => item.type === 'movie' || item.type === 'series'
+        )
+    );
+
+    readonly globalRecentLiveItems = computed<GlobalRecentItem[]>(() =>
+        this.globalRecentItems().filter((item) => item.type === 'live')
+    );
+
+    // Favorited live channels — the dashboard's "Live now" rail uses this
+    // source only. Recently watched live channels have their own dashboard rail.
+    readonly globalFavoriteLiveItems = computed<DashboardFavoriteItem[]>(() =>
+        this.globalFavoriteItems().filter((item) => item.type === 'live')
+    );
+
+    // Playback positions, keyed by `${playlist_id}::${contentXtreamId}::${type}`.
+    // Loaded lazily on dashboard mount (and refreshed when recent items
+    // change) so the hero + Continue Watching cards can show "X min left"
+    // and a progress bar. Live channels never have positions; M3U content
+    // doesn't either. Map starts empty and degrades cleanly on missing data.
+    private readonly playbackPositionsMap = signal<
+        Map<string, PlaybackPositionData>
+    >(new Map());
+    private readonly playbackPositionsBySeriesMap = signal<
+        Map<string, PlaybackPositionData>
+    >(new Map());
+
+    readonly playbackPositions$ = this.playbackPositionsMap.asReadonly();
+
+    getPlaybackPositionForItem(
+        item: PortalActivityItem
+    ): PlaybackPositionData | null {
+        if (item.type !== 'movie' && item.type !== 'series') {
+            return null;
+        }
+        const xtreamId =
+            typeof item.xtream_id === 'number'
+                ? item.xtream_id
+                : Number(item.xtream_id);
+        if (!Number.isFinite(xtreamId)) {
+            return null;
+        }
+
+        if (item.type === 'movie') {
+            const key = playbackPositionMapKey(
+                item.playlist_id,
+                xtreamId,
+                'vod'
+            );
+            return this.playbackPositionsMap().get(key) ?? null;
+        }
+
+        // Series recent_items rows carry either the series id (the series
+        // landing page writes the series itself) or, for direct-play flows,
+        // the episode id. Match both shapes through keyed maps so card renders
+        // do not scan every saved playback position.
+        const episodePosition =
+            this.playbackPositionsMap().get(
+                playbackPositionMapKey(item.playlist_id, xtreamId, 'episode')
+            ) ?? null;
+        const seriesPosition =
+            this.playbackPositionsBySeriesMap().get(
+                seriesPlaybackPositionMapKey(item.playlist_id, xtreamId)
+            ) ?? null;
+        return newestPlaybackPosition(episodePosition, seriesPosition);
+    }
+
+    /**
+     * Refresh the in-memory positions map for every playlist that owns at
+     * least one VOD/series recent item. Per-playlist bulk fetch is one IPC
+     * round-trip each (vs N+1 per content item), so this stays cheap even
+     * on heavy libraries.
+     */
+    async reloadPlaybackPositions(): Promise<void> {
+        const playlistIds = new Set<string>();
+        for (const item of this.globalRecentItems()) {
+            if (item.type === 'movie' || item.type === 'series') {
+                playlistIds.add(item.playlist_id);
+            }
+        }
+        if (playlistIds.size === 0) {
+            this.playbackPositionsMap.set(new Map());
+            this.playbackPositionsBySeriesMap.set(new Map());
+            return;
+        }
+
+        const next = new Map<string, PlaybackPositionData>();
+        const nextBySeries = new Map<string, PlaybackPositionData>();
+        for (const playlistId of playlistIds) {
+            try {
+                const positions =
+                    await this.playbackPositions.getAllPlaybackPositions(
+                        playlistId
+                    );
+                for (const position of positions) {
+                    next.set(
+                        playbackPositionMapKey(
+                            playlistId,
+                            position.contentXtreamId,
+                            position.contentType
+                        ),
+                        position
+                    );
+                    if (
+                        position.contentType === 'episode' &&
+                        Number.isFinite(position.seriesXtreamId)
+                    ) {
+                        const seriesKey = seriesPlaybackPositionMapKey(
+                            playlistId,
+                            position.seriesXtreamId as number
+                        );
+                        nextBySeries.set(
+                            seriesKey,
+                            newestPlaybackPosition(
+                                nextBySeries.get(seriesKey),
+                                position
+                            ) as PlaybackPositionData
+                        );
+                    }
+                }
+            } catch (err) {
+                console.warn(
+                    '[DashboardData] Failed to load playback positions for playlist',
+                    playlistId,
+                    err
+                );
+            }
+        }
+
+        this.ngZone.run(() => {
+            this.playbackPositionsMap.set(next);
+            this.playbackPositionsBySeriesMap.set(nextBySeries);
+        });
+    }
+
     readonly stalkerGlobalFavorites = computed<DashboardFavoriteItem[]>(() => {
         this.languageTick();
         return buildStalkerFavoriteItems(
@@ -232,11 +432,14 @@ export class DashboardDataService {
     constructor() {
         effect(() => {
             this.playlistFavoritesReloadKey();
-            if (!this.playlistsLoaded() || !this.favoritesAutoRefreshEnabled) {
+            if (
+                !this.playlistsLoaded() ||
+                !this.favoritesAutoRefreshEnabled()
+            ) {
                 return;
             }
 
-            void this.refreshPlaylistBackedGlobalFavorites();
+            void this.reloadPlaylistBackedGlobalFavorites();
         });
 
         effect(() => {
@@ -297,8 +500,11 @@ export class DashboardDataService {
             this.globalRecentLoadingState.set(true);
         }
 
-        if (!window.electron) {
-            this.xtreamGlobalRecentItems.set([]);
+        if (!this.hasPortalActivityStorage) {
+            const recentItems = await this.loadPwaXtreamGlobalRecentItems();
+            this.ngZone.run(() =>
+                this.xtreamGlobalRecentItems.set(recentItems)
+            );
             this.globalRecentDbLoadedState.set(true);
             this.finishInitialGlobalRecentLoadIfReady();
             return;
@@ -325,20 +531,34 @@ export class DashboardDataService {
     async reloadGlobalFavorites(): Promise<void> {
         if (!this.globalFavoritesLoaded()) {
             this.globalFavoritesLoadingState.set(true);
+            this.xtreamGlobalFavoritesLoadedState.set(false);
+            this.playlistBackedGlobalFavoritesLoadedState.set(false);
         }
 
-        const xtreamReload = this.reloadXtreamGlobalFavorites();
-        const m3uReload = this.refreshPlaylistBackedGlobalFavorites();
+        const xtreamReload = this.reloadXtreamGlobalFavorites().finally(() => {
+            this.ngZone.run(() =>
+                this.xtreamGlobalFavoritesLoadedState.set(true)
+            );
+            this.finishInitialGlobalFavoritesLoadIfReady();
+        });
+        const m3uReload = this.reloadPlaylistBackedGlobalFavorites();
 
         await Promise.all([xtreamReload, m3uReload]);
-        this.favoritesAutoRefreshEnabled = true;
+        if (
+            this.playlistsLoaded() &&
+            !this.playlistBackedGlobalFavoritesLoadedState()
+        ) {
+            await this.reloadPlaylistBackedGlobalFavorites();
+        }
+        this.finishInitialGlobalFavoritesLoadIfReady();
+        this.favoritesAutoRefreshEnabled.set(true);
     }
 
     async getGlobalRecentlyAddedItems(
         kind: DashboardRecentlyAddedFilterKind,
         limit = 200
     ): Promise<DashboardRecentlyAddedItem[]> {
-        if (!window.electron) {
+        if (!this.hasPortalActivityStorage) {
             return [];
         }
 
@@ -351,7 +571,7 @@ export class DashboardDataService {
     async getXtreamRecentlyAddedItems(
         limit = 20
     ): Promise<DashboardRecentlyAddedItem[]> {
-        if (!window.electron) {
+        if (!this.hasPortalActivityStorage) {
             return [];
         }
 
@@ -370,7 +590,7 @@ export class DashboardDataService {
             this.xtreamRecentlyAddedLoadingState.set(true);
         }
 
-        if (!window.electron) {
+        if (!this.hasPortalActivityStorage) {
             this.ngZone.run(() => {
                 this.xtreamRecentlyAddedItemsState.set([]);
                 this.xtreamRecentlyAddedLoadingState.set(false);
@@ -399,9 +619,9 @@ export class DashboardDataService {
     }
 
     private async reloadXtreamGlobalFavorites(): Promise<void> {
-        if (!window.electron) {
-            this.xtreamGlobalFavorites.set([]);
-            this.finishInitialGlobalFavoritesLoadIfReady();
+        if (!this.hasPortalActivityStorage) {
+            const favorites = await this.loadPwaXtreamGlobalFavorites();
+            this.ngZone.run(() => this.xtreamGlobalFavorites.set(favorites));
             return;
         }
 
@@ -417,14 +637,117 @@ export class DashboardDataService {
                 err
             );
             this.ngZone.run(() => this.xtreamGlobalFavorites.set([]));
-        } finally {
-            this.finishInitialGlobalFavoritesLoadIfReady();
         }
     }
 
-    private async refreshPlaylistBackedGlobalFavorites(): Promise<void> {
-        await this.reloadM3uGlobalFavorites();
+    private async loadPwaXtreamGlobalRecentItems(): Promise<
+        GlobalRecentItem[]
+    > {
+        const nested = await Promise.all(
+            this.getXtreamPlaylists().map(async (playlist) => {
+                const rows = await this.xtreamDataSource.getRecentItems(
+                    playlist._id
+                );
+                return rows.map((item) =>
+                    this.mapPwaXtreamRecentItem(item, playlist)
+                );
+            })
+        );
+        return nested.reduce<GlobalRecentItem[]>(
+            (items, playlistItems) => items.concat(playlistItems),
+            []
+        );
+    }
+
+    private async loadPwaXtreamGlobalFavorites(): Promise<
+        DashboardFavoriteItem[]
+    > {
+        const nested = await Promise.all(
+            this.getXtreamPlaylists().map(async (playlist) => {
+                const rows = await this.xtreamDataSource.getFavorites(
+                    playlist._id
+                );
+                return rows.map((item) =>
+                    this.mapPwaXtreamFavoriteItem(item, playlist)
+                );
+            })
+        );
+        return nested.reduce<DashboardFavoriteItem[]>(
+            (items, playlistItems) => items.concat(playlistItems),
+            []
+        );
+    }
+
+    private getXtreamPlaylists(): PlaylistMeta[] {
+        return this.playlists().filter(
+            (playlist) => !!playlist.serverUrl && !playlist.macAddress
+        );
+    }
+
+    private mapPwaXtreamRecentItem(
+        item: XtreamContentItem,
+        playlist: PlaylistMeta
+    ): GlobalRecentItem {
+        return {
+            id: item.id,
+            title: item.title,
+            type: this.normalizeXtreamActivityType(item.type),
+            playlist_id: playlist._id,
+            playlist_name: playlist.title || 'Xtream',
+            viewed_at: item.viewed_at ?? '',
+            category_id: item.category_id,
+            xtream_id: item.xtream_id,
+            poster_url: item.poster_url,
+            backdrop_url: item.backdrop_url ?? undefined,
+            source: 'xtream',
+        };
+    }
+
+    private mapPwaXtreamFavoriteItem(
+        item: XtreamContentItem,
+        playlist: PlaylistMeta
+    ): DashboardFavoriteItem {
+        return {
+            id: item.id,
+            title: item.title,
+            type: this.normalizeXtreamActivityType(item.type),
+            playlist_id: playlist._id,
+            playlist_name: playlist.title || 'Xtream',
+            added_at: item.added_at || item.added || new Date(0).toISOString(),
+            category_id: item.category_id,
+            xtream_id: item.xtream_id,
+            poster_url: item.poster_url,
+            backdrop_url: item.backdrop_url ?? undefined,
+            source: 'xtream',
+        };
+    }
+
+    private normalizeXtreamActivityType(type: string): PortalActivityType {
+        if (type === 'live' || type === 'series') {
+            return type;
+        }
+        return 'movie';
+    }
+
+    private async reloadPlaylistBackedGlobalFavorites(): Promise<void> {
+        const loaded = await this.refreshPlaylistBackedGlobalFavorites();
+        if (!loaded) {
+            return;
+        }
+
+        this.ngZone.run(() =>
+            this.playlistBackedGlobalFavoritesLoadedState.set(true)
+        );
         this.finishInitialGlobalFavoritesLoadIfReady();
+    }
+
+    private async refreshPlaylistBackedGlobalFavorites(): Promise<boolean> {
+        if (!this.playlistsLoaded()) {
+            return false;
+        }
+
+        await this.reloadM3uGlobalFavorites();
+        return true;
     }
 
     private async reloadM3uGlobalFavorites(): Promise<void> {
@@ -474,7 +797,12 @@ export class DashboardDataService {
                 let items: DashboardFavoriteItem[];
                 try {
                     items = await this.loadM3uPlaylistFavorites(playlist);
-                } catch {
+                } catch (err) {
+                    console.warn(
+                        '[DashboardData] Failed to load M3U favorites for playlist',
+                        playlist._id,
+                        err
+                    );
                     items = [];
                 }
 
@@ -490,7 +818,11 @@ export class DashboardDataService {
     }
 
     private finishInitialGlobalFavoritesLoadIfReady(): void {
-        if (!this.playlistsLoaded()) {
+        if (
+            !this.playlistsLoaded() ||
+            !this.xtreamGlobalFavoritesLoadedState() ||
+            !this.playlistBackedGlobalFavoritesLoadedState()
+        ) {
             return;
         }
 
@@ -515,28 +847,11 @@ export class DashboardDataService {
         type: PortalActivityType,
         kind: DashboardContentKind
     ): boolean {
-        if (kind === 'all') {
-            return true;
-        }
-        if (kind === 'channels') {
-            return type === 'live';
-        }
-        if (kind === 'vod') {
-            return type === 'movie';
-        }
-        return type === 'series';
+        return isTypeInKindUtil(type, kind);
     }
 
     getPlaylistLink(playlist: PlaylistMeta): string[] {
-        if (playlist.serverUrl) {
-            return ['/workspace', 'xtreams', playlist._id, 'vod'];
-        }
-
-        if (playlist.macAddress) {
-            return ['/workspace', 'stalker', playlist._id, 'vod'];
-        }
-
-        return ['/workspace', 'playlists', playlist._id];
+        return getPlaylistLinkUtil(playlist);
     }
 
     getPlaylistProvider(playlist: PlaylistMeta): string {
@@ -574,21 +889,77 @@ export class DashboardDataService {
     }
 
     getRecentItemLink(item: GlobalRecentItem): string[] {
-        return getRecentItemNavigation(item).link;
+        return getRecentItemLinkUtil(item);
     }
 
     getRecentItemNavigationState(
         item: GlobalRecentItem
     ): WorkspaceNavigationTarget['state'] {
-        return getRecentItemNavigation(item).state;
+        return getRecentItemNavigationStateUtil(
+            item,
+            this.getPlaybackPositionForItem(item)
+        );
+    }
+
+    getRecentItemDetailNavigationState(
+        item: GlobalRecentItem
+    ): WorkspaceNavigationTarget['state'] {
+        return getRecentItemDetailNavigationStateUtil(
+            item,
+            this.getPlaybackPositionForItem(item)
+        );
+    }
+
+    getRecentItemResumeNavigation(
+        item: GlobalRecentItem
+    ): WorkspaceNavigationTarget | null {
+        return getRecentItemResumeNavigationUtil(
+            item,
+            this.getPlaybackPositionForItem(item)
+        );
+    }
+
+    /**
+     * Mark the item's tracked position as fully watched by maxing out the
+     * existing row. Reusing the stored row keeps the provider-specific
+     * identity fields (Stalker scoped episode ids included) intact; without
+     * a row or a known duration there is nothing truthful to write, so the
+     * action reports false and the caller hides/ignores it. Uses the strict
+     * save boundary and rethrows persistence failures — the non-strict save
+     * swallows them, and reloading an unchanged position while reporting
+     * success would silently lie to the user.
+     */
+    async markRecentItemWatched(item: GlobalRecentItem): Promise<boolean> {
+        const position = this.getPlaybackPositionForItem(item);
+        if (!position?.durationSeconds || position.durationSeconds <= 0) {
+            return false;
+        }
+
+        await this.playbackPositions.savePlaybackPositionOrThrow(
+            item.playlist_id,
+            {
+                ...position,
+                positionSeconds: position.durationSeconds,
+                updatedAt: new Date().toISOString(),
+            }
+        );
+        await this.reloadPlaybackPositions();
+        return true;
     }
 
     async removeGlobalRecentItem(item: GlobalRecentItem): Promise<void> {
         if (item.source === 'xtream') {
-            await this.dbService.removeRecentItem(
-                item.id as number,
-                item.playlist_id
-            );
+            if (this.hasPortalActivityStorage) {
+                await this.dbService.removeRecentItem(
+                    item.id as number,
+                    item.playlist_id
+                );
+            } else {
+                await this.xtreamDataSource.removeRecentItem(
+                    item.id as number,
+                    item.playlist_id
+                );
+            }
             await this.reloadGlobalRecentItems();
             return;
         }
@@ -674,75 +1045,38 @@ export class DashboardDataService {
     }
 
     getGlobalFavoriteLink(item: DashboardFavoriteItem): string[] {
-        return getGlobalFavoriteNavigation(item).link;
+        return getGlobalFavoriteLinkUtil(item);
     }
 
     getGlobalFavoriteNavigationState(
         item: DashboardFavoriteItem
     ): WorkspaceNavigationTarget['state'] {
-        return getGlobalFavoriteNavigation(item).state;
+        return getGlobalFavoriteNavigationStateUtil(item);
     }
 
     getRecentlyAddedLink(item: DashboardRecentlyAddedItem): string[] {
-        if (item.source === 'stalker' && item.type !== 'live') {
-            return buildStalkerDetailNavigationTarget({
-                playlistId: item.playlist_id,
-                type: item.type,
-                categoryId: item.category_id,
-                item: buildStalkerStateItem(item.stalker_item, {
-                    id: item.id,
-                    title: item.title,
-                    type: item.type,
-                    category_id: item.category_id,
-                    poster_url: item.poster_url,
-                }),
-            }).link;
-        }
-
-        return buildXtreamNavigationTarget({
-            playlistId: item.playlist_id,
-            type: item.type,
-            categoryId: item.category_id,
-            itemId: item.xtream_id,
-            title: item.title,
-            imageUrl: item.poster_url,
-        }).link;
+        return getRecentlyAddedLinkUtil(item);
     }
 
     getRecentlyAddedNavigationState(
         item: DashboardRecentlyAddedItem
     ): WorkspaceNavigationTarget['state'] {
-        if (item.source === 'stalker' && item.type !== 'live') {
-            return buildStalkerDetailNavigationTarget({
-                playlistId: item.playlist_id,
-                type: item.type,
-                categoryId: item.category_id,
-                item: buildStalkerStateItem(item.stalker_item, {
-                    id: item.id,
-                    title: item.title,
-                    type: item.type,
-                    category_id: item.category_id,
-                    poster_url: item.poster_url,
-                }),
-            }).state;
-        }
-
-        return buildXtreamNavigationTarget({
-            playlistId: item.playlist_id,
-            type: item.type,
-            categoryId: item.category_id,
-            itemId: item.xtream_id,
-            title: item.title,
-            imageUrl: item.poster_url,
-        }).state;
+        return getRecentlyAddedNavigationStateUtil(item);
     }
 
     async removeGlobalFavorite(item: DashboardFavoriteItem): Promise<void> {
         if (item.source === 'xtream') {
-            await this.dbService.removeFromFavorites(
-                item.id as number,
-                item.playlist_id
-            );
+            if (this.hasPortalActivityStorage) {
+                await this.dbService.removeFromFavorites(
+                    item.id as number,
+                    item.playlist_id
+                );
+            } else {
+                await this.xtreamDataSource.removeFavorite(
+                    item.id as number,
+                    item.playlist_id
+                );
+            }
             await this.reloadGlobalFavorites();
             return;
         }
@@ -779,23 +1113,15 @@ export class DashboardDataService {
         }
 
         if (item.source === 'm3u') {
-            const playlist = await firstValueFrom(
-                this.playlistsService.getPlaylistById(item.playlist_id)
-            );
-            const currentFavorites = Array.isArray(playlist?.favorites)
-                ? playlist.favorites.filter(
-                      (favorite): favorite is string =>
-                          typeof favorite === 'string'
-                  )
-                : [];
-            const filteredFavorites = currentFavorites.filter(
-                (favorite) => favorite !== String(item.id)
-            );
-
             await firstValueFrom(
-                this.playlistsService.setFavorites(
+                this.playlistsService.transformPlaylistFavorites(
                     item.playlist_id,
-                    filteredFavorites
+                    (current) =>
+                        current.filter(
+                            (favorite) =>
+                                typeof favorite !== 'string' ||
+                                favorite !== String(item.id)
+                        )
                 )
             );
             await this.reloadGlobalFavorites();
@@ -818,14 +1144,20 @@ export class DashboardDataService {
     ): Promise<DashboardFavoriteItem[]> {
         // Cache fingerprint covers what affects the result: the favorites
         // list itself and the playlist's update timestamp (changes mean
-        // channels may have been added/removed by a refresh). A cache hit
-        // skips the heavyweight getPlaylistById() call — for large M3U
-        // playlists that's a serialized payload of 90K+ channels avoided
-        // entirely on repeat dashboard mounts.
+        // channels may have been added/removed by a refresh).
         const fingerprint = this.buildM3uFavoritesFingerprint(playlistMeta);
         const cached = this.m3uFavoritesCache.get(playlistMeta._id);
         if (cached && cached.fingerprint === fingerprint) {
             return cached.items;
+        }
+
+        const fastPathItems =
+            await this.loadM3uPlaylistFavoritesFromResolvedChannels(
+                playlistMeta,
+                fingerprint
+            );
+        if (fastPathItems !== null) {
+            return fastPathItems;
         }
 
         const playlist = (await firstValueFrom(
@@ -875,8 +1207,7 @@ export class DashboardDataService {
                 const matchedFavoriteId =
                     channelIdFavoritePosition !== undefined &&
                     (channelUrlFavoritePosition === undefined ||
-                        channelIdFavoritePosition <=
-                            channelUrlFavoritePosition)
+                        channelIdFavoritePosition <= channelUrlFavoritePosition)
                         ? channelId
                         : channelUrlFavoritePosition !== undefined
                           ? channelUrl
@@ -886,20 +1217,14 @@ export class DashboardDataService {
                     return acc;
                 }
 
-                acc.push({
-                    id: matchedFavoriteId,
-                    title:
-                        channel.name?.trim() || channel.tvg?.name || channelId,
-                    type: 'live',
-                    playlist_id: playlistMeta._id,
-                    playlist_name:
-                        playlistMeta.title || playlistMeta.filename || 'M3U',
-                    added_at: fallbackTimestamp,
-                    category_id: 'live',
-                    xtream_id: matchedFavoriteId,
-                    poster_url: channel.tvg?.logo || undefined,
-                    source: 'm3u',
-                });
+                acc.push(
+                    this.createM3uFavoriteItem(
+                        playlistMeta,
+                        matchedFavoriteId,
+                        channel,
+                        fallbackTimestamp
+                    )
+                );
                 return acc;
             },
             []
@@ -910,6 +1235,79 @@ export class DashboardDataService {
             items: computedItems,
         });
         return computedItems;
+    }
+
+    private async loadM3uPlaylistFavoritesFromResolvedChannels(
+        playlistMeta: PlaylistMeta,
+        fingerprint: string
+    ): Promise<DashboardFavoriteItem[] | null> {
+        let resolvedChannels: M3uFavoriteChannel[] | null;
+        try {
+            resolvedChannels = await firstValueFrom(
+                this.playlistsService.getM3uFavoriteChannels(playlistMeta._id)
+            );
+        } catch (err) {
+            console.warn(
+                '[DashboardData] Failed to load resolved M3U favorites, falling back to full playlist payload',
+                err
+            );
+            return null;
+        }
+
+        if (resolvedChannels === null) {
+            return null;
+        }
+
+        const fallbackTimestamp =
+            this.getM3uFavoriteTimestamp(playlistMeta) ??
+            new Date(0).toISOString();
+        const items = resolvedChannels
+            .slice()
+            .map((favorite) =>
+                this.createM3uFavoriteItem(
+                    playlistMeta,
+                    favorite.favoriteId,
+                    favorite.channel,
+                    fallbackTimestamp
+                )
+            );
+
+        this.m3uFavoritesCache.set(playlistMeta._id, {
+            fingerprint,
+            items,
+        });
+        return items;
+    }
+
+    private createM3uFavoriteItem(
+        playlistMeta: PlaylistMeta,
+        favoriteId: string,
+        channel: Channel,
+        fallbackTimestamp: string
+    ): DashboardFavoriteItem {
+        const channelId = String(channel.id ?? '').trim();
+
+        return {
+            id: favoriteId,
+            title:
+                channel.name?.trim() ||
+                channel.tvg?.name?.trim() ||
+                channelId ||
+                favoriteId,
+            type: 'live',
+            playlist_id: playlistMeta._id,
+            playlist_name: playlistMeta.title || playlistMeta.filename || 'M3U',
+            added_at: fallbackTimestamp,
+            category_id: 'live',
+            xtream_id: favoriteId,
+            poster_url: channel.tvg?.logo || undefined,
+            epg_lookup_key:
+                channel.tvg?.id?.trim() ||
+                channel.tvg?.name?.trim() ||
+                channel.name?.trim() ||
+                undefined,
+            source: 'm3u',
+        };
     }
 
     private buildM3uFavoritesFingerprint(playlist: PlaylistMeta): string {

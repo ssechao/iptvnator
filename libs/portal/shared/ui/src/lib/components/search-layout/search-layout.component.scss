@@ -12,6 +12,7 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     width: 100%;
 }
 
@@ -19,7 +20,8 @@
     display: flex;
     flex-direction: column;
     flex: 1;
-    overflow-y: auto;
+    min-height: 0;
+    overflow: hidden;
     padding: 0 20px 0 20px;
 }
 
@@ -49,6 +51,18 @@
         gap: 32px;
         flex: 1;
         flex-wrap: wrap;
+
+        // Keep the back arrow and title tightly grouped, independent of the
+        // wide gap between the title group and the filters (RTL-safe)
+        .header-title-group {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .header-back {
+            flex-shrink: 0;
+        }
 
         h2 {
             margin: 0;
@@ -90,6 +104,7 @@
 
 .results-container {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
 }
 
@@ -155,17 +170,22 @@
     padding-bottom: 1rem;
 }
 
-// Global search overlay context
-:host-context(.global-search-overlay) {
-    // Prevent Electron's app-region: drag from bleeding through the dialog overlay
-    app-region: no-drag;
-
-    .search-page {
-        background: var(--background);
-        height: 100vh;
+// The header packs the title, the type filters and the scope toggle into one
+// row. On a phone that row is wider than the screen, and the scope checkbox
+// was the part pushed off the right edge, so the row becomes a column.
+@media (max-width: 640px) {
+    .header .header-top {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
     }
 
-    .header {
-        background: var(--background);
+    .header .header-left {
+        gap: 12px;
+    }
+
+    .header .header-right {
+        justify-content: flex-start;
+        flex-wrap: wrap;
     }
 }

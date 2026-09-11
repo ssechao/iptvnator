@@ -1,3 +1,4 @@
+import { ChannelScrollFocusDirective } from '../../channel-scroll-focus/channel-scroll-focus.directive';
 import { KeyValue, TitleCasePipe } from '@angular/common';
 import {
     ChangeDetectionStrategy,
@@ -19,9 +20,15 @@ import { MatIconModule } from '@angular/material/icon';
 import { MatMenuModule, MatMenuTrigger } from '@angular/material/menu';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { TranslatePipe } from '@ngx-translate/core';
+import { EpgRuntimeBridgeService } from '@iptvnator/epg/data-access';
 import { resolveChannelEpgLookupKey } from '@iptvnator/m3u-state';
-import { Channel, EpgProgram } from '@iptvnator/shared/interfaces';
-import { ChannelEpgMetadata } from '../all-channels-view/all-channels-view.component';
+import { SettingsStore } from '@iptvnator/services';
+import {
+    Channel,
+    EpgProgram,
+    epgProviderClockMs,
+} from '@iptvnator/shared/interfaces';
+import { buildChannelEpgMetadataMap } from '../epg-enrichment.util';
 import {
     PlaylistChannelSortMode,
     getPlaylistChannelSortModeLabel,
@@ -30,6 +37,7 @@ import {
     sortPlaylistChannelItems,
 } from '../channel-list-sort.util';
 import { resolveChannelLogo } from '../channel-logo-fallback.util';
+import { EpgMappingDialogComponent } from '../epg-mapping-dialog/epg-mapping-dialog.component';
 import { ChannelDetailsDialogComponent } from '../channel-details-dialog/channel-details-dialog.component';
 import { ChannelListItemComponent } from '../channel-list-item/channel-list-item.component';
 import { ResizableDirective } from '../../resizable/resizable.directive';
@@ -39,6 +47,8 @@ import {
 } from './group-management-dialog/group-management-dialog.component';
 
 const GROUP_CHANNEL_SORT_STORAGE_KEY = 'm3u-groups-channel-sort-mode';
+/** Rail width inside the fullscreen channel panel; see the `compact` input. */
+const COMPACT_GROUPS_NAV_WIDTH = 148;
 
 interface GroupView {
     readonly channels: Channel[];
@@ -59,6 +69,7 @@ interface FilteredGroupView {
     styleUrls: ['./groups-view.component.scss'],
     changeDetection: ChangeDetectionStrategy.OnPush,
     imports: [
+        ChannelScrollFocusDirective,
         ChannelListItemComponent,
         MatButtonModule,
         MatIconModule,
@@ -72,6 +83,9 @@ interface FilteredGroupView {
 })
 export class GroupsViewComponent {
     private readonly dialog = inject(MatDialog);
+    private readonly epgBridge = inject(EpgRuntimeBridgeService);
+    private readonly settingsStore = inject(SettingsStore);
+    readonly supportsEpgMapping = this.epgBridge.supportsEpgMapping;
     private readonly hostEl = inject(ElementRef<HTMLElement>);
 
     readonly contextMenuTrigger =
@@ -82,6 +96,35 @@ export class GroupsViewComponent {
     /** Grouped channels object */
     readonly groupedChannels = input.required<{ [key: string]: Channel[] }>();
     readonly searchTerm = input('');
+    /**
+     * The selected group's title / sort / collapse header over the channel
+     * pane. Off inside the fullscreen channel panel; the groups rail keeps
+     * its own header since it carries the group search.
+     */
+    readonly showHeader = input(true);
+    /**
+     * Inside the fullscreen channel panel (≤400px wide): the groups rail is
+     * pinned to {@link COMPACT_GROUPS_NAV_WIDTH} with no resize handle, and
+     * the sidebar's persisted `m3u-groups-nav-width` — up to 320px — is
+     * neither read nor written, since it would leave the channel pane a few
+     * dozen pixels wide.
+     */
+    readonly compact = input(false);
+    readonly navMinWidth = computed(() =>
+        this.compact() ? COMPACT_GROUPS_NAV_WIDTH : 164
+    );
+    readonly navMaxWidth = computed(() =>
+        this.compact() ? COMPACT_GROUPS_NAV_WIDTH : 320
+    );
+    readonly navDefaultWidth = computed(() =>
+        this.compact() ? COMPACT_GROUPS_NAV_WIDTH : 208
+    );
+    /** A key of its own, so the pinned width never overwrites the sidebar's. */
+    readonly navStorageKey = computed(() =>
+        this.compact()
+            ? 'm3u-groups-nav-width-fullscreen'
+            : 'm3u-groups-nav-width'
+    );
 
     /** EPG map for channel enrichment */
     readonly channelEpgMap = input.required<Map<string, EpgProgram | null>>();
@@ -124,6 +167,14 @@ export class GroupsViewComponent {
     /** Emits when the user clicks the inline collapse toggle in the groups header */
     readonly sidebarToggleRequested = output<void>();
 
+    /**
+     * The group currently shown in the channel pane, by title. Emitted for
+     * both manual clicks and the auto-selection below, so a host can follow
+     * what the user is looking at — the M3U player seeds the programme
+     * guide's initial scope from it.
+     */
+    readonly selectedGroupChange = output<string | null>();
+
     readonly isGroupSearchOpen = signal(false);
     readonly localGroupSearchTerm = signal('');
     readonly selectedGroupKey = signal<string | null>(null);
@@ -138,7 +189,7 @@ export class GroupsViewComponent {
             this.searchTerm().trim().length > 0 ||
             this.localGroupSearchTerm().trim().length > 0
     );
-    readonly itemSize = computed(() => (this.shouldShowEpg() ? 68 : 48));
+    readonly itemSize = computed(() => (this.shouldShowEpg() ? 68 : 52));
     readonly contextMenuChannel = signal<Channel | null>(null);
     readonly contextMenuPosition = signal({
         x: '0px',
@@ -184,6 +235,13 @@ export class GroupsViewComponent {
             if (nextSelection !== currentSelection) {
                 this.selectedGroupKey.set(nextSelection);
             }
+        });
+
+        // A signal effect only re-runs when the value actually changes, so
+        // this emits once per selection — `selectGroup()` included, since it
+        // writes the same signal.
+        effect(() => {
+            this.selectedGroupChange.emit(this.selectedGroupKey());
         });
 
         effect(() => {
@@ -345,17 +403,17 @@ export class GroupsViewComponent {
      * spread-clone-every-channel pattern.
      */
     readonly epgMetadataMap = computed(() => {
-        const epgMap = this.channelEpgMap();
+        // Read progressTick to create a dependency for the ~30s progress refresh.
         this.progressTick();
-
-        const result = new Map<string, ChannelEpgMetadata>();
-        epgMap.forEach((program, channelId) => {
-            result.set(channelId, {
-                epgProgram: program,
-                progressPercentage: this.calculateProgress(program),
-            });
-        });
-        return result;
+        // Progress is measured in the provider's EPG clock: the map keeps the
+        // raw programme rows and the item shifts their times for display.
+        return buildChannelEpgMetadataMap(
+            this.channelEpgMap(),
+            epgProviderClockMs(
+                Date.now(),
+                this.settingsStore.resolvedEpgOffsetMinutes()
+            )
+        );
     });
 
     /** Resolves the EPG lookup key the side-car map is keyed by. */
@@ -447,14 +505,18 @@ export class GroupsViewComponent {
     }
 
     onGroupsNavResizeStart(): void {
+        if (this.compact()) return;
         this.preservedContentWidth = this.measureContentPanelWidth();
     }
 
     onGroupsNavWidthChange(width: number): void {
+        // The pinned panel rail must never ask the page's sidebar to resize.
+        if (this.compact()) return;
         this.emitSidebarWidthRequest(width, this.sidebarWidthRequested);
     }
 
     onGroupsNavResizeEnd(width: number): void {
+        if (this.compact()) return;
         this.emitSidebarWidthRequest(width, this.sidebarWidthRequestEnded);
         this.preservedContentWidth = 0;
     }
@@ -498,6 +560,24 @@ export class GroupsViewComponent {
         });
     }
 
+    openEpgMapping(): void {
+        const channel = this.contextMenuChannel();
+        if (!channel) {
+            return;
+        }
+
+        this.contextMenuTrigger().closeMenu();
+        const channelKey = resolveChannelEpgLookupKey(channel);
+        if (!channelKey) {
+            return;
+        }
+
+        EpgMappingDialogComponent.open(this.dialog, {
+            channelKey,
+            channelName: channel.name ?? channelKey,
+        });
+    }
+
     openChannelDetails(): void {
         const channel = this.contextMenuChannel();
         if (!channel) {
@@ -536,30 +616,6 @@ export class GroupsViewComponent {
 
         return a.key.localeCompare(b.key);
     };
-
-    private calculateProgress(
-        epgProgram: EpgProgram | null | undefined
-    ): number {
-        if (!epgProgram) {
-            return 0;
-        }
-
-        const now = Date.now();
-        const start = new Date(epgProgram.start).getTime();
-        const stop = new Date(epgProgram.stop).getTime();
-
-        if (!Number.isFinite(start) || !Number.isFinite(stop)) {
-            return 0;
-        }
-
-        const total = stop - start;
-        if (total <= 0) {
-            return 0;
-        }
-
-        const elapsed = Math.min(total, Math.max(0, now - start));
-        return Math.round((elapsed / total) * 100);
-    }
 
     private emitSidebarWidthRequest(
         navWidth: number,

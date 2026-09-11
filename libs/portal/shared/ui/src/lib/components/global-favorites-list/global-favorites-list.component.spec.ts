@@ -33,6 +33,7 @@ describe('GlobalFavoritesListComponent', () => {
                     provide: SettingsStore,
                     useValue: {
                         openStreamOnDoubleClick: signal(false),
+                        resolvedEpgOffsetMinutes: signal(0),
                     },
                 },
             ],
@@ -73,6 +74,60 @@ describe('GlobalFavoritesListComponent', () => {
         );
 
         expect(icons).toEqual(['star_outline', 'star']);
+    });
+
+    it('shows the catch-up badge on Xtream rows with a playable archive', () => {
+        fixture.componentRef.setInput('channels', [
+            buildChannel('x1', 'Archive Channel', {
+                sourceType: 'xtream',
+                xtreamId: 42,
+                tvArchive: 1,
+                tvArchiveDuration: 7,
+            }),
+            buildChannel('x2', 'Plain Channel', {
+                sourceType: 'xtream',
+                xtreamId: 43,
+                tvArchive: 0,
+                tvArchiveDuration: 0,
+            }),
+            buildChannel('m1', 'M3U Channel'),
+        ]);
+        fixture.detectChanges();
+
+        const badges = fixture.nativeElement.querySelectorAll(
+            '[data-test-id="catchup-badge"]'
+        );
+        expect(badges).toHaveLength(1);
+
+        const badgeRow = badges[0].closest('[data-test-id="channel-item"]');
+        expect(badgeRow?.textContent).toContain('Archive Channel');
+    });
+
+    it('renders radio rows as compact without a false EPG placeholder', () => {
+        fixture.componentRef.setInput('channels', [
+            buildChannel('radio', 'Radio One', { radio: 'true' }),
+        ]);
+        fixture.detectChanges();
+
+        const row = fixture.nativeElement.querySelector('.channel-list-item');
+        expect(row.classList.contains('compact')).toBe(true);
+        expect(
+            fixture.nativeElement.querySelector('.epg-placeholder')
+        ).toBeNull();
+    });
+
+    it('renders non-radio rows as compact when the host disables EPG', () => {
+        fixture.componentRef.setInput('showEpg', false);
+        fixture.componentRef.setInput('channels', [
+            buildChannel('pwa', 'PWA Channel'),
+        ]);
+        fixture.detectChanges();
+
+        const row = fixture.nativeElement.querySelector('.channel-list-item');
+        expect(row.classList.contains('compact')).toBe(true);
+        expect(
+            fixture.nativeElement.querySelector('.epg-placeholder')
+        ).toBeNull();
     });
 
     it('preserves incoming recent order when a favorites sort mode is set', () => {

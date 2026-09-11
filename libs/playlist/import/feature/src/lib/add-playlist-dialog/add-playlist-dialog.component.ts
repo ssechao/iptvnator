@@ -1,6 +1,7 @@
 import {
     Component,
     computed,
+    effect,
     inject,
     signal,
     ViewEncapsulation,
@@ -12,37 +13,54 @@ import {
     MatDialogModule,
     MatDialogRef,
 } from '@angular/material/dialog';
+import { MatIcon } from '@angular/material/icon';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { Store } from '@ngrx/store';
 import { TranslateModule, TranslateService } from '@ngx-translate/core';
 import { PlaylistType } from '@iptvnator/playlist/shared/ui';
 import { PlaylistActions } from '@iptvnator/m3u-state';
 import { DataService } from '@iptvnator/services';
-import { PLAYLIST_PARSE_BY_URL } from '@iptvnator/shared/interfaces';
+import {
+    PLAYLIST_PARSE_BY_URL,
+    ProviderImportCandidate,
+} from '@iptvnator/shared/interfaces';
+import { AutoImportComponent } from '../auto-import/auto-import.component';
 import { FileUploadComponent } from '../file-upload/file-upload.component';
 import { StalkerPortalImportComponent } from '../stalker-portal-import/stalker-portal-import.component';
 import { TextImportComponent } from '../text-import/text-import.component';
 import { UrlUploadComponent } from '../url-upload/url-upload.component';
 import { XtreamCodeImportComponent } from '../xtream-code-import/xtream-code-import.component';
 
-type PlaylistCategory = 'm3u' | Extract<PlaylistType, 'xtream' | 'stalker'>;
-type M3uSubType = Extract<PlaylistType, 'url' | 'file' | 'text'>;
-
-interface CategoryOption {
-    value: PlaylistCategory;
-    label: string;
-}
-
-interface SubtypeOption {
-    value: M3uSubType;
+/**
+ * Flat 5-method option model — replaces the prior category × subtype matrix
+ * (M3U/Xtream/Stalker × URL/File/Text) which created 9 combinations of which
+ * only 5 were real. Now each entry IS a method, no nesting.
+ */
+export interface PlaylistMethodOption {
+    value: PlaylistType;
+    icon: string;
     labelKey: string;
+    subKey: string;
 }
+
+/** The import form a picked auto-detect candidate prefills. */
+const METHOD_BY_CANDIDATE_KIND: Record<
+    ProviderImportCandidate['kind'],
+    PlaylistType
+> = {
+    xtream: 'xtream',
+    stalker: 'stalker',
+    'm3u-url': 'url',
+    'm3u-text': 'text',
+};
 
 @Component({
     imports: [
+        AutoImportComponent,
         FileUploadComponent,
         MatButtonModule,
         MatDialogModule,
+        MatIcon,
         StalkerPortalImportComponent,
         TextImportComponent,
         TranslateModule,
@@ -69,44 +87,162 @@ export class AddPlaylistDialogComponent {
     readonly textImport = viewChild(TextImportComponent);
     readonly xtreamImport = viewChild(XtreamCodeImportComponent);
     readonly stalkerImport = viewChild(StalkerPortalImportComponent);
+    readonly autoImport = viewChild(AutoImportComponent);
 
-    readonly category = signal<PlaylistCategory>('m3u');
-    readonly m3uSubType = signal<M3uSubType>('url');
+    readonly method = signal<PlaylistType>('url');
 
-    readonly categoryOptions: CategoryOption[] = [
-        { value: 'm3u', label: 'M3U' },
-        { value: 'xtream', label: 'Xtream' },
-        { value: 'stalker', label: 'Stalker' },
+    /**
+     * Candidate picked in the auto-detect surface, waiting for its target
+     * form to exist. Selecting a candidate switches `method`, which only
+     * instantiates the target child on the NEXT change-detection pass — so
+     * the prefill is applied by an effect that re-runs once the child's
+     * viewChild signal resolves, then clears this.
+     */
+    private readonly pendingPrefill =
+        signal<ProviderImportCandidate | null>(null);
+
+    /**
+     * Survives the auto-detect surface being destroyed by a method switch, so
+     * returning to it after inspecting a prefilled form keeps the paste.
+     */
+    readonly autoDetectText = signal('');
+
+    // Order matches the v0.22 mockup left-to-right: URL first (Most common),
+    // then File, Xtream credentials, Stalker portal, raw text paste. Each
+    // entry stands on its own — no nested subtypes. Labels are short and
+    // sentence-cased; the "Add via …" / "Add Xtreme Code" wording from the
+    // old tab labels is redundant inside a dialog already titled "Add
+    // playlist".
+    readonly methodOptions: PlaylistMethodOption[] = [
+        {
+            value: 'url',
+            icon: 'public',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_URL_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_URL_SUB',
+        },
+        {
+            value: 'file',
+            icon: 'folder_open',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_FILE_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_FILE_SUB',
+        },
+        {
+            value: 'xtream',
+            icon: 'vpn_key',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_XTREAM_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_XTREAM_SUB',
+        },
+        {
+            value: 'stalker',
+            icon: 'cast',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_STALKER_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_STALKER_SUB',
+        },
+        {
+            value: 'text',
+            icon: 'subject',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_TEXT_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_TEXT_SUB',
+        },
+        {
+            value: 'auto',
+            icon: 'auto_awesome',
+            labelKey: 'HOME.ADD_PLAYLIST.METHOD_AUTO_LABEL',
+            subKey: 'HOME.ADD_PLAYLIST.METHOD_AUTO_SUB',
+        },
     ];
 
-    readonly subtypeOptions: SubtypeOption[] = [
-        { value: 'url', labelKey: 'HOME.TABS.URL_UPLOAD' },
-        { value: 'file', labelKey: 'HOME.TABS.FILE_UPLOAD' },
-        { value: 'text', labelKey: 'HOME.TABS.TEXT_IMPORT' },
-    ];
-
-    readonly playlistType = computed<PlaylistType>(() => {
-        const cat = this.category();
-        if (cat === 'xtream') return 'xtream';
-        if (cat === 'stalker') return 'stalker';
-        return this.m3uSubType();
-    });
+    /**
+     * Backwards-compatible alias. The template's @switch and the action
+     * buttons key off this; keeping the name avoids churn in 5 case branches.
+     */
+    readonly playlistType = computed<PlaylistType>(() => this.method());
 
     constructor() {
         if (this.data?.type) {
-            this.initFromType(this.data.type);
+            this.method.set(this.data.type);
         }
+        effect(() => this.applyPendingPrefill());
     }
 
-    private initFromType(type: PlaylistType): void {
-        if (type === 'xtream') {
-            this.category.set('xtream');
-        } else if (type === 'stalker') {
-            this.category.set('stalker');
-        } else {
-            this.category.set('m3u');
-            this.m3uSubType.set(type as M3uSubType);
+    /**
+     * Hands a detected source to the matching import form. Only prefills —
+     * the user reviews and submits through the regular form, so validation
+     * and the behavioral probes (portal discovery, connection test) stay in
+     * charge of what actually gets persisted.
+     */
+    onCandidateSelected(candidate: ProviderImportCandidate): void {
+        this.pendingPrefill.set(candidate);
+        this.method.set(METHOD_BY_CANDIDATE_KIND[candidate.kind]);
+    }
+
+    private applyPendingPrefill(): void {
+        const candidate = this.pendingPrefill();
+        if (!candidate) {
+            return;
         }
+        // The user can click another method tile before the target form
+        // mounts; a candidate must not lie in wait and prefill a later visit
+        // to its form. Only the method the selection itself switched to may
+        // consume it.
+        if (this.method() !== METHOD_BY_CANDIDATE_KIND[candidate.kind]) {
+            this.pendingPrefill.set(null);
+            return;
+        }
+        switch (candidate.kind) {
+            case 'm3u-url': {
+                const child = this.urlUpload();
+                if (!child) {
+                    return;
+                }
+                child.form.patchValue({
+                    playlistUrl: candidate.url ?? '',
+                    playlistName: candidate.suggestedTitle ?? '',
+                });
+                break;
+            }
+            case 'm3u-text': {
+                const child = this.textImport();
+                if (!child) {
+                    return;
+                }
+                child.textForm.patchValue({ text: candidate.text ?? '' });
+                break;
+            }
+            case 'xtream': {
+                const child = this.xtreamImport();
+                if (!child) {
+                    return;
+                }
+                child.form.patchValue({
+                    title: candidate.suggestedTitle ?? '',
+                    serverUrl: candidate.serverUrl ?? '',
+                    username: candidate.username ?? '',
+                    password: candidate.password ?? '',
+                });
+                break;
+            }
+            case 'stalker': {
+                const child = this.stalkerImport();
+                if (!child) {
+                    return;
+                }
+                child.form.patchValue({
+                    title: candidate.suggestedTitle ?? '',
+                    portalUrl: candidate.portalUrl ?? '',
+                    macAddress: candidate.macAddress ?? '',
+                    serialNumber: candidate.serialNumber ?? '',
+                    deviceId1: candidate.deviceId1 ?? '',
+                    deviceId2: candidate.deviceId2 ?? '',
+                    signature1: candidate.signature1 ?? '',
+                    signature2: candidate.signature2 ?? '',
+                    username: candidate.username ?? '',
+                    password: candidate.password ?? '',
+                });
+                break;
+            }
+        }
+        this.pendingPrefill.set(null);
     }
 
     /**
@@ -142,9 +278,12 @@ export class AddPlaylistDialogComponent {
             formValue?.playlistName
         );
 
+        const userAgent = this.normalizeOptionalValue(formValue?.userAgent);
+
         this.dataService.sendIpcEvent(PLAYLIST_PARSE_BY_URL, {
             url: playlistUrl,
             ...(playlistName ? { title: playlistName } : {}),
+            ...(userAgent ? { userAgent } : {}),
         });
         this.closeDialog();
     }
@@ -180,6 +319,9 @@ export class AddPlaylistDialogComponent {
                 break;
             case 'stalker':
                 this.stalkerImport()?.clearForm();
+                break;
+            case 'auto':
+                this.autoImport()?.clearForm();
                 break;
         }
     }

@@ -5,10 +5,19 @@ import { SwUpdate } from '@angular/service-worker';
 import { Store } from '@ngrx/store';
 import { TranslateService } from '@ngx-translate/core';
 import { PlaylistActions } from '@iptvnator/m3u-state';
-import { catchError, firstValueFrom, from, switchMap, throwError } from 'rxjs';
+import {
+    catchError,
+    firstValueFrom,
+    from,
+    Observable,
+    switchMap,
+    throwError,
+} from 'rxjs';
 import { DataService } from '@iptvnator/services';
 import {
+    CONNECTIVITY_GUARD_RESET,
     ERROR,
+    isHostConnectivityFastFailMessage,
     Playlist,
     PLAYLIST_PARSE_BY_URL,
     PLAYLIST_UPDATE,
@@ -24,8 +33,19 @@ import {
     createPortalDebugSuccessEvent,
     logPortalDebugEvent,
     logPortalDebugRequest,
+    createLogger,
 } from '@iptvnator/portal/shared/util';
 import { getRuntimeBackendUrl } from './runtime-config';
+
+/**
+ * How long to wait for the backend to forget a host before giving up.
+ *
+ * This talks to the user's own backend, not a provider, so it should answer
+ * immediately; the bound exists so a stuck one cannot hold up the retry that
+ * asked for the reset. Short on purpose — the reset is best effort, and the
+ * caller's own request reports the real state either way.
+ */
+const CONNECTIVITY_GUARD_RESET_TIMEOUT_MS = 5_000;
 
 interface PwaXtreamResponse {
     readonly payload?: unknown;
@@ -63,6 +83,7 @@ export class PwaService extends DataService {
     private readonly store = inject(Store);
     private readonly swUpdate = inject(SwUpdate);
     private readonly translateService = inject(TranslateService);
+    private readonly logger = createLogger('PwaService');
     private readonly providerTargetIds = new Map<string, Promise<string>>();
     private readonly silentXtreamActions = new Set<string>([
         XtreamCodeActions.GetAccountInfo,
@@ -79,7 +100,6 @@ export class PwaService extends DataService {
 
     constructor() {
         super();
-        console.log('PWA service initialized...');
     }
 
     /** Uses service worker mechanism to check for available application updates */
@@ -108,12 +128,12 @@ export class PwaService extends DataService {
      */
     sendIpcEvent<T = unknown>(type: string, payload?: unknown): T {
         if (type === PLAYLIST_PARSE_BY_URL) {
-            this.fetchFromUrl(payload);
+            this.fetchFromUrl(payload as Partial<Playlist>);
             return undefined as T;
         }
 
         if (type === PLAYLIST_UPDATE) {
-            this.refreshPlaylist(payload);
+            this.refreshPlaylist(payload as Partial<Playlist & { id: string }>);
             return undefined as T;
         }
 
@@ -130,19 +150,86 @@ export class PwaService extends DataService {
                     macAddress: string;
                     params: Record<string, string>;
                     token?: string;
+                    serialNumber?: string;
+                    silent?: boolean;
+                    skipConnectionGuard?: boolean;
                 }
+            ) as T;
+        }
+
+        if (type === CONNECTIVITY_GUARD_RESET) {
+            return this.resetConnectivityGuard(
+                payload as { url?: string }
             ) as T;
         }
 
         return undefined as T;
     }
 
-    refreshPlaylist(payload: Partial<Playlist & { id: string }>) {
-        this.getPlaylistFromUrl(payload.url)
+    /**
+     * Clears the web backend's per-host failure record, so the next request
+     * contacts the host for real instead of being fast-failed.
+     *
+     * The breaker lives in the backend process, not the browser, so this is an
+     * HTTP call rather than a local reset. Best effort by design — the caller's
+     * own request reports the real state, and `resetHostConnectivityGuard`
+     * swallows whatever this rejects with.
+     */
+    private async resetConnectivityGuard(payload: {
+        url?: string;
+    }): Promise<{ reset: boolean }> {
+        if (!payload?.url) {
+            return { reset: false };
+        }
+
+        // Bounded, because every caller awaits this BEFORE issuing the request
+        // it is clearing the way for. `fetch` has no timeout of its own, so a
+        // backend or reverse proxy that accepts the POST and then goes quiet
+        // would leave Retry doing nothing at all — the failure this whole
+        // change exists to stop, reintroduced one layer up. The abort rejects,
+        // `resetHostConnectivityGuard` swallows it, and the caller proceeds.
+        const controller = new AbortController();
+        const abortTimer = setTimeout(
+            () => controller.abort(),
+            CONNECTIVITY_GUARD_RESET_TIMEOUT_MS
+        );
+
+        try {
+            const response = await fetch(
+                `${this.corsProxyUrl}/connectivity-guard/reset`,
+                {
+                    body: JSON.stringify({ url: payload.url }),
+                    headers: { 'content-type': 'application/json' },
+                    method: 'POST',
+                    signal: controller.signal,
+                }
+            );
+
+            if (!response.ok) {
+                return { reset: false };
+            }
+
+            return (await response.json()) as { reset: boolean };
+        } finally {
+            clearTimeout(abortTimer);
+        }
+    }
+
+    refreshPlaylist(payload?: Partial<Playlist & { id: string }>) {
+        if (!payload?.url || !payload?.id) {
+            return;
+        }
+
+        const playlistId = payload.id;
+
+        this.getPlaylistFromUrl(payload.url, payload.userAgent)
             .pipe(
                 catchError((error) => {
                     this.snackBar.open(
-                        this.getPlaylistRefreshErrorMessage(error),
+                        this.appendProviderErrorCode(
+                            this.getPlaylistRefreshErrorMessage(error),
+                            error
+                        ),
                         this.translateService.instant('CLOSE'),
                         {
                             duration: 5000,
@@ -155,7 +242,8 @@ export class PwaService extends DataService {
                 this.store.dispatch(
                     PlaylistActions.updatePlaylist({
                         playlist,
-                        playlistId: payload.id,
+                        playlistId,
+                        refreshEpg: true,
                     })
                 );
 
@@ -163,7 +251,7 @@ export class PwaService extends DataService {
                     this.translateService.instant(
                         'HOME.PLAYLISTS.PLAYLIST_UPDATE_SUCCESS'
                     ),
-                    null,
+                    undefined,
                     { duration: 2000 }
                 );
             });
@@ -192,14 +280,23 @@ export class PwaService extends DataService {
      * Fetches playlist from the specified url
      * @param payload playlist payload
      */
-    fetchFromUrl(payload: Partial<Playlist>): void {
+    fetchFromUrl(payload?: Partial<Playlist>): void {
+        if (!payload?.url) {
+            return;
+        }
+
         const title = payload.title?.trim() || undefined;
 
-        this.getPlaylistFromUrl(payload.url)
+        this.getPlaylistFromUrl(payload.url, payload.userAgent)
             .pipe(
                 catchError((error) => {
                     this.snackBar.open(
-                        this.getErrorMessageByStatusCode(error.status),
+                        this.appendProviderErrorCode(
+                            this.getErrorMessageByStatusCode(
+                                this.extractHttpStatusCode(error)
+                            ),
+                            error
+                        ),
                         'Close',
                         {
                             duration: 5000,
@@ -226,7 +323,7 @@ export class PwaService extends DataService {
             });
     }
 
-    getErrorMessageByStatusCode(status: number) {
+    getErrorMessageByStatusCode(status: number | null | undefined) {
         let messageKey = 'HOME.URL_UPLOAD.ERROR_FETCH_FAILED';
         switch (status) {
             case 413:
@@ -244,6 +341,19 @@ export class PwaService extends DataService {
                 break;
         }
         return this.translateService.instant(messageKey);
+    }
+
+    /**
+     * The web backend attaches the underlying Node network code (ETIMEDOUT,
+     * ENETUNREACH, ...) to proxy error bodies; without it the toast collapses
+     * every connection failure into the same generic fetch error (#1400).
+     */
+    private appendProviderErrorCode(message: string, error: unknown): string {
+        const body = (error as { error?: { code?: unknown } } | null)?.error;
+        const code = typeof body?.code === 'string' ? body.code : '';
+        return code && !message.includes(`(${code})`)
+            ? `${message} (${code})`
+            : message;
     }
 
     private extractHttpStatusCode(error: unknown): number | null {
@@ -336,7 +446,7 @@ export class PwaService extends DataService {
                 );
 
                 if (isSilentAction) {
-                    console.log(
+                    this.logger.debug(
                         `Background Xtream action failed (${action ?? 'unknown'}):`,
                         normalizedMessage
                     );
@@ -376,7 +486,7 @@ export class PwaService extends DataService {
 
             // Log error to console
             if (isSilentAction) {
-                console.log(
+                this.logger.debug(
                     `Background Xtream action failed (${action ?? 'unknown'}):`,
                     normalizedMessage
                 );
@@ -387,7 +497,7 @@ export class PwaService extends DataService {
                 };
             }
 
-            console.error('Xtream request error:', normalizedMessage);
+            this.logger.error('Xtream request error:', normalizedMessage);
             this.snackBar.open(
                 `Xtream request failed: ${normalizedMessage}`,
                 'Close',
@@ -458,6 +568,16 @@ export class PwaService extends DataService {
         params: Record<string, string>;
         macAddress: string;
         token?: string;
+        serialNumber?: string;
+        /** Endpoint-discovery probes expect failures; no error snackbar. */
+        silent?: boolean;
+        /**
+         * Endpoint-discovery probes are exempt from the backend's per-host
+         * connectivity guard: they walk several candidates on one host and
+         * expect most to fail, so counting them would declare a working portal
+         * unreachable. Mirrors the Electron `STALKER_REQUEST` payload flag.
+         */
+        skipConnectionGuard?: boolean;
     }) {
         let context = createPortalDebugRequestContext({
             provider: 'stalker',
@@ -473,11 +593,25 @@ export class PwaService extends DataService {
         try {
             const targetId = await this.getProviderTargetId(payload.url);
             const token = payload.token ?? payload.params.token;
+            // `macAddress`, `token` and `serialNumber` are control params for
+            // the /stalker proxy: it turns them into the portal-facing
+            // Cookie / Authorization / SN headers and strips them from the
+            // query it forwards to the portal.
             const requestParams = {
                 targetId,
                 ...payload.params,
                 macAddress: payload.macAddress,
                 ...(token ? { token } : {}),
+                ...(payload.serialNumber
+                    ? { serialNumber: payload.serialNumber }
+                    : {}),
+                // Endpoint-discovery probes are exempt from the backend's
+                // connectivity guard. Dropping this here would let two probes
+                // that time out open the breaker and fast-fail the healthy
+                // candidate discovery is looking for.
+                ...(payload.skipConnectionGuard
+                    ? { skipConnectionGuard: 'true' }
+                    : {}),
             };
             const params = new URLSearchParams(requestParams);
             const requestUrl = `${this.corsProxyUrl}/stalker?${params.toString()}`;
@@ -504,6 +638,46 @@ export class PwaService extends DataService {
 
             // Parse and return the JSON response
             const responseBody = await response.json();
+
+            // The proxy converts upstream provider failures (404 on an
+            // absent endpoint, 5xx) into an HTTP 200 `{ message, status }`
+            // body WITHOUT a `payload` key. Surface those as errors carrying
+            // the status so endpoint discovery and the lazy portal repair
+            // can classify them — unwrapping `payload` here silently
+            // returned `undefined`, making a dead endpoint look like an
+            // empty answer and unreachable to the repair.
+            // The connectivity guard refused to contact the host. This one must
+            // NOT go through the branch below: an `HTTP Error <code>` prefix
+            // and a numeric `status` both read as "the endpoint answered", so
+            // endpoint discovery would keep walking candidates instead of
+            // aborting, and a 4xx reading would additionally fire lazy portal
+            // repair against a host just declared unreachable. Thrown bare, the
+            // message lands in the connection-level-failure slot — which is
+            // exactly what a tripped breaker means.
+            if (
+                responseBody &&
+                typeof responseBody === 'object' &&
+                !('payload' in responseBody) &&
+                isHostConnectivityFastFailMessage(responseBody.message)
+            ) {
+                throw new Error(String(responseBody.message));
+            }
+
+            if (
+                responseBody &&
+                typeof responseBody === 'object' &&
+                !('payload' in responseBody) &&
+                typeof responseBody.status === 'number'
+            ) {
+                const proxyError = new Error(
+                    `HTTP Error ${responseBody.status}: ${
+                        responseBody.message ?? ''
+                    }`
+                ) as Error & { status: number };
+                proxyError.status = responseBody.status;
+                throw proxyError;
+            }
+
             logPortalDebugEvent(
                 createPortalDebugSuccessEvent(context, responseBody)
             );
@@ -511,24 +685,32 @@ export class PwaService extends DataService {
         } catch (err: unknown) {
             const errorInfo = this.getErrorDetails(err);
             logPortalDebugEvent(createPortalDebugErrorEvent(context, err));
-            console.error('Stalker request error:', err);
+            this.logger.error('Stalker request error:', err);
 
-            this.snackBar.open(
-                `Error: ${errorInfo?.message ?? ' Not found'}, status: ${errorInfo?.status ?? 404}`,
-                'Close',
-                {
-                    duration: 5000,
-                }
-            );
+            if (!payload.silent) {
+                this.snackBar.open(
+                    `Error: ${errorInfo?.message ?? ' Not found'}, status: ${errorInfo?.status ?? 404}`,
+                    'Close',
+                    {
+                        duration: 5000,
+                    }
+                );
+            }
             throw err;
         }
     }
 
-    getPlaylistFromUrl(url: string) {
+    getPlaylistFromUrl(url: string, userAgent?: string): Observable<Playlist> {
+        const normalizedUserAgent = userAgent?.trim();
         return from(this.getProviderTargetId(url)).pipe(
             switchMap((targetId) =>
-                this.http.get(`${this.corsProxyUrl}/parse`, {
-                    params: { targetId },
+                this.http.get<Playlist>(`${this.corsProxyUrl}/parse`, {
+                    params: {
+                        targetId,
+                        ...(normalizedUserAgent
+                            ? { userAgent: normalizedUserAgent }
+                            : {}),
+                    },
                 })
             )
         );

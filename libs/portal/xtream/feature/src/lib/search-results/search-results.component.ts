@@ -1,4 +1,3 @@
-import { KeyValuePipe } from '@angular/common';
 import {
     AfterViewInit,
     ChangeDetectionStrategy,
@@ -7,10 +6,12 @@ import {
     effect,
     inject,
     Inject,
+    linkedSignal,
     Optional,
     signal,
     viewChild,
 } from '@angular/core';
+import { Location } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { MatIconButton } from '@angular/material/button';
 import { MatCheckboxModule } from '@angular/material/checkbox';
@@ -20,6 +21,7 @@ import {
     MatDialogRef,
 } from '@angular/material/dialog';
 import { MatIcon } from '@angular/material/icon';
+import { MatProgressSpinner } from '@angular/material/progress-spinner';
 import { ActivatedRoute, Router } from '@angular/router';
 import { TranslatePipe } from '@ngx-translate/core';
 import { DatabaseService } from '@iptvnator/services';
@@ -31,30 +33,55 @@ import {
     queryParamSignal,
 } from '@iptvnator/portal/shared/util';
 import { createLogger } from '@iptvnator/portal/shared/util';
-import { XtreamContentItem } from '@iptvnator/portal/xtream/data-access';
 import { SearchFilters } from '@iptvnator/portal/xtream/data-access';
 import { XtreamStore } from '@iptvnator/portal/xtream/data-access';
-import { ContentType } from '@iptvnator/portal/xtream/data-access';
+import {
+    ContentType,
+    XtreamSearchResultItem,
+} from '@iptvnator/portal/xtream/data-access';
+import {
+    GlobalSearchResult,
+    isM3uGlobalSearchResult,
+} from '@iptvnator/shared/interfaces';
 
 interface SearchResultsData {
     isGlobalSearch: boolean;
     initialQuery?: string;
 }
 
-function groupResultsByPlaylistName(
-    items: XtreamContentItem[]
-): Record<string, XtreamContentItem[]> {
-    return items.reduce<Record<string, XtreamContentItem[]>>(
-        (groups, item) => {
-            const key = String(item.playlist_name);
-            if (!groups[key]) {
-                groups[key] = [];
-            }
-            groups[key].push(item);
-            return groups;
-        },
-        {}
-    );
+interface GlobalSearchResultGroup {
+    playlistId: string;
+    playlistName: string;
+    items: XtreamSearchResultItem[];
+}
+
+const GLOBAL_SEARCH_PAGE_SIZE = 100;
+
+/**
+ * Render window for the in-portal (single playlist) search, which receives its
+ * complete result set in one response. The window grows via the layout's
+ * `nearEnd` scroll hook, mirroring the global search's paged appends.
+ */
+const IN_PORTAL_RESULTS_CHUNK = 60;
+
+function groupResultsByPlaylistId(
+    items: XtreamSearchResultItem[]
+): GlobalSearchResultGroup[] {
+    const groups = new Map<string, GlobalSearchResultGroup>();
+
+    for (const item of items) {
+        const playlistId = String(item.playlist_id ?? 'unknown');
+        const playlistName = String(item.playlist_name ?? playlistId);
+        const group = groups.get(playlistId) ?? {
+            playlistId,
+            playlistName,
+            items: [],
+        };
+        group.items.push(item);
+        groups.set(playlistId, group);
+    }
+
+    return [...groups.values()];
 }
 
 @Component({
@@ -63,11 +90,11 @@ function groupResultsByPlaylistName(
     imports: [
         ContentCardComponent,
         FormsModule,
-        KeyValuePipe,
         MatCheckboxModule,
         MatDialogModule,
         MatIcon,
         MatIconButton,
+        MatProgressSpinner,
         SearchLayoutComponent,
         TranslatePipe,
     ],
@@ -81,6 +108,7 @@ export class SearchResultsComponent implements AfterViewInit {
     readonly router = inject(Router);
     readonly activatedRoute = inject(ActivatedRoute);
     readonly databaseService = inject(DatabaseService);
+    private readonly location = inject(Location);
     private readonly logger = createLogger('XtreamSearchResults');
     readonly isWorkspaceLayout = isWorkspaceLayoutRoute(this.activatedRoute);
     readonly routeSearchTerm = queryParamSignal(
@@ -95,6 +123,11 @@ export class SearchResultsComponent implements AfterViewInit {
     /** Search filters from store */
     readonly filters = this.xtreamStore.searchFilters;
     private globalSearchRequestVersion = 0;
+    private lastGlobalSearchTerm = '';
+    private lastGlobalSearchTypes: string[] = [];
+    private lastGlobalSearchExcludeHidden?: boolean;
+    readonly hasMoreGlobalResults = signal(false);
+    readonly isLoadingMoreGlobalResults = signal(false);
 
     private static readonly GROUP_BY_STORAGE_KEY =
         'global-search-group-by-playlist';
@@ -139,15 +172,86 @@ export class SearchResultsComponent implements AfterViewInit {
     /** Grouped results computed once per result change (avoids recalculating on every CD cycle) */
     readonly groupedResults = computed(() => {
         const results = this.xtreamStore.searchResults();
-        if (!this.isGlobalSearch) return { default: results };
-        return groupResultsByPlaylistName(results);
+        if (!this.isGlobalSearch) {
+            return [];
+        }
+        return groupResultsByPlaylistId(results);
     });
 
+    /** Resets to the first chunk whenever a new result set replaces the old. */
+    private readonly inPortalVisibleCount = linkedSignal({
+        source: () => this.xtreamStore.searchResults(),
+        computation: () => IN_PORTAL_RESULTS_CHUNK,
+    });
+
+    /** Windowed slice of the in-portal search results. */
+    readonly visibleInPortalResults = computed(() =>
+        this.xtreamStore.searchResults().slice(0, this.inPortalVisibleCount())
+    );
+
+    /**
+     * Feeds the search layout's infinite scroll so its auto-fill can reveal
+     * further chunks even when the rendered ones do not overflow the viewport.
+     */
+    readonly hasMoreSearchResults = computed(() =>
+        this.isGlobalSearch
+            ? this.hasMoreGlobalResults()
+            : this.xtreamStore.searchResults().length >
+              this.inPortalVisibleCount()
+    );
+
+    readonly isAppendingSearchResults = computed(
+        () => this.isGlobalSearch && this.isLoadingMoreGlobalResults()
+    );
+
+    /**
+     * RENDERED result count for the layout's overflow re-measure: the
+     * windowed slice for in-portal mode (grows chunk by chunk), the full
+     * loaded set for global mode (server pages append into it).
+     */
+    readonly renderedSearchResultsCount = computed(() =>
+        this.isGlobalSearch
+            ? this.xtreamStore.searchResults().length
+            : this.visibleInPortalResults().length
+    );
+
+    /**
+     * Result-set identity for the layout's near-end latch and auto-fill
+     * budget. Type filters and the hidden-categories toggle replace the
+     * result set without changing the term, so they are part of the identity.
+     */
+    readonly searchResetIdentity = computed(() => {
+        const filters = this.filters();
+        return [
+            this.searchTerm(),
+            String(filters.live),
+            String(filters.movie),
+            String(filters.series),
+            String(this.excludeHidden()),
+        ].join('|');
+    });
+
+    onResultsNearEnd(): void {
+        if (this.isGlobalSearch) {
+            void this.loadMoreGlobalResults();
+            return;
+        }
+
+        const total = this.xtreamStore.searchResults().length;
+        if (this.inPortalVisibleCount() < total) {
+            this.inPortalVisibleCount.update(
+                (count) => count + IN_PORTAL_RESULTS_CHUNK
+            );
+        }
+    }
+
     constructor(
-        @Optional() @Inject(MAT_DIALOG_DATA) data: SearchResultsData,
+        @Optional() @Inject(MAT_DIALOG_DATA) data: SearchResultsData | null,
         @Optional() public dialogRef: MatDialogRef<SearchResultsComponent>
     ) {
-        this.isGlobalSearch = data?.isGlobalSearch || false;
+        this.isGlobalSearch =
+            data?.isGlobalSearch ||
+            this.activatedRoute.snapshot.data?.['isGlobalSearch'] === true;
         const initialQuery = (data?.initialQuery ?? '').trim();
 
         if (this.isGlobalSearch) {
@@ -176,21 +280,21 @@ export class SearchResultsComponent implements AfterViewInit {
 
         effect((onCleanup) => {
             const term = this.searchTerm();
-            if (term.length >= 3) {
+            if (term.length >= this.minSearchLength) {
                 const timeout = setTimeout(() => this.executeSearch(), 300);
                 onCleanup(() => clearTimeout(timeout));
-            } else if (term.length === 0) {
+            } else if (term.length < this.minSearchLength) {
                 this.clearResultsOnly();
             }
         });
 
         effect(() => {
-            if (this.isGlobalSearch || !this.isWorkspaceLayout) {
+            if (!this.isWorkspaceLayout) {
                 return;
             }
 
             const queryTerm = this.routeSearchTerm();
-            if (!queryTerm || queryTerm === this.searchTerm()) {
+            if (queryTerm === this.searchTerm()) {
                 return;
             }
 
@@ -199,10 +303,12 @@ export class SearchResultsComponent implements AfterViewInit {
     }
 
     ngAfterViewInit() {
-        this.xtreamStore.setSelectedContentType(undefined);
-        setTimeout(() => {
-            this.searchLayoutComponent()?.focusSearchInput();
-        });
+        this.xtreamStore.setSelectedContentType('vod');
+        if (this.showInlineSearchInput) {
+            setTimeout(() => {
+                this.searchLayoutComponent()?.focusSearchInput();
+            });
+        }
     }
 
     executeSearch() {
@@ -243,7 +349,7 @@ export class SearchResultsComponent implements AfterViewInit {
             );
         }
 
-        if (this.searchTerm().length >= 3) {
+        if (this.searchTerm().length >= this.minSearchLength) {
             this.executeSearch();
         }
     }
@@ -254,17 +360,77 @@ export class SearchResultsComponent implements AfterViewInit {
     private clearResultsOnly() {
         this.globalSearchRequestVersion++;
         this.xtreamStore.setIsSearching(false);
+        this.hasMoreGlobalResults.set(false);
+        this.isLoadingMoreGlobalResults.set(false);
+        this.lastGlobalSearchTerm = '';
+        this.lastGlobalSearchTypes = [];
+        this.lastGlobalSearchExcludeHidden = undefined;
         this.xtreamStore.setGlobalSearchResults([]);
     }
 
-    async searchGlobal(term: string, types: string[], excludeHidden?: boolean) {
+    async searchGlobal(
+        term: string,
+        types: string[],
+        excludeHidden?: boolean,
+        append = false
+    ) {
+        const trimmedTerm =
+            term.trim() || (append ? this.lastGlobalSearchTerm : '');
+        const effectiveTypes =
+            append && this.lastGlobalSearchTypes.length > 0
+                ? this.lastGlobalSearchTypes
+                : types;
+        const effectiveExcludeHidden =
+            append && this.lastGlobalSearchExcludeHidden !== undefined
+                ? this.lastGlobalSearchExcludeHidden
+                : excludeHidden;
+
+        if (
+            trimmedTerm.length < this.minSearchLength ||
+            effectiveTypes.length === 0
+        ) {
+            this.clearResultsOnly();
+            return;
+        }
+
+        if (
+            append &&
+            (!this.hasMoreGlobalResults() ||
+                this.isLoadingMoreGlobalResults() ||
+                this.xtreamStore.isSearching() ||
+                // An append continues the LAST EXECUTED search. While an
+                // edited query is still debouncing, the visible results
+                // belong to the old term — fetching a new-term page at the
+                // old offset would interleave two different queries.
+                trimmedTerm !== this.lastGlobalSearchTerm)
+        ) {
+            return;
+        }
+
         const requestVersion = ++this.globalSearchRequestVersion;
-        this.xtreamStore.setIsSearching(true);
+        const offset = append ? this.getCurrentGlobalSearchResults().length : 0;
+
+        if (append) {
+            this.isLoadingMoreGlobalResults.set(true);
+        } else {
+            this.lastGlobalSearchTerm = trimmedTerm;
+            this.lastGlobalSearchTypes = [...effectiveTypes];
+            this.lastGlobalSearchExcludeHidden = effectiveExcludeHidden;
+            this.hasMoreGlobalResults.set(false);
+            this.isLoadingMoreGlobalResults.set(false);
+            this.xtreamStore.setIsSearching(true);
+        }
+
         try {
             const results = await this.databaseService.globalSearchContent(
-                term,
-                types,
-                excludeHidden
+                trimmedTerm,
+                effectiveTypes,
+                effectiveExcludeHidden,
+                undefined,
+                {
+                    limit: GLOBAL_SEARCH_PAGE_SIZE + 1,
+                    offset,
+                }
             );
 
             if (requestVersion !== this.globalSearchRequestVersion) {
@@ -272,9 +438,24 @@ export class SearchResultsComponent implements AfterViewInit {
             }
 
             if (results && Array.isArray(results)) {
-                this.xtreamStore.setGlobalSearchResults(results);
+                const visibleResults = results.slice(
+                    0,
+                    GLOBAL_SEARCH_PAGE_SIZE
+                );
+                this.hasMoreGlobalResults.set(
+                    results.length > GLOBAL_SEARCH_PAGE_SIZE
+                );
+                this.xtreamStore.setGlobalSearchResults(
+                    append
+                        ? [
+                              ...this.getCurrentGlobalSearchResults(),
+                              ...visibleResults,
+                          ]
+                        : visibleResults
+                );
             } else {
                 this.xtreamStore.setIsSearching(false);
+                this.hasMoreGlobalResults.set(false);
             }
         } catch (error) {
             if (requestVersion !== this.globalSearchRequestVersion) {
@@ -282,11 +463,45 @@ export class SearchResultsComponent implements AfterViewInit {
             }
 
             this.logger.error('Error in global search', error);
-            this.xtreamStore.resetSearchResults();
+            if (append) {
+                this.hasMoreGlobalResults.set(false);
+            } else {
+                this.xtreamStore.resetSearchResults();
+            }
+        } finally {
+            if (requestVersion === this.globalSearchRequestVersion) {
+                this.isLoadingMoreGlobalResults.set(false);
+                if (!append) {
+                    this.xtreamStore.setIsSearching(false);
+                }
+            }
         }
     }
 
-    selectItem(item: XtreamContentItem) {
+    async loadMoreGlobalResults(): Promise<void> {
+        if (!this.isGlobalSearch) {
+            return;
+        }
+
+        const filters = this.filters();
+        const types = Object.entries(filters)
+            .filter(([, enabled]) => enabled)
+            .map(([type]) => type);
+
+        await this.searchGlobal(
+            this.searchTerm(),
+            types,
+            this.excludeHidden(),
+            true
+        );
+    }
+
+    selectItem(item: XtreamSearchResultItem) {
+        if (isM3uGlobalSearchResult(item as GlobalSearchResult)) {
+            this.selectM3uItem(item as GlobalSearchResult);
+            return;
+        }
+
         const playlistId = item.playlist_id ?? this.xtreamStore.playlistId();
         if (!playlistId) {
             return;
@@ -323,6 +538,10 @@ export class SearchResultsComponent implements AfterViewInit {
         this.dialogRef?.close();
     }
 
+    goBack(): void {
+        this.location.back();
+    }
+
     toggleGroupByPlaylist(value: boolean) {
         this.groupByPlaylist.set(value);
         localStorage.setItem(
@@ -337,7 +556,7 @@ export class SearchResultsComponent implements AfterViewInit {
             SearchResultsComponent.EXCLUDE_HIDDEN_STORAGE_KEY,
             String(value)
         );
-        if (this.searchTerm().length >= 3) {
+        if (this.searchTerm().length >= this.minSearchLength) {
             this.executeSearch();
         }
     }
@@ -347,6 +566,64 @@ export class SearchResultsComponent implements AfterViewInit {
     }
 
     get showInlineSearchInput(): boolean {
-        return !this.isWorkspaceLayout || this.isGlobalSearch;
+        return !this.isWorkspaceLayout;
+    }
+
+    get showGlobalCloseButton(): boolean {
+        return this.isGlobalSearch && !this.isWorkspaceLayout;
+    }
+
+    /**
+     * The in-portal search is a nested view (reached from the toolbar
+     * search box or an actor page); the global search is a top-level
+     * sidebar destination, and the dialog has its own close button — a
+     * back arrow there would navigate the page behind the open dialog.
+     */
+    get showBackButton(): boolean {
+        return (
+            this.isWorkspaceLayout && !this.isGlobalSearch && !this.dialogRef
+        );
+    }
+
+    get minSearchLength(): number {
+        return this.isGlobalSearch ? 2 : 3;
+    }
+
+    get initialDescriptionKey(): string {
+        return this.isGlobalSearch
+            ? 'PORTALS.SEARCH_VIEW.GLOBAL_INITIAL_DESCRIPTION'
+            : 'PORTALS.SEARCH_VIEW.INITIAL_DESCRIPTION';
+    }
+
+    getDisplayType(item: XtreamSearchResultItem): string {
+        const result = item as GlobalSearchResult;
+        if (isM3uGlobalSearchResult(result) && result.radio === 'true') {
+            return 'radio';
+        }
+
+        return item.type;
+    }
+
+    private getCurrentGlobalSearchResults(): GlobalSearchResult[] {
+        return this.xtreamStore.searchResults() as GlobalSearchResult[];
+    }
+
+    private selectM3uItem(item: GlobalSearchResult): void {
+        if (!isM3uGlobalSearchResult(item)) {
+            return;
+        }
+
+        if (this.isGlobalSearch) {
+            this.dialogRef?.close();
+        }
+
+        void this.router.navigate(
+            ['/workspace', 'playlists', item.playlist_id, 'all'],
+            {
+                state: {
+                    openM3uChannelUrl: item.stream_url,
+                },
+            }
+        );
     }
 }

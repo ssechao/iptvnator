@@ -1,24 +1,34 @@
 import { Injectable, inject } from '@angular/core';
+import {
+    normalizeXtreamServerUrl,
+    resolveXtreamPortalExpiration,
+    resolveXtreamPortalStatus,
+    XtreamPortalStatusResponseLike,
+} from '@iptvnator/shared/interfaces';
 import { DataService } from './data.service';
+import { resetHostConnectivityGuard } from './host-connectivity-reset';
 
 export type PortalStatus =
-    | 'active'
-    | 'inactive'
-    | 'expired'
-    | 'unavailable'
-    | 'checking';
+    'active' | 'inactive' | 'expired' | 'unavailable' | 'checking';
+
+/**
+ * Status plus the parsed account expiration from the same round-trip the
+ * status check already makes — consumers that care about "expires soon"
+ * (dashboard source cards) share the cache instead of issuing their own
+ * `get_account_info` calls.
+ */
+export interface PortalStatusDetails {
+    status: PortalStatus;
+    /** Unix seconds; null when the portal doesn't report an expiration. */
+    expiresAtSeconds: number | null;
+}
 
 interface XtreamPortalStatusResponse {
-    payload?: {
-        user_info?: {
-            status?: string;
-            exp_date?: string;
-        };
-    };
+    payload?: XtreamPortalStatusResponseLike;
 }
 
 interface PortalStatusCacheEntry {
-    status: PortalStatus;
+    details: PortalStatusDetails;
     timestamp: number;
 }
 
@@ -32,6 +42,11 @@ interface CheckPortalStatusOptions {
 }
 
 const PORTAL_STATUS_CACHE_TTL_MS = 30_000;
+const XTREAM_STATUS_ACTIONS = [
+    'get_account_info',
+    null,
+    'get_profile',
+] as const;
 
 @Injectable({
     providedIn: 'root',
@@ -52,7 +67,7 @@ export class PortalStatusService {
      * playlist-item + switcher menu open) share a single network round-trip
      * instead of racing each other.
      */
-    private readonly inFlight = new Map<string, Promise<PortalStatus>>();
+    private readonly inFlight = new Map<string, Promise<PortalStatusDetails>>();
 
     /**
      * Checks the status of an Xtream Code portal
@@ -70,7 +85,39 @@ export class PortalStatusService {
         password: string,
         options?: CheckPortalStatusOptions
     ): Promise<PortalStatus> {
-        const cacheKey = this.buildCacheKey(serverUrl, username, password);
+        const details = await this.checkPortalStatusDetails(
+            serverUrl,
+            username,
+            password,
+            options
+        );
+        return details.status;
+    }
+
+    /**
+     * Same check as {@link checkPortalStatus} (shared cache, shared in-flight
+     * dedup) but returns the account expiration alongside the status.
+     */
+    async checkPortalStatusDetails(
+        serverUrl: string,
+        username: string,
+        password: string,
+        options?: CheckPortalStatusOptions
+    ): Promise<PortalStatusDetails> {
+        const connection = this.normalizeConnection(
+            serverUrl,
+            username,
+            password
+        );
+        if (!connection) {
+            return { status: 'unavailable', expiresAtSeconds: null };
+        }
+
+        const cacheKey = this.buildCacheKey(
+            connection.serverUrl,
+            connection.username,
+            connection.password
+        );
 
         if (!options?.skipCache) {
             const cached = this.cache.get(cacheKey);
@@ -78,22 +125,34 @@ export class PortalStatusService {
                 cached &&
                 Date.now() - cached.timestamp < PORTAL_STATUS_CACHE_TTL_MS
             ) {
-                return cached.status;
+                return cached.details;
             }
 
             const pending = this.inFlight.get(cacheKey);
             if (pending) {
                 return pending;
             }
+        } else {
+            // Skipping the cache means the user asked to test this portal
+            // right now, so the main process must forget any connection
+            // failures it recorded for the host and contact it for real.
+            await resetHostConnectivityGuard(
+                this.dataService,
+                connection.serverUrl
+            );
         }
 
-        const request = this.fetchPortalStatus(serverUrl, username, password)
-            .then((status) => {
+        const request = this.fetchPortalStatus(
+            connection.serverUrl,
+            connection.username,
+            connection.password
+        )
+            .then((details) => {
                 this.cache.set(cacheKey, {
-                    status,
+                    details,
                     timestamp: Date.now(),
                 });
-                return status;
+                return details;
             })
             .finally(() => {
                 this.inFlight.delete(cacheKey);
@@ -115,8 +174,21 @@ export class PortalStatusService {
         username: string,
         password: string
     ): PortalStatus | null {
+        const connection = this.normalizeConnection(
+            serverUrl,
+            username,
+            password
+        );
+        if (!connection) {
+            return null;
+        }
+
         const cached = this.cache.get(
-            this.buildCacheKey(serverUrl, username, password)
+            this.buildCacheKey(
+                connection.serverUrl,
+                connection.username,
+                connection.password
+            )
         );
         if (!cached) {
             return null;
@@ -124,7 +196,7 @@ export class PortalStatusService {
         if (Date.now() - cached.timestamp >= PORTAL_STATUS_CACHE_TTL_MS) {
             return null;
         }
-        return cached.status;
+        return cached.details.status;
     }
 
     /** Clear the entire cache. Useful for log-out or debug flows. */
@@ -140,51 +212,67 @@ export class PortalStatusService {
         return `${serverUrl}|${username}|${password}`;
     }
 
+    private normalizeConnection(
+        serverUrl: string,
+        username: string,
+        password: string
+    ): {
+        password: string;
+        serverUrl: string;
+        username: string;
+    } | null {
+        try {
+            const normalizedUsername = username.trim();
+            const normalizedPassword = password.trim();
+            if (!normalizedUsername || !normalizedPassword) {
+                return null;
+            }
+
+            return {
+                serverUrl: normalizeXtreamServerUrl(serverUrl),
+                username: normalizedUsername,
+                password: normalizedPassword,
+            };
+        } catch {
+            return null;
+        }
+    }
+
     private async fetchPortalStatus(
         serverUrl: string,
         username: string,
         password: string
-    ): Promise<PortalStatus> {
-        try {
-            let normalizedUrl = serverUrl;
-            if (serverUrl && !serverUrl.endsWith('/')) {
-                normalizedUrl = serverUrl;
-            }
-
-            const response =
-                await this.dataService.sendIpcEvent<XtreamPortalStatusResponse>(
-                    'XTREAM_REQUEST',
-                    {
-                        url: normalizedUrl,
-                        params: {
-                            password,
-                            username,
-                            action: 'get_account_info',
-                        },
-                        suppressErrorLog: true,
-                    }
-                );
-            const payload = response?.payload;
-
-            if (!payload?.user_info?.status) {
-                return 'unavailable';
-            }
-
-            if (payload.user_info.status === 'Active') {
-                if (!payload.user_info.exp_date) {
-                    return 'active';
+    ): Promise<PortalStatusDetails> {
+        for (const action of XTREAM_STATUS_ACTIONS) {
+            try {
+                const response =
+                    await this.dataService.sendIpcEvent<XtreamPortalStatusResponse>(
+                        'XTREAM_REQUEST',
+                        {
+                            url: serverUrl,
+                            params: {
+                                ...(action ? { action } : {}),
+                                password,
+                                username,
+                            },
+                            suppressErrorLog: true,
+                        }
+                    );
+                const status = resolveXtreamPortalStatus(response?.payload);
+                if (status !== 'unavailable') {
+                    return {
+                        status,
+                        expiresAtSeconds: resolveXtreamPortalExpiration(
+                            response?.payload
+                        ),
+                    };
                 }
-
-                const expDate = new Date(
-                    parseInt(payload.user_info.exp_date, 10) * 1000
-                );
-                return expDate < new Date() ? 'expired' : 'active';
-            } else {
-                return 'inactive';
+            } catch {
+                // Try the next Xtream account-info action variant.
             }
-        } catch (error) {
-            return 'unavailable';
         }
+
+        return { status: 'unavailable', expiresAtSeconds: null };
     }
 
     /**

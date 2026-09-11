@@ -13,6 +13,8 @@
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 
+#include "embedded_mpv_extra_options.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -70,6 +72,7 @@ enum class SessionStatus {
     Loading,
     Playing,
     Paused,
+    Ended,
     Error,
     Closed,
 };
@@ -95,12 +98,67 @@ struct SessionSnapshot {
     double volumePercent = 100.0;
     std::string streamUrl;
     std::string error;
+    // True when `error` is the engine's own failure (render context, fatal
+    // libmpv log) rather than the stream's: the app must not reload for it.
+    bool engineError = false;
+    // Keys of session options libmpv refused at creation (names only, never
+    // values: a value may carry credentials). Reported once by the service.
+    std::vector<std::string> rejectedOptionKeys;
     std::vector<AudioTrack> audioTracks;
     int64_t selectedAudioTrackId = -1;
     std::vector<AudioTrack> subtitleTracks;
     int64_t selectedSubtitleTrackId = -1;
     double playbackSpeed = 1.0;
     std::string aspectOverride = "no";
+    // Stream diagnostics for the player's info popover. Sentinels mean "mpv
+    // has not answered yet", so an unknown value omits its row instead of
+    // reporting a zero.
+    double fps = 0.0;                  // estimated-vf-fps; <=0 = unknown
+    double videoBitrate = 0.0;         // bits/s; <=0 = unknown
+    double audioBitrate = 0.0;
+    std::string videoCodec;            // video-format, e.g. "h264"
+    std::string audioCodec;            // audio-codec-name, e.g. "aac"
+    std::string audioChannels;         // audio-params/channels, e.g. "5.1"
+    int64_t audioSampleRate = 0;       // audio-params/samplerate; 0 unknown
+    std::string container;             // file-format, e.g. "mpegts"
+    double cacheDuration = -1.0;       // demuxer-cache-duration; <0 = unknown
+    int64_t droppedFrames = -1;        // frame-drop-count; <0 = unknown
+    int64_t decoderDroppedFrames = -1;
+
+    // MPV_FORMAT_NONE revokes just this observation, not unrelated values.
+    bool clearUnavailableStreamProperty(const std::string& name) {
+        if (name == "estimated-vf-fps") { fps = 0; }
+        else if (name == "video-bitrate") { videoBitrate = 0; }
+        else if (name == "audio-bitrate") { audioBitrate = 0; }
+        else if (name == "video-format") { videoCodec.clear(); }
+        else if (name == "audio-codec-name") { audioCodec.clear(); }
+        else if (name == "audio-params/channels") { audioChannels.clear(); }
+        else if (name == "audio-params/samplerate") { audioSampleRate = 0; }
+        else if (name == "file-format") { container.clear(); }
+        else if (name == "demuxer-cache-duration") { cacheDuration = -1; }
+        else if (name == "frame-drop-count") { droppedFrames = -1; }
+        else if (name == "decoder-frame-drop-count") { decoderDroppedFrames = -1; }
+        else { return false; }
+        return true;
+    }
+
+    // Every new file starts from "nothing reported yet": the popover must
+    // never show the previous stream's codec or bitrate. Kept next to the
+    // fields so adding one cannot forget the reset.
+    void clearStreamStats()
+    {
+        fps = 0.0;
+        videoBitrate = 0.0;
+        audioBitrate = 0.0;
+        videoCodec.clear();
+        audioCodec.clear();
+        audioChannels.clear();
+        audioSampleRate = 0;
+        container.clear();
+        cacheDuration = -1.0;
+        droppedFrames = -1;
+        decoderDroppedFrames = -1;
+    }
     bool recordingActive = false;
     std::string recordingTargetPath;
     std::string recordingStartedAt;
@@ -132,6 +190,7 @@ struct Session {
     std::string pendingRecordingTargetPath;
     std::string pendingRecordingStartedAt;
     std::string pendingRecordingStopStartedAt;
+    uint64_t pendingPlaybackLoadRequestId = 0;
     std::weak_ptr<Session>* renderCallbackContext = nullptr;
     RenderBackend renderBackend = RenderBackend::OpenGL;
     int renderWidthPixels = 0;
@@ -157,6 +216,8 @@ std::string toStatusString(SessionStatus status)
             return "playing";
         case SessionStatus::Paused:
             return "paused";
+        case SessionStatus::Ended:
+            return "ended";
         case SessionStatus::Error:
             return "error";
         case SessionStatus::Closed:
@@ -199,7 +260,11 @@ std::shared_ptr<Session> getSessionOrThrow(
 
 void scheduleRender(const std::shared_ptr<Session>& session);
 void requestRender(const std::shared_ptr<Session>& session);
-void updateSessionError(const std::shared_ptr<Session>& session, const std::string& error);
+void updateSessionError(
+    const std::shared_ptr<Session>& session,
+    const std::string& error,
+    bool engineError = false
+);
 
 bool isEmbeddedMpvTraceEnabled()
 {
@@ -546,7 +611,8 @@ void renderSoftwareFrame(const std::shared_ptr<Session>& session)
     if (result < 0) {
         updateSessionError(
             session,
-            std::string("Failed to render frame: ") + mpv_error_string(result)
+            std::string("Failed to render frame: ") + mpv_error_string(result),
+            true
         );
         return;
     }
@@ -666,7 +732,8 @@ void renderOpenGLFrame(const std::shared_ptr<Session>& session)
         updateSessionError(
             session,
             std::string("Failed to render OpenGL frame: ") +
-                mpv_error_string(result)
+                mpv_error_string(result),
+            true
         );
         return;
     }
@@ -762,6 +829,19 @@ void onRenderContextUpdate(void* context)
     }
 }
 
+void replaceAllInPlace(std::string& value, const std::string& from, const std::string& to)
+{
+    if (from.empty()) {
+        return;
+    }
+
+    size_t position = 0;
+    while ((position = value.find(from, position)) != std::string::npos) {
+        value.replace(position, from.length(), to);
+        position += to.length();
+    }
+}
+
 std::string joinHeaderFields(const Napi::Object& headers)
 {
     const Napi::Array propertyNames = headers.GetPropertyNames();
@@ -784,6 +864,15 @@ std::string joinHeaderFields(const Napi::Object& headers)
         if (key.empty() || value.empty()) {
             continue;
         }
+
+        // mpv's `--http-header-fields` option is a comma-separated list
+        // (OPT_STRINGLIST). Header values that themselves contain commas
+        // (e.g. the Stalker MAG250 user agent "...(KHTML, like Gecko) MAG250")
+        // must be escaped so mpv does not split them into bogus fields and
+        // the server rejects the request with HTTP 400. mpv strips the
+        // backslash and keeps the comma inside the header value.
+        replaceAllInPlace(value, "\\", "\\\\");
+        replaceAllInPlace(value, ",", "\\,");
 
         fields.push_back(key + ": " + value);
     }
@@ -1009,11 +1098,16 @@ void updateSubtitleTracksFromNode(SessionSnapshot& snapshot, const mpv_node& nod
     );
 }
 
-void updateSessionError(const std::shared_ptr<Session>& session, const std::string& error)
+void updateSessionError(
+    const std::shared_ptr<Session>& session,
+    const std::string& error,
+    bool engineError
+)
 {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->snapshot.status = SessionStatus::Error;
     session->snapshot.error = error;
+    session->snapshot.engineError = engineError;
 }
 
 uint64_t nextAsyncRequestId()
@@ -1088,6 +1182,27 @@ bool reconcileRecordingPropertyReply(
     return false;
 }
 
+bool reconcilePlaybackLoadReply(
+    const std::shared_ptr<Session>& session,
+    uint64_t requestId,
+    int error
+)
+{
+    if (
+        requestId == 0 ||
+        requestId != session->pendingPlaybackLoadRequestId
+    ) {
+        return false;
+    }
+
+    session->pendingPlaybackLoadRequestId = 0;
+    if (error < 0) {
+        session->snapshot.status = SessionStatus::Error;
+        session->snapshot.error = mpv_error_string(error);
+    }
+    return true;
+}
+
 double clampVolumePercent(double volume)
 {
     return std::clamp(volume, 0.0, 1.0) * 100.0;
@@ -1107,6 +1222,8 @@ void runEventLoop(const std::shared_ptr<Session>& session)
             case MPV_EVENT_START_FILE:
                 session->snapshot.status = SessionStatus::Loading;
                 session->snapshot.error.clear();
+                session->snapshot.engineError = false;
+                session->snapshot.clearStreamStats();
                 session->snapshot.audioTracks.clear();
                 session->snapshot.selectedAudioTrackId = -1;
                 session->snapshot.subtitleTracks.clear();
@@ -1128,6 +1245,19 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                         endFile->error < 0
                             ? mpv_error_string(endFile->error)
                             : "Playback failed.";
+                } else if (
+                    endFile &&
+                    endFile->reason == MPV_END_FILE_REASON_EOF &&
+                    session->running.load()) {
+                    session->snapshot.status = SessionStatus::Ended;
+                } else if (
+                    endFile &&
+                    endFile->reason == MPV_END_FILE_REASON_REDIRECT &&
+                    session->running.load()) {
+                    session->snapshot.status = SessionStatus::Loading;
+                    session->snapshot.error.clear();
+                    session->snapshot.engineError = false;
+                    session->loadedPath = false;
                 } else if (session->running.load()) {
                     session->snapshot.status = SessionStatus::Idle;
                 }
@@ -1141,6 +1271,11 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                 }
 
                 const std::string propertyName = property->name;
+
+                if (property->format == MPV_FORMAT_NONE) {
+                    session->snapshot.clearUnavailableStreamProperty(propertyName);
+                    break;
+                }
 
                 if (propertyName == "time-pos" &&
                     property->format == MPV_FORMAT_DOUBLE &&
@@ -1163,11 +1298,25 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                     property->data) {
                     session->paused = *static_cast<int*>(property->data) != 0;
                     if (session->snapshot.status != SessionStatus::Loading &&
+                        session->snapshot.status != SessionStatus::Ended &&
                         session->snapshot.status != SessionStatus::Error &&
                         session->loadedPath) {
                         session->snapshot.status = session->paused
                             ? SessionStatus::Paused
                             : SessionStatus::Playing;
+                    }
+                    break;
+                }
+
+                if (propertyName == "eof-reached" &&
+                    property->format == MPV_FORMAT_FLAG &&
+                    property->data) {
+                    const bool eofReached =
+                        *static_cast<int*>(property->data) != 0;
+                    if (eofReached &&
+                        session->running.load() &&
+                        session->loadedPath) {
+                        session->snapshot.status = SessionStatus::Ended;
                     }
                     break;
                 }
@@ -1253,6 +1402,67 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                     break;
                 }
 
+                if (property->format == MPV_FORMAT_DOUBLE && property->data) {
+                    const double value = *static_cast<double*>(property->data);
+                    if (propertyName == "estimated-vf-fps") {
+                        session->snapshot.fps = value;
+                        break;
+                    }
+                    if (propertyName == "video-bitrate") {
+                        session->snapshot.videoBitrate = value;
+                        break;
+                    }
+                    if (propertyName == "audio-bitrate") {
+                        session->snapshot.audioBitrate = value;
+                        break;
+                    }
+                    if (propertyName == "demuxer-cache-duration") {
+                        session->snapshot.cacheDuration = value;
+                        break;
+                    }
+                }
+
+                if (property->format == MPV_FORMAT_INT64 && property->data) {
+                    const int64_t value =
+                        *static_cast<int64_t*>(property->data);
+                    if (propertyName == "frame-drop-count") {
+                        session->snapshot.droppedFrames = value;
+                        break;
+                    }
+                    if (propertyName == "decoder-frame-drop-count") {
+                        session->snapshot.decoderDroppedFrames = value;
+                        break;
+                    }
+                    if (propertyName == "audio-params/samplerate") {
+                        session->snapshot.audioSampleRate = value;
+                        break;
+                    }
+                }
+
+                if (property->format == MPV_FORMAT_STRING && property->data) {
+                    // MPV_FORMAT_STRING hands over a char**.
+                    const char* const* textValue =
+                        static_cast<char**>(property->data);
+                    const std::string text =
+                        (textValue && *textValue) ? *textValue : "";
+                    if (propertyName == "video-format") {
+                        session->snapshot.videoCodec = text;
+                        break;
+                    }
+                    if (propertyName == "audio-codec-name") {
+                        session->snapshot.audioCodec = text;
+                        break;
+                    }
+                    if (propertyName == "audio-params/channels") {
+                        session->snapshot.audioChannels = text;
+                        break;
+                    }
+                    if (propertyName == "file-format") {
+                        session->snapshot.container = text;
+                        break;
+                    }
+                }
+
                 break;
             }
             case MPV_EVENT_LOG_MESSAGE: {
@@ -1280,11 +1490,19 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                 }
                 if (level == "fatal") {
                     session->snapshot.status = SessionStatus::Error;
+                    session->snapshot.engineError = true;
                 }
                 break;
             }
             case MPV_EVENT_COMMAND_REPLY:
             case MPV_EVENT_SET_PROPERTY_REPLY:
+                if (reconcilePlaybackLoadReply(
+                        session,
+                        event->reply_userdata,
+                        event->error
+                    )) {
+                    break;
+                }
                 if (reconcileRecordingPropertyReply(
                         session,
                         event->reply_userdata,
@@ -1292,8 +1510,10 @@ void runEventLoop(const std::shared_ptr<Session>& session)
                     )) {
                     break;
                 }
+                // Only a failed loadfile may flip the session status: a
+                // rejected seek/aid/speed reply on a live stream must not
+                // surface the error UI while playback keeps running.
                 if (event->error < 0) {
-                    session->snapshot.status = SessionStatus::Error;
                     session->snapshot.error = mpv_error_string(event->error);
                 }
                 break;
@@ -1575,6 +1795,25 @@ Napi::Value CreateSession(const Napi::CallbackInfo& info)
         std::to_string(session->snapshot.volumePercent);
     mpv_set_option_string(session->handle, "volume", initialVolume.c_str());
 
+    // Session options from Settings (network defaults first, then the
+    // user's lines). Applied last so a user value overrides a built-in one,
+    // and before mpv_initialize because most of them are init-only.
+    for (const auto& option : iptvnator::readEmbeddedMpvExtraOptions(info, 4)) {
+        const int optionResult = mpv_set_option_string(
+            session->handle,
+            option.first.c_str(),
+            option.second.c_str()
+        );
+        if (optionResult < 0) {
+            traceEmbeddedMpv(
+                session,
+                "rejected session option " + option.first + ": " +
+                    mpv_error_string(optionResult)
+            );
+            session->snapshot.rejectedOptionKeys.push_back(option.first);
+        }
+    }
+
     mpv_request_log_messages(session->handle, "warn");
 
     const int initializeResult = mpv_initialize(session->handle);
@@ -1684,6 +1923,75 @@ Napi::Value CreateSession(const Napi::CallbackInfo& info)
         10,
         "video-aspect-override",
         MPV_FORMAT_STRING
+    );
+    mpv_observe_property(session->handle, 11, "eof-reached", MPV_FORMAT_FLAG);
+    // Stream diagnostics behind the player's info popover. The renderer pulls
+    // snapshots on its own cadence, so observing these adds no IPC traffic.
+    mpv_observe_property(
+        session->handle,
+        12,
+        "estimated-vf-fps",
+        MPV_FORMAT_DOUBLE
+    );
+    mpv_observe_property(
+        session->handle,
+        13,
+        "video-bitrate",
+        MPV_FORMAT_DOUBLE
+    );
+    mpv_observe_property(
+        session->handle,
+        14,
+        "audio-bitrate",
+        MPV_FORMAT_DOUBLE
+    );
+    mpv_observe_property(
+        session->handle,
+        15,
+        "video-format",
+        MPV_FORMAT_STRING
+    );
+    mpv_observe_property(
+        session->handle,
+        16,
+        "audio-codec-name",
+        MPV_FORMAT_STRING
+    );
+    mpv_observe_property(
+        session->handle,
+        17,
+        "file-format",
+        MPV_FORMAT_STRING
+    );
+    mpv_observe_property(
+        session->handle,
+        18,
+        "demuxer-cache-duration",
+        MPV_FORMAT_DOUBLE
+    );
+    mpv_observe_property(
+        session->handle,
+        19,
+        "frame-drop-count",
+        MPV_FORMAT_INT64
+    );
+    mpv_observe_property(
+        session->handle,
+        20,
+        "decoder-frame-drop-count",
+        MPV_FORMAT_INT64
+    );
+    mpv_observe_property(
+        session->handle,
+        21,
+        "audio-params/channels",
+        MPV_FORMAT_STRING
+    );
+    mpv_observe_property(
+        session->handle,
+        22,
+        "audio-params/samplerate",
+        MPV_FORMAT_INT64
     );
 
     session->running.store(true);
@@ -1832,29 +2140,36 @@ Napi::Value LoadPlayback(const Napi::CallbackInfo& info)
     command.format = MPV_FORMAT_NODE_ARRAY;
     command.u.list = &commandList;
 
+    const uint64_t loadPlaybackRequestId = nextAsyncRequestId();
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->snapshot.streamUrl = streamUrl;
+        session->snapshot.error.clear();
+        session->snapshot.engineError = false;
+        session->snapshot.status = SessionStatus::Loading;
+        session->snapshot.recordingActive = false;
+        session->snapshot.recordingTargetPath.clear();
+        session->snapshot.recordingStartedAt.clear();
+        session->snapshot.recordingError.clear();
+        session->pendingPlaybackLoadRequestId = loadPlaybackRequestId;
+    }
+
     const int commandResult = mpv_command_node_async(
         session->handle,
-        nextAsyncRequestId(),
+        loadPlaybackRequestId,
         &command
     );
     if (commandResult < 0) {
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->pendingPlaybackLoadRequestId = 0;
+        }
         updateSessionError(session, mpv_error_string(commandResult));
         throw Napi::Error::New(
             env,
             std::string("Failed to load playback: ") +
                 mpv_error_string(commandResult)
         );
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(session->mutex);
-        session->snapshot.streamUrl = streamUrl;
-        session->snapshot.error.clear();
-        session->snapshot.status = SessionStatus::Loading;
-        session->snapshot.recordingActive = false;
-        session->snapshot.recordingTargetPath.clear();
-        session->snapshot.recordingStartedAt.clear();
-        session->snapshot.recordingError.clear();
     }
 
     return env.Undefined();
@@ -1911,8 +2226,13 @@ Napi::Value SetPaused(const Napi::CallbackInfo& info)
     {
         std::lock_guard<std::mutex> lock(session->mutex);
         session->paused = paused != 0;
+        // Optimistic only while playing/paused: a load in flight keeps
+        // `loading` until MPV_EVENT_FILE_LOADED, otherwise a reconnect's
+        // unpause right after loadfile would report the replacement stream
+        // as playing before it opened (and clear the attempt indicator).
         if (session->loadedPath &&
-            session->snapshot.status != SessionStatus::Error) {
+            (session->snapshot.status == SessionStatus::Playing ||
+             session->snapshot.status == SessionStatus::Paused)) {
             session->snapshot.status = session->paused
                 ? SessionStatus::Paused
                 : SessionStatus::Playing;
@@ -1956,6 +2276,50 @@ Napi::Value Seek(const Napi::CallbackInfo& info)
     {
         std::lock_guard<std::mutex> lock(session->mutex);
         session->snapshot.positionSeconds = std::max(0.0, target);
+    }
+
+    return env.Undefined();
+}
+
+Napi::Value SeekBy(const Napi::CallbackInfo& info)
+{
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsNumber()) {
+        throw Napi::TypeError::New(env, "Expected session id and seek delta.");
+    }
+
+    const std::string sessionId = info[0].As<Napi::String>().Utf8Value();
+    const auto session = getSessionOrThrow(env, sessionId);
+    const auto delta = info[1].As<Napi::Number>().DoubleValue();
+    const std::string deltaValue = std::to_string(delta);
+    // Relative step (arrow keys, ±10 s buttons): mpv resolves the delta
+    // against its own playback position and merges relative seeks that are
+    // still queued, so a burst of presses accumulates instead of collapsing
+    // onto one target computed from the renderer's stale snapshot.
+    //
+    // Unlike the absolute Seek above, the snapshot is deliberately NOT
+    // advanced here: the event thread may already have stored the observed
+    // post-seek `time-pos` under the same mutex, and adding the delta on top
+    // of that would count the step twice with nothing to correct it while
+    // paused. Only the observed `time-pos` updates the position.
+    const char* command[] = {
+        "seek",
+        deltaValue.c_str(),
+        "relative+exact",
+        nullptr,
+    };
+    const int result = mpv_command_async(
+        session->handle,
+        nextAsyncRequestId(),
+        command
+    );
+
+    if (result < 0) {
+        throw Napi::Error::New(
+            env,
+            std::string("Failed to seek playback: ") +
+                mpv_error_string(result)
+        );
     }
 
     return env.Undefined();
@@ -2273,6 +2637,86 @@ Napi::Value StopRecording(const Napi::CallbackInfo& info)
     return env.Undefined();
 }
 
+/** Serializes the optional `stats` object; omits it when nothing is known. */
+void writeStreamStats(
+    Napi::Env env,
+    Napi::Object result,
+    const SessionSnapshot& snapshot
+)
+{
+    auto stats = Napi::Object::New(env);
+    bool hasStats = false;
+    if (snapshot.fps > 0.0) {
+        stats.Set("fps", Napi::Number::New(env, snapshot.fps));
+        hasStats = true;
+    }
+    if (snapshot.videoBitrate > 0.0) {
+        stats.Set(
+            "videoBitrateBps",
+            Napi::Number::New(env, snapshot.videoBitrate)
+        );
+        hasStats = true;
+    }
+    if (snapshot.audioBitrate > 0.0) {
+        stats.Set(
+            "audioBitrateBps",
+            Napi::Number::New(env, snapshot.audioBitrate)
+        );
+        hasStats = true;
+    }
+    if (!snapshot.videoCodec.empty()) {
+        stats.Set("videoCodec", Napi::String::New(env, snapshot.videoCodec));
+        hasStats = true;
+    }
+    if (!snapshot.audioCodec.empty()) {
+        stats.Set("audioCodec", Napi::String::New(env, snapshot.audioCodec));
+        hasStats = true;
+    }
+    if (!snapshot.audioChannels.empty()) {
+        stats.Set(
+            "audioChannels",
+            Napi::String::New(env, snapshot.audioChannels)
+        );
+        hasStats = true;
+    }
+    if (snapshot.audioSampleRate > 0) {
+        stats.Set(
+            "audioSampleRateHz",
+            Napi::Number::New(
+                env,
+                static_cast<double>(snapshot.audioSampleRate)
+            )
+        );
+        hasStats = true;
+    }
+    if (!snapshot.container.empty()) {
+        stats.Set("container", Napi::String::New(env, snapshot.container));
+        hasStats = true;
+    }
+    if (snapshot.cacheDuration >= 0.0) {
+        stats.Set(
+            "bufferedAheadSeconds",
+            Napi::Number::New(env, snapshot.cacheDuration)
+        );
+        hasStats = true;
+    }
+    if (snapshot.droppedFrames >= 0 || snapshot.decoderDroppedFrames >= 0) {
+        // mpv counts render-time and decoder drops separately; the popover
+        // shows the one number a viewer cares about.
+        const int64_t dropped =
+            std::max<int64_t>(0, snapshot.droppedFrames) +
+            std::max<int64_t>(0, snapshot.decoderDroppedFrames);
+        stats.Set(
+            "droppedFrames",
+            Napi::Number::New(env, static_cast<double>(dropped))
+        );
+        hasStats = true;
+    }
+    if (hasStats) {
+        result.Set("stats", stats);
+    }
+}
+
 Napi::Value GetSessionSnapshot(const Napi::CallbackInfo& info)
 {
     Napi::Env env = info.Env();
@@ -2382,6 +2826,8 @@ Napi::Value GetSessionSnapshot(const Napi::CallbackInfo& info)
         "aspectOverride",
         Napi::String::New(env, snapshot.aspectOverride)
     );
+    writeStreamStats(env, result, snapshot);
+
     if (snapshot.recordingActive ||
         !snapshot.recordingTargetPath.empty() ||
         !snapshot.recordingError.empty()) {
@@ -2413,6 +2859,20 @@ Napi::Value GetSessionSnapshot(const Napi::CallbackInfo& info)
 
     if (!snapshot.error.empty()) {
         result.Set("error", Napi::String::New(env, snapshot.error));
+        if (snapshot.engineError) {
+            result.Set("errorOrigin", Napi::String::New(env, "engine"));
+        }
+    }
+    if (!snapshot.rejectedOptionKeys.empty()) {
+        Napi::Array keys =
+            Napi::Array::New(env, snapshot.rejectedOptionKeys.size());
+        for (size_t i = 0; i < snapshot.rejectedOptionKeys.size(); ++i) {
+            keys.Set(
+                static_cast<uint32_t>(i),
+                Napi::String::New(env, snapshot.rejectedOptionKeys[i])
+            );
+        }
+        result.Set("rejectedOptionKeys", keys);
     }
 
     return result;
@@ -2450,6 +2910,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
     exports.Set("setBounds", Napi::Function::New(env, SetBounds));
     exports.Set("setPaused", Napi::Function::New(env, SetPaused));
     exports.Set("seek", Napi::Function::New(env, Seek));
+    exports.Set("seekBy", Napi::Function::New(env, SeekBy));
     exports.Set("setVolume", Napi::Function::New(env, SetVolume));
     exports.Set("setAudioTrack", Napi::Function::New(env, SetAudioTrack));
     exports.Set(

@@ -1,86 +1,76 @@
-import { CommonModule } from '@angular/common';
 import {
     Component,
     computed,
+    effect,
+    ElementRef,
     inject,
-    Input,
     OnDestroy,
     OnInit,
-    signal,
     ViewEncapsulation,
 } from '@angular/core';
-import {
-    FormArray,
-    FormBuilder,
-    ReactiveFormsModule,
-    Validators,
-} from '@angular/forms';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { ReactiveFormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
-import {
-    MAT_DIALOG_DATA,
-    MatDialog,
-    MatDialogModule,
-} from '@angular/material/dialog';
+import { MatDialog } from '@angular/material/dialog';
 import { MatIconModule } from '@angular/material/icon';
-import { MatSnackBar, MatSnackBarConfig } from '@angular/material/snack-bar';
-import { Router } from '@angular/router';
-import { EpgService } from '@iptvnator/epg/data-access';
+import { ActivatedRoute, Router } from '@angular/router';
 import { SettingsContextService } from '@iptvnator/workspace/shell/util';
-import { Store } from '@ngrx/store';
 import { TranslateModule, TranslateService } from '@ngx-translate/core';
-import { DialogService } from '@iptvnator/ui/components';
 import {
-    PlaylistActions,
-    selectAllPlaylistsMeta,
-    selectIsEpgAvailable,
-} from '@iptvnator/m3u-state';
-import { firstValueFrom, take } from 'rxjs';
-import {
-    DatabaseService,
-    DataService,
-    DbOperationEvent,
-    PlaylistBackupImportSummary,
-    PlaylistBackupService,
-    PlaylistsService,
+    EpgSourceReconciliationError,
+    RuntimeCapabilitiesService,
 } from '@iptvnator/services';
-import {
-    EmbeddedMpvSupport,
-    CoverSize,
-    Language,
-    normalizeExternalPlayerArguments,
-    StartupBehavior,
-    StreamFormat,
-    Theme,
-    VideoPlayer,
-} from '@iptvnator/shared/interfaces';
-import { SettingsStore } from '../services/settings-store.service';
-import { SettingsService } from './../services/settings.service';
+import { VodSourceDiscoveryService } from '@iptvnator/portal/shared/data-access';
+import { Language, StreamFormat } from '@iptvnator/shared/interfaces';
+import { firstValueFrom, map } from 'rxjs';
+import { BUILD_COMMIT } from '../../environments/build-commit';
 import { SettingsAboutSectionComponent } from './settings-about-section.component';
+import { SettingsAppUpdateFacade } from './settings-app-update.facade';
 import { SettingsBackupSectionComponent } from './settings-backup-section.component';
-import {
-    SettingsDeleteAllPlaylistsDialogComponent,
-    SettingsDeleteAllPlaylistsDialogData,
-} from './settings-delete-all-playlists-dialog.component';
+import { SettingsDashboardSectionComponent } from './settings-dashboard-section.component';
+import { SettingsEmbeddedMpvFacade } from './settings-embedded-mpv.facade';
+import { SettingsEpgFacade } from './settings-epg.facade';
 import { SettingsEpgSectionComponent } from './settings-epg-section.component';
-import { createEpgUrlControl } from './settings-form.utils';
+import { SettingsFormFacade } from './settings-form.facade';
 import { SettingsGeneralSectionComponent } from './settings-general-section.component';
+import { SettingsSection } from './settings.models';
 import {
-    SettingsPlaylistDeleteSummary,
-    SettingsSection,
-} from './settings.models';
-import {
+    buildSettingsPlayerOptions,
     buildSettingsSectionNavItems,
     SETTINGS_COVER_SIZE_OPTIONS,
-    SETTINGS_EMBEDDED_PLAYER_OPTIONS,
-    SETTINGS_OS_PLAYER_OPTIONS,
+    SETTINGS_EPG_VIEW_MODE_OPTIONS,
     SETTINGS_STARTUP_BEHAVIOR_OPTIONS,
+    SETTINGS_STARTUP_WINDOW_MODE_OPTIONS,
     SETTINGS_THEME_OPTIONS,
 } from './settings-options';
 import { SettingsPlaybackSectionComponent } from './settings-playback-section.component';
+import { SettingsRemoteControlFacade } from './settings-remote-control.facade';
 import { SettingsRemoteControlSectionComponent } from './settings-remote-control-section.component';
 import { SettingsResetSectionComponent } from './settings-reset-section.component';
-import { SettingsSectionScrollDirective } from './settings-section-scroll.directive';
+import { SettingsTmdbSectionComponent } from './settings-tmdb-section.component';
+import {
+    SettingsUnsavedChangesChoice,
+    SettingsUnsavedChangesDialogComponent,
+} from './settings-unsaved-changes-dialog.component';
+import { SettingsLeaveConfirmation } from './settings-unsaved-changes.guard';
+import { SettingsUnloadGuardService } from './settings-unload-guard.service';
+import { SettingsBackupFacade } from './settings-backup.facade';
+import { SettingsPlaylistResetFacade } from './settings-playlist-reset.facade';
+import { SettingsSnackbarService } from './settings-snackbar.service';
 
+export const SETTINGS_DEFAULT_SECTION = 'general';
+
+/**
+ * Thin coordinator for the settings page. The behaviour of each section lives
+ * in a dedicated facade the template binds to directly; what stays here is the
+ * page-level wiring: environment capabilities, the `:section` route param that
+ * selects which section page renders, and the save/discard flow that spans
+ * several facades.
+ *
+ * Routed as `/workspace/settings/:section`. Navigating between sections only
+ * changes the param — the component instance (and with it the form and its
+ * dirty state) survives until the user leaves settings entirely.
+ */
 @Component({
     templateUrl: './settings.component.html',
     styleUrls: ['./settings.component.scss'],
@@ -89,42 +79,54 @@ import { SettingsSectionScrollDirective } from './settings-section-scroll.direct
     },
     encapsulation: ViewEncapsulation.None,
     imports: [
-        CommonModule,
         MatButtonModule,
         MatIconModule,
         ReactiveFormsModule,
         TranslateModule,
-        MatDialogModule,
         SettingsAboutSectionComponent,
         SettingsBackupSectionComponent,
+        SettingsDashboardSectionComponent,
         SettingsEpgSectionComponent,
         SettingsGeneralSectionComponent,
         SettingsPlaybackSectionComponent,
         SettingsRemoteControlSectionComponent,
         SettingsResetSectionComponent,
-        SettingsSectionScrollDirective,
+        SettingsTmdbSectionComponent,
+    ],
+    providers: [
+        SettingsAppUpdateFacade,
+        SettingsBackupFacade,
+        SettingsEmbeddedMpvFacade,
+        SettingsEpgFacade,
+        SettingsFormFacade,
+        SettingsPlaylistResetFacade,
+        SettingsRemoteControlFacade,
+        SettingsSnackbarService,
+        SettingsUnloadGuardService,
     ],
 })
-export class SettingsComponent implements OnInit, OnDestroy {
-    private dialogService = inject(DialogService);
-    public dataService = inject(DataService);
-    private epgService = inject(EpgService);
-    private formBuilder = inject(FormBuilder);
-    private playlistsService = inject(PlaylistsService);
-    private router = inject(Router);
-    private settingsService = inject(SettingsService);
-    private snackBar = inject(MatSnackBar);
-    private store = inject(Store);
-    private translate = inject(TranslateService);
-    private matDialog = inject(MatDialog);
-    private playlistBackupService = inject(PlaylistBackupService);
-    private readonly databaseService = inject(DatabaseService);
-    private readonly dialogData = inject<{ isDialog: boolean } | null>(
-        MAT_DIALOG_DATA,
-        { optional: true }
-    );
+export class SettingsComponent
+    implements OnInit, OnDestroy, SettingsLeaveConfirmation
+{
+    readonly appUpdate = inject(SettingsAppUpdateFacade);
+    readonly backup = inject(SettingsBackupFacade);
+    readonly embeddedMpv = inject(SettingsEmbeddedMpvFacade);
+    readonly epg = inject(SettingsEpgFacade);
+    readonly form = inject(SettingsFormFacade);
+    readonly playlistReset = inject(SettingsPlaylistResetFacade);
+    readonly remoteControl = inject(SettingsRemoteControlFacade);
 
-    @Input() isDialog = this.dialogData?.isDialog ?? false;
+    private readonly settingsCtx = inject(SettingsContextService);
+    private readonly settingsSnackbar = inject(SettingsSnackbarService);
+    private readonly unloadGuard = inject(SettingsUnloadGuardService);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
+    private readonly vodSourceDiscovery = inject(VodSourceDiscoveryService);
+    private readonly matDialog = inject(MatDialog);
+    private readonly route = inject(ActivatedRoute);
+    private readonly router = inject(Router);
+    private readonly translate = inject(TranslateService);
+    private readonly hostElement = inject(ElementRef<HTMLElement>);
+
     /** List with available languages as enum */
     readonly languageEnum = Language;
 
@@ -132,147 +134,90 @@ export class SettingsComponent implements OnInit, OnDestroy {
     readonly streamFormatEnum = StreamFormat;
 
     /** Flag that indicates whether the app runs in electron environment */
-    readonly isDesktop = !!window.electron;
-    readonly embeddedMpvSupport = signal<EmbeddedMpvSupport | null>(null);
-    readonly supportsEmbeddedMpv = computed(
-        () => this.isDesktop && !!this.embeddedMpvSupport()?.supported
-    );
+    readonly isDesktop = this.runtime.isElectron;
+    readonly isPwa = this.runtime.isPwa;
+    readonly supportsDesktopFileSave = this.runtime.supportsDesktopFileSave;
+    readonly supportsEpg = this.form.supportsEpg;
+    readonly supportsManagedExternalPlayers =
+        this.runtime.supportsManagedExternalPlayers;
+    readonly supportsExternalPlayerPathSettings =
+        this.runtime.supportsExternalPlayerPathSettings;
+    readonly supportsVodMultiSource = this.vodSourceDiscovery.isAvailable;
+    readonly supportsRemoteControl = this.runtime.supportsRemoteControl;
+    readonly supportsStartupWindowMode = this.runtime.supportsStartupWindowMode;
+    readonly supportsPortalConnectivityGuard =
+        this.runtime.supportsPortalConnectivityGuard;
 
-    isPwa = this.dataService.getAppEnvironment() === 'pwa';
-
-    private readonly settingsCtx = inject(SettingsContextService);
-    readonly activeSection = this.settingsCtx.activeSection;
-
-    readonly osPlayers = computed(() => [
-        ...(this.supportsEmbeddedMpv()
-            ? [
-                  {
-                      id: VideoPlayer.EmbeddedMpv,
-                      labelKey: 'SETTINGS.PLAYER_EMBEDDED_MPV',
-                  },
-              ]
-            : []),
-        ...SETTINGS_OS_PLAYER_OPTIONS,
-    ]);
+    /** Settings form object */
+    readonly settingsForm = this.form.form;
 
     /** Player options */
-    readonly players = computed(() => [
-        ...SETTINGS_EMBEDDED_PLAYER_OPTIONS,
-        ...(this.isDesktop ? this.osPlayers() : []),
-    ]);
+    readonly players = computed(() =>
+        buildSettingsPlayerOptions({
+            supportsEmbeddedMpv: this.embeddedMpv.supported(),
+            supportsManagedExternalPlayers: this.supportsManagedExternalPlayers,
+        })
+    );
 
-    /** Current version of the app */
-    version: string;
-
-    /** Update message to show */
-    updateMessage: string;
-
-    /** EPG availability flag */
-    epgAvailable$ = this.store.select(selectIsEpgAvailable);
-    readonly playlists = this.store.selectSignal(selectAllPlaylistsMeta);
+    /** Git commit the app was built from (CI builds only) */
+    readonly buildCommit = BUILD_COMMIT;
 
     readonly themeOptions = SETTINGS_THEME_OPTIONS;
     readonly coverSizeOptions = SETTINGS_COVER_SIZE_OPTIONS;
     readonly startupBehaviorOptions = SETTINGS_STARTUP_BEHAVIOR_OPTIONS;
+    readonly startupWindowModeOptions = SETTINGS_STARTUP_WINDOW_MODE_OPTIONS;
+    readonly epgViewModeOptions = SETTINGS_EPG_VIEW_MODE_OPTIONS;
 
-    /** Settings form object */
-    settingsForm = this.formBuilder.group({
-        player: [VideoPlayer.VideoJs],
-        ...(this.isDesktop ? { epgUrl: new FormArray([]) } : {}),
-        streamFormat: StreamFormat.M3u8StreamFormat,
-        openStreamOnDoubleClick: false,
-        language: Language.ENGLISH,
-        showCaptions: false,
-        showDashboard: true,
-        startupBehavior: StartupBehavior.FirstView,
-        showExternalPlaybackBar: true,
-        theme: Theme.SystemTheme,
-        mpvPlayerPath: '',
-        mpvPlayerArguments: '',
-        mpvReuseInstance: false,
-        vlcPlayerPath: '',
-        vlcPlayerArguments: '',
-        vlcReuseInstance: false,
-        remoteControl: false,
-        remoteControlPort: [
-            8765,
-            [
-                Validators.required,
-                Validators.min(1),
-                Validators.max(65535),
-                Validators.pattern(/^\d+$/),
-            ],
-        ],
-        recordingFolder: '',
-        coverSize: 'medium' as CoverSize,
-        tmdbApiKey: '',
-        ...(this.isDesktop ? { preferUploadedEpgOverXtream: false } : {}),
-    });
-
-    /** Form array with epg sources */
-    epgUrl = this.settingsForm.get('epgUrl') as FormArray;
-
-    /** Local IP addresses for remote control URL display */
-    localIpAddresses = signal<string[]>([]);
-
-    /** Currently visible QR code IP (null = none visible) */
-    visibleQrCodeIp = signal<string | null>(null);
-    readonly isRemovingAllPlaylists = signal(false);
-    readonly isClearingEpgData = signal(false);
-    readonly isExportingData = signal(false);
-    readonly removeAllProgress = signal<DbOperationEvent | null>(null);
-
-    private settingsStore = inject(SettingsStore);
-    readonly sectionNavItems: SettingsSection[] = buildSettingsSectionNavItems(
-        this.isDesktop
-    );
-
-    readonly playlistDeleteSummary = computed<SettingsPlaylistDeleteSummary>(
-        () => {
-            const items = this.playlists();
-
-            return {
-                total: items.length,
-                m3u: items.filter((item) => !item.serverUrl && !item.macAddress)
-                    .length,
-                xtream: items.filter((item) => Boolean(item.serverUrl)).length,
-                stalker: items.filter((item) => Boolean(item.macAddress))
-                    .length,
-            };
-        }
-    );
-
-    readonly canRemoveAllPlaylists = computed(
-        () =>
-            !this.isRemovingAllPlaylists() &&
-            this.playlistDeleteSummary().total > 0
-    );
-
-    readonly removeAllProgressLabel = computed(() => {
-        if (!this.isRemovingAllPlaylists()) {
-            return null;
-        }
-
-        const progress = this.removeAllProgress();
-        const current = progress?.current;
-        const total = progress?.total;
-
-        if (
-            typeof current === 'number' &&
-            typeof total === 'number' &&
-            total > 0
-        ) {
-            return this.translate.instant('SETTINGS.REMOVE_ALL_PROGRESS', {
-                current,
-                total,
-            });
-        }
-
-        return this.translate.instant('SETTINGS.REMOVE_ALL_IN_PROGRESS');
+    readonly sectionNavItems: SettingsSection[] = buildSettingsSectionNavItems({
+        supportsEpg: this.supportsEpg,
+        supportsRemoteControl: this.supportsRemoteControl,
     });
 
     get sectionNav(): SettingsSection[] {
         return this.sectionNavItems.filter((section) => section.visible);
+    }
+
+    private readonly sectionParam = toSignal(
+        this.route.paramMap.pipe(map((params) => params.get('section'))),
+        { initialValue: null }
+    );
+
+    /**
+     * Section page currently rendered. Unknown or capability-gated params
+     * fall back to the default section while the redirect effect below
+     * rewrites the URL to match.
+     */
+    readonly activeSection = computed(() => {
+        const section = this.sectionParam();
+        return section && this.isNavigableSection(section)
+            ? section
+            : SETTINGS_DEFAULT_SECTION;
+    });
+
+    constructor() {
+        // A stale or hand-typed URL (`/settings/epg` in a runtime without
+        // EPG support, `/settings/nonsense`) must not leave the address bar
+        // lying about what is on screen.
+        effect(() => {
+            const section = this.sectionParam();
+            if (section && !this.isNavigableSection(section)) {
+                void this.router.navigate(
+                    ['/workspace/settings', SETTINGS_DEFAULT_SECTION],
+                    { replaceUrl: true }
+                );
+            }
+        });
+
+        // Section pages share one scroll container (`main.workspace-content`);
+        // without this, opening a long section, scrolling, and switching to a
+        // short one strands the viewport past the new page's content. Instant
+        // on purpose — this is navigation, not an animated transition.
+        effect(() => {
+            this.activeSection();
+            this.hostElement.nativeElement
+                .closest('main.workspace-content')
+                ?.scrollTo({ top: 0 });
+        });
     }
 
     /**
@@ -280,188 +225,37 @@ export class SettingsComponent implements OnInit, OnDestroy {
      * storage (indexed db)
      */
     async ngOnInit(): Promise<void> {
+        // The router guard only covers in-app navigation; this protects the
+        // same edits against window close, app quit, and page reload.
+        this.unloadGuard.activate({
+            form: this.settingsForm,
+            confirmClose: () => this.confirmLeaveWithUnsavedChanges(),
+        });
+
         // Wait for settings to load before setting the form
-        await this.settingsStore.loadSettings();
-        this.setSettings();
-        void this.loadEmbeddedMpvSupport();
-        this.checkAppVersion();
-        void this.fetchLocalIpAddresses();
+        await this.form.loadSettings();
+        this.form.hydrateFromStore();
+        this.form.bindDashboardControlsEnabledState();
+        void this.embeddedMpv.load();
+        this.appUpdate.checkAppVersion();
+        this.appUpdate.init();
+        void this.remoteControl.fetchLocalIpAddresses();
 
-        if (!this.isDialog) {
-            this.settingsCtx.setSections(this.sectionNav);
-        }
-    }
-
-    private async loadEmbeddedMpvSupport(): Promise<void> {
-        if (!this.isDesktop) {
-            this.embeddedMpvSupport.set({
-                supported: false,
-                platform: 'web',
-                reason: 'Embedded MPV requires the Electron desktop build.',
-            });
-            return;
-        }
-
-        if (!window.electron?.getEmbeddedMpvSupport) {
-            this.embeddedMpvSupport.set({
-                supported: false,
-                platform: window.electron.platform,
-                reason: 'Embedded MPV support is not available in this build.',
-            });
-            return;
-        }
-
-        try {
-            this.embeddedMpvSupport.set(
-                await window.electron.getEmbeddedMpvSupport()
-            );
-        } catch (error) {
-            this.embeddedMpvSupport.set({
-                supported: false,
-                platform: window.electron.platform,
-                reason: error instanceof Error ? error.message : String(error),
-            });
-        }
+        this.settingsCtx.setSections(this.sectionNav);
     }
 
     ngOnDestroy(): void {
+        this.appUpdate.dispose();
         this.settingsCtx.reset();
     }
 
-    /**
-     * Fetches local IP addresses for remote control URL display
-     */
-    async fetchLocalIpAddresses(): Promise<void> {
-        if (window.electron?.getLocalIpAddresses) {
-            const addresses = await window.electron.getLocalIpAddresses();
-            this.localIpAddresses.set(addresses);
-        }
-    }
-
-    /**
-     * Toggle QR code visibility for a given IP address
-     */
-    toggleQrCode(ip: string): void {
-        if (this.visibleQrCodeIp() === ip) {
-            this.visibleQrCodeIp.set(null);
-        } else {
-            this.visibleQrCodeIp.set(ip);
-        }
-    }
-
-    /**
-     * Sets saved settings from the indexed db store
-     */
-    setSettings() {
-        const currentSettings = this.settingsStore.getSettings();
-        this.settingsForm.patchValue(currentSettings);
-
-        if (this.isDesktop && currentSettings.epgUrl) {
-            this.epgUrl.clear();
-            this.setEpgUrls(currentSettings.epgUrl);
-        }
-    }
-
-    selectTheme(theme: Theme): void {
-        if (this.settingsForm.value.theme === theme) {
-            return;
-        }
-
-        this.settingsForm.patchValue({ theme });
-        this.settingsForm.get('theme')?.markAsDirty();
-        this.settingsForm.markAsDirty();
-        this.settingsService.changeTheme(theme);
-    }
-
-    selectCoverSize(size: CoverSize): void {
-        if (this.settingsForm.value.coverSize === size) {
-            return;
-        }
-
-        this.settingsForm.patchValue({ coverSize: size });
-        this.settingsForm.get('coverSize')?.markAsDirty();
-        this.settingsForm.markAsDirty();
-        this.settingsStore.updateSettings({ coverSize: size });
-    }
-
+    /** Picks a recording folder in the desktop shell and stages it in the form */
     async selectRecordingFolder(): Promise<void> {
-        if (
-            !this.isDesktop ||
-            !window.electron?.selectEmbeddedMpvRecordingFolder
-        ) {
-            return;
+        const folder = await this.embeddedMpv.selectRecordingFolder();
+
+        if (folder) {
+            this.form.setRecordingFolder(folder);
         }
-
-        const folder = await window.electron.selectEmbeddedMpvRecordingFolder();
-        if (!folder) {
-            return;
-        }
-
-        this.settingsForm.patchValue({ recordingFolder: folder });
-        this.settingsForm.get('recordingFolder')?.markAsDirty();
-        this.settingsForm.markAsDirty();
-    }
-
-    /**
-     * Sets the epg urls to the form array
-     * @param epgUrls urls of the EPG sources
-     */
-    setEpgUrls(epgUrls: string[] | string): void {
-        const urls = Array.isArray(epgUrls) ? epgUrls : [epgUrls];
-        const filteredUrls = urls
-            .map((url) => url.trim())
-            .filter((url) => url !== '');
-
-        filteredUrls.forEach((url) => {
-            this.epgUrl.push(createEpgUrlControl(url));
-        });
-    }
-
-    /**
-     * Checks whether the latest version of the application
-     * is used and updates the version message in the
-     * settings UI
-     */
-    checkAppVersion(): void {
-        this.settingsService
-            .getAppVersion()
-            .pipe(take(1))
-            .subscribe((version) => this.showVersionInformation(version));
-    }
-
-    /**
-     * Updates the message in settings UI about the used
-     * version of the app
-     * @param currentVersion current version of the application
-     */
-    showVersionInformation(currentVersion: string): void {
-        const isOutdated = this.isCurrentVersionOutdated(currentVersion);
-
-        if (isOutdated) {
-            this.updateMessage = `${
-                this.translate.instant(
-                    'SETTINGS.NEW_VERSION_AVAILABLE'
-                ) as string
-            }: ${currentVersion}`;
-        } else {
-            this.updateMessage = this.translate.instant(
-                'SETTINGS.LATEST_VERSION'
-            );
-        }
-    }
-
-    /**
-     * Compares actual with latest version of the
-     * application
-     * @param latestVersion latest version
-     * @returns returns true if an update is available
-     */
-    isCurrentVersionOutdated(latestVersion: string): boolean {
-        this.version = this.dataService.getAppVersion();
-        return this.settingsService.isVersionOutdated(
-            this.version,
-            latestVersion
-        );
     }
 
     /**
@@ -469,268 +263,119 @@ export class SettingsComponent implements OnInit, OnDestroy {
      * the indexed db store
      */
     onSubmit(): void {
-        const settings = {
-            ...this.settingsForm.value,
-            mpvPlayerPath: this.normalizeExternalPlayerPath(
-                this.settingsForm.value.mpvPlayerPath
-            ),
-            vlcPlayerPath: this.normalizeExternalPlayerPath(
-                this.settingsForm.value.vlcPlayerPath
-            ),
-            mpvPlayerArguments: normalizeExternalPlayerArguments(
-                this.settingsForm.value.mpvPlayerArguments
-            ),
-            vlcPlayerArguments: normalizeExternalPlayerArguments(
-                this.settingsForm.value.vlcPlayerArguments
-            ),
-        };
+        void this.persistSettings();
+    }
 
-        this.settingsStore.updateSettings(settings).then(() => {
-            this.applyChangedSettings();
+    /**
+     * Exit gate for `settingsUnsavedChangesGuard`: silently allows leaving
+     * while the form is pristine, otherwise lets the user save, discard, or
+     * stay. A failed save keeps the user in settings — navigating away on a
+     * write that did not land would silently lose the edits the dialog just
+     * promised to keep.
+     */
+    async confirmLeaveWithUnsavedChanges(): Promise<boolean> {
+        if (this.settingsForm.pristine) {
+            return true;
+        }
 
-            if (window.electron) {
-                window.electron.updateSettings(settings);
+        const choice = await firstValueFrom(
+            this.matDialog
+                .open<
+                    SettingsUnsavedChangesDialogComponent,
+                    { canSave: boolean },
+                    SettingsUnsavedChangesChoice
+                >(SettingsUnsavedChangesDialogComponent, {
+                    width: '440px',
+                    data: { canSave: this.settingsForm.valid },
+                })
+                .afterClosed()
+        );
 
-                window.electron.setMpvPlayerPath(settings.mpvPlayerPath);
-                window.electron.setVlcPlayerPath(settings.vlcPlayerPath);
+        if (choice === 'save') {
+            return this.persistSettings();
+        }
+
+        if (choice === 'discard') {
+            // Also reverts the live theme preview — leaving must not keep a
+            // theme the store never saved.
+            this.discardChanges();
+            return true;
+        }
+
+        return false;
+    }
+
+    /** @returns whether the write actually landed */
+    private async persistSettings(): Promise<boolean> {
+        try {
+            await this.form.save(() => this.applyChangedSettings());
+            return true;
+        } catch (error) {
+            if (error instanceof EpgSourceReconciliationError) {
+                this.settingsSnackbar.open(
+                    this.translate.instant('SETTINGS.EPG_DATA_CLEAR_FAILED')
+                );
+                return false;
             }
-        });
-        if (this.isDialog) {
-            this.matDialog.closeAll();
+            // The store already applied the change in memory, so without
+            // this the save looks successful until the next restart. The
+            // unsaved-changes bar stays visible so it can be retried.
+            //
+            // The Electron-side pushes in SettingsFormFacade.save() stay in
+            // the success branch on purpose: main keeps its own copy of the
+            // player paths and remote-control state, and applying half the
+            // form while telling the user nothing was saved is worse than
+            // applying none of it. Once settings live in the main process
+            // (issue #1273) this split disappears.
+            this.settingsSnackbar.storageFailure('save');
+            return false;
         }
     }
 
-    private normalizeExternalPlayerPath(
-        playerPath: string | null | undefined
-    ): string {
-        return playerPath?.trim() ?? '';
+    /**
+     * Throws away every staged form edit and returns to the persisted
+     * settings. `applySavedSettings` also reverts the live theme preview
+     * (`selectTheme` applies immediately) and marks the form pristine, which
+     * hides the unsaved-changes bar.
+     */
+    discardChanges(): void {
+        this.form.hydrateFromStore();
+        this.form.applySavedSettings();
     }
 
     /**
      * Applies the changed settings to the app
      */
     applyChangedSettings(): void {
-        this.settingsForm.markAsPristine();
-        if (this.isDesktop) {
-            let epgUrls = this.settingsForm.value.epgUrl;
-            if (epgUrls) {
-                if (!Array.isArray(epgUrls)) {
-                    epgUrls = [epgUrls];
-                }
-                epgUrls = epgUrls.filter((url) => url !== '');
-                if (epgUrls.length > 0) {
-                    // Fetch all EPG URLs at once
-                    this.epgService.fetchEpg(epgUrls);
-                }
-            }
-        }
-        this.translate.use(this.settingsForm.value.language);
-        this.settingsService.changeTheme(
-            this.settingsForm.value.theme ?? Theme.SystemTheme
-        );
-        this.openSettingsSnackbar(
+        this.form.applySavedSettings();
+        this.epg.fetchConfiguredEpg();
+        this.settingsSnackbar.open(
             this.translate.instant('SETTINGS.SETTINGS_SAVED')
         );
     }
 
-    /**
-     * Navigates back to the applications homepage
-     */
-    backToHome(): void {
-        if (this.isDialog) {
-            this.matDialog.closeAll();
-        } else {
-            this.router.navigateByUrl('/');
-        }
+    async exportData(): Promise<void> {
+        await this.backup.exportData(() => this.waitForUiFeedbackFrame());
+    }
+
+    importData(): void {
+        this.backup.importData(() => this.form.hydrateFromStore());
+    }
+
+    removeAll(): void {
+        this.playlistReset.confirmAndRemoveAll(() =>
+            this.waitForUiFeedbackFrame()
+        );
+    }
+
+    private isNavigableSection(sectionId: string): boolean {
+        return this.sectionNav.some((section) => section.id === sectionId);
     }
 
     /**
-     * Force-fetch EPG for a single URL, bypassing the 12-hour freshness check.
-     * The plain fetchEpg would short-circuit on fresh data and click the
-     * refresh button would be a no-op — that's exactly not what the user
-     * intends when clicking "Refresh".
+     * Lets the browser paint the pending busy state before a long running
+     * task blocks the main thread.
      */
-    refreshEpg(url: string): void {
-        if (!url || !window.electron?.forceFetchEpg) return;
-        void window.electron.forceFetchEpg(url);
-    }
-
-    /**
-     * Force-fetch every configured EPG URL sequentially. Empty fields are
-     * skipped. Each URL flows through the normal progress panel so the user
-     * gets visible per-URL feedback.
-     */
-    refreshAllEpg(): void {
-        if (!window.electron?.forceFetchEpg) return;
-        const urls = (this.epgUrl.value as string[])
-            .map((url) => url?.trim())
-            .filter((url): url is string => Boolean(url));
-        urls.forEach((url) => window.electron.forceFetchEpg(url));
-    }
-
-    /**
-     * Initializes new entry in form array for EPG URL
-     */
-    addEpgSource(): void {
-        this.epgUrl.insert(this.epgUrl.length, createEpgUrlControl());
-    }
-
-    /**
-     * Removes entry from form array for EPG URL
-     * @param index index of the item to remove
-     */
-    removeEpgSource(index: number): void {
-        this.epgUrl.removeAt(index);
-        this.settingsForm.markAsDirty();
-    }
-
-    /**
-     * Clears all EPG data from database and immediately re-fetches every
-     * configured URL so the user isn't left staring at an empty state.
-     * Tracks progress with `isClearingEpgData` so the UI can show a spinner
-     * and block double-clicks, and surfaces failures via a dedicated snackbar.
-     */
-    clearEpgData(): void {
-        this.dialogService.openConfirmDialog({
-            title: this.translate.instant('SETTINGS.CLEAR_EPG_DIALOG.TITLE'),
-            message: this.translate.instant(
-                'SETTINGS.CLEAR_EPG_DIALOG.MESSAGE'
-            ),
-            onConfirm: async (): Promise<void> => {
-                if (
-                    !window.electron?.clearEpgData ||
-                    this.isClearingEpgData()
-                ) {
-                    return;
-                }
-
-                this.isClearingEpgData.set(true);
-                try {
-                    const result = await window.electron.clearEpgData();
-                    if (result && result.success === false) {
-                        throw new Error('Clear EPG returned success=false');
-                    }
-                    this.openSettingsSnackbar(
-                        this.translate.instant('SETTINGS.EPG_DATA_CLEARED')
-                    );
-                    this.refreshAllEpg();
-                } catch (error) {
-                    console.error('Failed to clear EPG data:', error);
-                    this.openSettingsSnackbar(
-                        this.translate.instant('SETTINGS.EPG_DATA_CLEAR_FAILED')
-                    );
-                } finally {
-                    this.isClearingEpgData.set(false);
-                }
-            },
-        });
-    }
-
-    async exportData() {
-        if (this.isExportingData()) {
-            return;
-        }
-
-        this.isExportingData.set(true);
-
-        // Let Angular paint the busy state before the backup build and native
-        // save dialog handoff start.
-        await this.waitForUiFeedbackFrame();
-
-        try {
-            const backup = await this.playlistBackupService.exportBackup();
-
-            if (this.isDesktop && window.electron?.saveFileDialog) {
-                const savePath = await window.electron.saveFileDialog(
-                    backup.defaultFileName,
-                    [
-                        {
-                            name: 'JSON',
-                            extensions: ['json'],
-                        },
-                    ]
-                );
-
-                if (!savePath) {
-                    return;
-                }
-
-                await window.electron.writeFile(savePath, backup.json);
-            } else {
-                const blob = new Blob([backup.json], {
-                    type: 'application/json',
-                });
-                const url = window.URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = backup.defaultFileName;
-                link.click();
-                window.URL.revokeObjectURL(url);
-            }
-
-            this.openSettingsSnackbar('Playlist backup exported.');
-        } catch (error) {
-            console.error('Failed to export playlist backup:', error);
-            this.openSettingsSnackbar('Playlist backup export failed.');
-        } finally {
-            this.isExportingData.set(false);
-        }
-    }
-
-    importData() {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = 'application/json';
-
-        input.addEventListener('change', async (event: Event) => {
-            const target = event.target as HTMLInputElement;
-            const file = target.files?.[0];
-
-            if (file) {
-                try {
-                    const summary =
-                        await this.playlistBackupService.importBackup(
-                            await file.text()
-                        );
-
-                    if (summary.imported > 0 || summary.merged > 0) {
-                        this.store.dispatch(
-                            PlaylistActions.removeAllPlaylists()
-                        );
-                        this.store.dispatch(PlaylistActions.loadPlaylists());
-                    }
-
-                    this.setSettings();
-                    this.openSettingsSnackbar(
-                        this.buildBackupImportSummary(summary)
-                    );
-
-                    if (summary.errors.length > 0) {
-                        console.error(
-                            'Playlist backup import completed with issues:',
-                            summary.errors
-                        );
-                    }
-                } catch (error) {
-                    console.error('Failed to import playlist backup:', error);
-                    this.openSettingsSnackbar(
-                        error instanceof Error
-                            ? error.message
-                            : this.translate.instant('SETTINGS.IMPORT_ERROR')
-                    );
-                }
-            }
-        });
-
-        input.click();
-    }
-
-    private buildBackupImportSummary(
-        summary: PlaylistBackupImportSummary
-    ): string {
-        return `Backup import finished: ${summary.imported} imported, ${summary.merged} merged, ${summary.skipped} skipped, ${summary.failed} failed.`;
-    }
-
     private async waitForUiFeedbackFrame(): Promise<void> {
         if (typeof window.requestAnimationFrame !== 'function') {
             await Promise.resolve();
@@ -739,100 +384,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
 
         await new Promise<void>((resolve) => {
             window.requestAnimationFrame(() => resolve());
-        });
-    }
-
-    removeAll(): void {
-        if (!this.canRemoveAllPlaylists()) {
-            return;
-        }
-
-        this.matDialog
-            .open<
-                SettingsDeleteAllPlaylistsDialogComponent,
-                SettingsDeleteAllPlaylistsDialogData,
-                boolean
-            >(SettingsDeleteAllPlaylistsDialogComponent, {
-                autoFocus: false,
-                data: {
-                    summary: this.playlistDeleteSummary(),
-                },
-                maxWidth: 'calc(100vw - 32px)',
-                restoreFocus: true,
-                width: '460px',
-            })
-            .afterClosed()
-            .pipe(take(1))
-            .subscribe((confirmed) => {
-                if (confirmed) {
-                    void this.removeAllConfirmed();
-                }
-            });
-    }
-
-    private async removeAllConfirmed(): Promise<void> {
-        if (this.isRemovingAllPlaylists()) {
-            return;
-        }
-
-        this.isRemovingAllPlaylists.set(true);
-        this.removeAllProgress.set(null);
-
-        await this.waitForUiFeedbackFrame();
-
-        try {
-            const deleted =
-                this.isDesktop && window.electron
-                    ? await this.deleteAllPlaylistsInElectron()
-                    : await this.deleteAllPlaylistsInBrowser();
-
-            if (!deleted) {
-                throw new Error('Delete all playlists returned success=false');
-            }
-
-            this.store.dispatch(PlaylistActions.removeAllPlaylists());
-            this.openSettingsSnackbar(
-                this.translate.instant('SETTINGS.PLAYLISTS_REMOVED')
-            );
-        } catch (error) {
-            console.error('Error removing playlists:', error);
-            this.openSettingsSnackbar(
-                this.translate.instant('SETTINGS.PLAYLISTS_REMOVE_FAILED')
-            );
-        } finally {
-            this.removeAllProgress.set(null);
-            this.isRemovingAllPlaylists.set(false);
-        }
-    }
-
-    private async deleteAllPlaylistsInElectron(): Promise<boolean> {
-        return this.databaseService.deleteAllPlaylists({
-            operationId: this.databaseService.createOperationId(
-                'settings-delete-all-playlists'
-            ),
-            onEvent: (event) => this.handleDeleteAllPlaylistsEvent(event),
-        });
-    }
-
-    private async deleteAllPlaylistsInBrowser(): Promise<boolean> {
-        await firstValueFrom(this.playlistsService.removeAll());
-        return true;
-    }
-
-    private handleDeleteAllPlaylistsEvent(event: DbOperationEvent): void {
-        this.removeAllProgress.set(event);
-    }
-
-    private openSettingsSnackbar(
-        message: string,
-        config: MatSnackBarConfig = {}
-    ): void {
-        this.snackBar.open(message, undefined, {
-            duration: 2000,
-            horizontalPosition: 'center',
-            verticalPosition: 'bottom',
-            panelClass: ['settings-snackbar'],
-            ...config,
         });
     }
 }

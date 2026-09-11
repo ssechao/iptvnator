@@ -1,5 +1,12 @@
 import { XtreamVodDetails } from './xtream-vod-details.interface';
 import { StalkerVodDetails } from './stalker-vod-details.interface';
+import {
+    TmdbCountryFacet,
+    TmdbEnrichedCastMember,
+    TmdbGenreFacet,
+    TmdbMediaType,
+    TmdbRecommendation,
+} from './tmdb.interface';
 
 /**
  * Discriminated union for VOD details across portal types.
@@ -79,6 +86,18 @@ export interface NormalizedVodMeta {
     ratingKinopoisk?: string;
     /** YouTube trailer ID (Xtream only) */
     youtubeTrailer?: string;
+    /** Cast with profile photos, populated by TMDB enrichment */
+    tmdbCast?: TmdbEnrichedCastMember[];
+    /** Directors (movies) / creators (series) as clickable person chips */
+    tmdbDirectors?: TmdbEnrichedCastMember[];
+    /** TMDB recommendations (drives the cross-portal "Similar" rail) */
+    tmdbRecommendations?: TmdbRecommendation[];
+    /** Media type the enrichment matched as; Discover click routing */
+    tmdbMediaType?: TmdbMediaType;
+    /** Per-entry clickable genre chips (Discover page) */
+    tmdbGenres?: TmdbGenreFacet[];
+    /** Per-entry clickable country chips (Discover page) */
+    tmdbCountries?: TmdbCountryFacet[];
 }
 
 /**

@@ -9,6 +9,7 @@ import {
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatInputModule } from '@angular/material/input';
 import { TranslatePipe } from '@ngx-translate/core';
+import { RuntimeCapabilitiesService } from '@iptvnator/services';
 
 @Component({
     selector: 'app-url-upload',
@@ -22,12 +23,14 @@ import { TranslatePipe } from '@ngx-translate/core';
 })
 export class UrlUploadComponent implements OnInit {
     private readonly fb = inject(FormBuilder);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
 
     form!: FormGroup<{
         playlistName: FormControl<string>;
         playlistUrl: FormControl<string>;
+        userAgent: FormControl<string>;
     }>;
-    readonly isDesktop = !!window.electron;
+    readonly isDesktop = this.runtime.isElectron;
 
     ngOnInit(): void {
         const urlRegex = '(https?://.*?)';
@@ -37,6 +40,7 @@ export class UrlUploadComponent implements OnInit {
                 [Validators.required, Validators.pattern(urlRegex)],
             ],
             playlistName: [''],
+            userAgent: [''],
         });
     }
 
@@ -44,6 +48,7 @@ export class UrlUploadComponent implements OnInit {
         this.form.reset({
             playlistName: '',
             playlistUrl: '',
+            userAgent: '',
         });
     }
 }

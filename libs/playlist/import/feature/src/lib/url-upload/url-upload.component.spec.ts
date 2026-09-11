@@ -4,13 +4,21 @@ import { MatFormFieldModule } from '@angular/material/form-field';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
 import { TranslateModule } from '@ngx-translate/core';
 import { MockModule } from 'ng-mocks';
+import { RuntimeCapabilitiesService } from '@iptvnator/services';
 import { UrlUploadComponent } from './url-upload.component';
 
 describe('UrlUploadComponent', () => {
     let component: UrlUploadComponent;
     let fixture: ComponentFixture<UrlUploadComponent>;
+    let runtime: {
+        isElectron: boolean;
+    };
 
     beforeEach(waitForAsync(() => {
+        runtime = {
+            isElectron: true,
+        };
+
         TestBed.configureTestingModule({
             imports: [
                 UrlUploadComponent,
@@ -19,6 +27,12 @@ describe('UrlUploadComponent', () => {
                 MockModule(ReactiveFormsModule),
                 TranslateModule.forRoot(),
                 NoopAnimationsModule,
+            ],
+            providers: [
+                {
+                    provide: RuntimeCapabilitiesService,
+                    useValue: runtime,
+                },
             ],
         }).compileComponents();
     }));
@@ -33,10 +47,27 @@ describe('UrlUploadComponent', () => {
         expect(component).toBeTruthy();
     });
 
+    it('shows the CORS note only when Electron is unavailable', () => {
+        expect(
+            (fixture.nativeElement as HTMLElement).querySelector('.cors-note')
+        ).toBeNull();
+
+        fixture.destroy();
+        runtime.isElectron = false;
+        fixture = TestBed.createComponent(UrlUploadComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        expect(
+            (fixture.nativeElement as HTMLElement).querySelector('.cors-note')
+        ).not.toBeNull();
+    });
+
     it('accepts an optional playlist name without affecting url validation', () => {
         const testUrl = 'http://example.org/playlist.m3u';
 
         component.form.setValue({
+            userAgent: '',
             playlistName: '  Custom Playlist  ',
             playlistUrl: 'wrong url here',
         });
@@ -44,6 +75,7 @@ describe('UrlUploadComponent', () => {
         expect(component.form.valid).toBeFalsy();
 
         component.form.setValue({
+            userAgent: '',
             playlistName: '',
             playlistUrl: testUrl,
         });
@@ -51,6 +83,7 @@ describe('UrlUploadComponent', () => {
         expect(component.form.valid).toBeTruthy();
 
         component.form.setValue({
+            userAgent: '',
             playlistName: '   ',
             playlistUrl: testUrl,
         });
@@ -60,6 +93,7 @@ describe('UrlUploadComponent', () => {
 
     it('clears the url playlist form', () => {
         component.form.setValue({
+            userAgent: 'IPTVnator-Test/1.0',
             playlistName: 'News',
             playlistUrl: 'http://example.org/playlist.m3u',
         });
@@ -70,6 +104,7 @@ describe('UrlUploadComponent', () => {
         expect(component.form.getRawValue()).toEqual({
             playlistName: '',
             playlistUrl: '',
+            userAgent: '',
         });
         expect(component.form.pristine).toBeTruthy();
     });

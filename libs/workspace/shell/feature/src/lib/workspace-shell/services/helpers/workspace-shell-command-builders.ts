@@ -27,9 +27,9 @@ export interface CommandBuilderContext {
     context: WorkspacePortalContext | null;
     section: PortalRailSection | null;
     hasActivePlaylist: boolean;
-    hasXtreamPlaylists: boolean;
+    hasSearchablePlaylists: boolean;
     canRefreshPlaylist: boolean;
-    isElectron: boolean;
+    supportsDownloads: boolean;
     showDashboard: boolean;
     translate: TranslateFn;
     router: Router;
@@ -128,9 +128,13 @@ export function getPlaylistCommandDefinitions(
             icon: 'account_circle',
             labelKey: 'WORKSPACE.SHELL.COMMANDS.ACCOUNT_INFO_LABEL',
             descriptionKey:
-                'WORKSPACE.SHELL.COMMANDS.ACCOUNT_INFO_DESCRIPTION',
+                context.provider === 'stalker'
+                    ? 'WORKSPACE.SHELL.COMMANDS.ACCOUNT_INFO_DESCRIPTION_STALKER'
+                    : 'WORKSPACE.SHELL.COMMANDS.ACCOUNT_INFO_DESCRIPTION',
             priority: 40,
-            visible: context.provider === 'xtreams',
+            visible:
+                context.provider === 'xtreams' ||
+                context.provider === 'stalker',
             run: () => ctx.actions.openAccountInfo(),
         },
     ];
@@ -139,8 +143,13 @@ export function getPlaylistCommandDefinitions(
 export function getGlobalCommandDefinitions(
     ctx: CommandBuilderContext
 ): WorkspaceCommandContribution[] {
-    const { route, hasXtreamPlaylists, isElectron, showDashboard, actions } =
-        ctx;
+    const {
+        route,
+        hasSearchablePlaylists,
+        supportsDownloads,
+        showDashboard,
+        actions,
+    } = ctx;
 
     return [
         {
@@ -151,8 +160,8 @@ export function getGlobalCommandDefinitions(
             descriptionKey:
                 'WORKSPACE.SHELL.COMMANDS.GLOBAL_SEARCH_DESCRIPTION',
             priority: 10,
-            visible: hasXtreamPlaylists,
-            keywords: ['xtream'],
+            visible: hasSearchablePlaylists && route.kind !== 'global-search',
+            keywords: ['xtream', 'm3u', 'live'],
             run: ({ query }) => actions.openGlobalSearch(query),
         },
         {
@@ -185,7 +194,7 @@ export function getGlobalCommandDefinitions(
             descriptionKey:
                 'WORKSPACE.SHELL.COMMANDS.OPEN_DOWNLOADS_DESCRIPTION',
             priority: 40,
-            visible: isElectron && route.kind !== 'downloads',
+            visible: supportsDownloads && route.kind !== 'downloads',
             run: () => actions.openDownloadsShortcut(),
         },
         {

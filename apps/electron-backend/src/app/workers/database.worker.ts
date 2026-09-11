@@ -1,9 +1,12 @@
+import { migrateAppPlaylists } from '../database/operations/playlist-migration.operations';
 import {
     closeWorkerDatabase,
     getWorkerDatabase,
 } from './database.worker-connection';
 import { parentPort } from 'worker_threads';
 import type {
+    ContentMetadataPatch,
+    VodSourcePin,
     XtreamBackupFavoriteItem,
     XtreamBackupRecentlyViewedItem,
 } from '@iptvnator/shared/interfaces';
@@ -43,29 +46,36 @@ import {
     saveContent,
     searchContent,
 } from '../database/operations/content.operations';
-import { setContentBackdropIfMissing } from '../database/operations/content-backdrop.operations';
+import { setContentMetadataIfMissing } from '../database/operations/content-metadata.operations';
 import {
     clearAllPlaybackPositions,
     clearPlaybackPosition,
+    clearPlaybackPositionsBatch,
     getAllPlaybackPositions,
     getPlaybackPosition,
     getRecentPlaybackPositions,
     getSeriesPlaybackPositions,
     savePlaybackPosition,
+    savePlaybackPositionsBatch,
 } from '../database/operations/playback-position.operations';
 import {
     createPlaylist,
     deleteAllPlaylists,
     deletePlaylist,
     getAppPlaylist,
+    getAppPlaylistFavoriteChannels,
+    getAppPlaylistMetas,
     getAppPlaylists,
     getAppState,
     getPlaylist,
     setAppState,
+    type AppPlaylistGetPhaseCapture,
+    type AppPlaylistUpsertPhaseCapture,
     updatePlaylist,
     upsertAppPlaylist,
     upsertAppPlaylists,
 } from '../database/operations/playlist.operations';
+import { setPlaylistServerTimezone } from '../database/operations/playlist-server-timezone.operations';
 import {
     addRecentItem,
     clearPlaylistRecentItems,
@@ -75,19 +85,73 @@ import {
     removeRecentItem,
     removeRecentItemsBatch,
 } from '../database/operations/recently-viewed.operations';
+import { matchTitles } from '../database/operations/title-match.operations';
+import {
+    findTitleSources,
+    type FindTitleSourcesRequest,
+} from '../database/operations/title-sources.operations';
+import {
+    clearTmdbMetadata,
+    getTmdbCacheStats,
+    getTmdbMetadata,
+    setTmdbMetadata,
+} from '../database/operations/tmdb.operations';
+import {
+    clearVodSourcePin,
+    getVodSourcePin,
+    clearVodSourcePinsForPlaylist,
+    replaceVodSourcePinsForPlaylist,
+    listVodSourcePinsForPlaylist,
+    setVodSourcePin,
+} from '../database/operations/vod-source-pin.operations';
 import {
     deleteXtreamContent,
     restoreXtreamUserData,
 } from '../database/operations/xtream.operations';
+import {
+    armWorkerPerformanceCapture,
+    executeWithWorkerPerformanceCapture,
+    registerDatabaseWorkerPerformanceCapture,
+    releaseDatabaseWorkerPerformanceCapture,
+    stampWorkerPerformanceResponsePostedEpoch,
+    startWorkerPerformanceCapture,
+    type WorkerPerformanceCapture,
+} from './worker-performance-capture';
+import {
+    captureWorkerPerformancePhase,
+    captureWorkerPerformancePhaseAsync,
+    createWorkerPerformancePhaseAdapter,
+} from './worker-performance-phase';
+import {
+    handleDatabaseWorkerPostGcHeapRequest,
+    isDatabaseWorkerPostGcHeapRequest,
+} from './database-worker-post-gc-heap';
+import { publishDatabaseWorkerCancelReceipt } from './database-worker-cancel-receipt';
+import {
+    createProgressEventThrottle,
+    type ProgressEventThrottle,
+} from './operation-progress-throttle';
 
 const loggerLabel = '[DB Worker]';
 const batchDelayMs = Number.parseInt(
     process.env['IPTVNATOR_DB_WORKER_BATCH_DELAY_MS'] ?? '0',
     10
 );
+/**
+ * Shortest gap between two progress events of one operation. Phase starts,
+ * phase completions and terminal events are never held back; see
+ * `operation-progress-throttle.ts`.
+ */
+const progressEventMinIntervalMs = 100;
 
 type ActiveOperationState = {
     cancelled: boolean;
+    performanceRequestId?: string;
+};
+
+type PreRegisteredActiveOperation = {
+    operationId: string;
+    state: ActiveOperationState;
 };
 
 type OperationController = {
@@ -115,6 +179,7 @@ type OperationController = {
 };
 
 const activeOperations = new Map<string, ActiveOperationState>();
+const activePerformanceCaptures = new Set<WorkerPerformanceCapture>();
 
 if (!parentPort) {
     throw new Error('Database worker must be started with a parent port');
@@ -158,29 +223,38 @@ function postEvent(requestId: string, event: DbOperationEvent): void {
 
 async function pauseBetweenBatches(): Promise<void> {
     if (batchDelayMs <= 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
         return;
     }
 
     await new Promise((resolve) => setTimeout(resolve, batchDelayMs));
 }
 
-function createOperationController(config: {
-    operationId?: string;
-    operation: string;
-    playlistId?: string;
-    requestId: string;
-    cancellable?: boolean;
-}): OperationController {
+function createOperationController(
+    config: {
+        operationId?: string;
+        operation: string;
+        playlistId?: string;
+        requestId: string;
+        cancellable?: boolean;
+    },
+    preRegisteredState?: ActiveOperationState
+): OperationController {
     const { operationId, operation, playlistId, requestId } = config;
     const cancellable = config.cancellable ?? true;
     const activeState =
-        operationId && cancellable ? { cancelled: false } : null;
+        operationId && cancellable
+            ? (preRegisteredState ?? { cancelled: false })
+            : null;
 
     if (operationId && activeState) {
         activeOperations.set(operationId, activeState);
     }
 
     let lastEvent: Partial<DbOperationEvent> = {};
+    const progressThrottle = createProgressEventThrottle({
+        minIntervalMs: progressEventMinIntervalMs,
+    });
 
     const send = (
         status: DbOperationEvent['status'],
@@ -218,30 +292,44 @@ function createOperationController(config: {
         }
     };
 
+    const sendProgress = (
+        updates: ReturnType<ProgressEventThrottle['push']>
+    ): void => {
+        for (const update of updates) {
+            send('progress', update);
+        }
+    };
+
     return {
         control: {
             checkpoint,
             onProgress: async (progress) => {
-                send('progress', progress);
+                sendProgress(progressThrottle.push(progress));
             },
         },
         emitStarted: (event) => {
             send('started', event);
         },
         emitCompleted: (event) => {
+            sendProgress(progressThrottle.flush());
             send('completed', event);
         },
         emitCancelled: (event) => {
+            sendProgress(progressThrottle.flush());
             send('cancelled', event);
         },
         emitError: (error, event) => {
+            sendProgress(progressThrottle.flush());
             send('error', {
                 ...event,
                 error: error instanceof Error ? error.message : String(error),
             });
         },
         cleanup: () => {
-            if (operationId) {
+            if (
+                operationId &&
+                activeOperations.get(operationId) === activeState
+            ) {
                 activeOperations.delete(operationId);
             }
         },
@@ -250,9 +338,10 @@ function createOperationController(config: {
 
 async function executeTrackedOperation<TResult>(
     config: Parameters<typeof createOperationController>[0],
-    handler: (controller: OperationController) => Promise<TResult>
+    handler: (controller: OperationController) => Promise<TResult>,
+    preRegisteredState?: ActiveOperationState
 ): Promise<TResult> {
-    const controller = createOperationController(config);
+    const controller = createOperationController(config, preRegisteredState);
 
     try {
         return await handler(controller);
@@ -268,7 +357,54 @@ async function executeTrackedOperation<TResult>(
     }
 }
 
-async function executeRequest(message: DbWorkerRequestMessage) {
+function preRegisterCancellableOperation(
+    message: DbWorkerRequestMessage
+): PreRegisteredActiveOperation | null {
+    switch (message.operation) {
+        case 'DB_SAVE_CONTENT':
+        case 'DB_DELETE_PLAYLIST':
+        case 'DB_DELETE_XTREAM_CONTENT':
+        case 'DB_RESTORE_XTREAM_USER_DATA':
+            break;
+        default:
+            return null;
+    }
+
+    if (
+        typeof message.payload !== 'object' ||
+        message.payload === null ||
+        Array.isArray(message.payload)
+    ) {
+        return null;
+    }
+    const operationId = (message.payload as Record<string, unknown>)[
+        'operationId'
+    ];
+    if (typeof operationId !== 'string' || operationId.length === 0) {
+        return null;
+    }
+
+    const state: ActiveOperationState = { cancelled: false };
+    activeOperations.set(operationId, state);
+    return { operationId, state };
+}
+
+function releasePreRegisteredOperation(
+    operation: PreRegisteredActiveOperation | null
+): void {
+    if (
+        operation &&
+        activeOperations.get(operation.operationId) === operation.state
+    ) {
+        activeOperations.delete(operation.operationId);
+    }
+}
+
+async function executeRequest(
+    message: DbWorkerRequestMessage,
+    preRegisteredState?: ActiveOperationState,
+    performanceCapture: WorkerPerformanceCapture | null = null
+) {
     const db = await getWorkerDatabase();
 
     switch (message.operation) {
@@ -285,7 +421,14 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 playlistId: string;
                 type: 'live' | 'movies' | 'series';
             };
-            return getCategories(db, payload.playlistId, payload.type);
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
+            return getCategories(
+                db,
+                payload.playlistId,
+                payload.type,
+                capturePhase
+            );
         }
 
         case 'DB_SAVE_CATEGORIES': {
@@ -298,12 +441,15 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 type: 'live' | 'movies' | 'series';
                 hiddenCategoryXtreamIds?: number[];
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
             return saveCategories(
                 db,
                 payload.playlistId,
                 payload.categories,
                 payload.type,
-                payload.hiddenCategoryXtreamIds
+                payload.hiddenCategoryXtreamIds,
+                capturePhase
             );
         }
 
@@ -340,7 +486,14 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 playlistId: string;
                 type: 'live' | 'movie' | 'series';
             };
-            return getContent(db, payload.playlistId, payload.type);
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
+            return getContent(
+                db,
+                payload.playlistId,
+                payload.type,
+                capturePhase
+            );
         }
 
         case 'DB_GET_GLOBAL_RECENTLY_ADDED': {
@@ -348,11 +501,7 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 kind?: 'all' | 'vod' | 'series';
                 limit?: number;
                 playlistType?:
-                    | 'xtream'
-                    | 'stalker'
-                    | 'm3u-file'
-                    | 'm3u-text'
-                    | 'm3u-url';
+                    'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url';
             };
             return getGlobalRecentlyAdded(
                 db,
@@ -369,6 +518,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 type: 'live' | 'movie' | 'series';
                 operationId?: string;
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
 
             return executeTrackedOperation(
                 {
@@ -389,7 +540,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                         payload.playlistId,
                         payload.streams,
                         payload.type,
-                        controller.control
+                        controller.control,
+                        capturePhase
                     );
 
                     controller.emitCompleted({
@@ -399,7 +551,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     });
 
                     return result;
-                }
+                },
+                preRegisteredState
             );
         }
 
@@ -408,8 +561,15 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 playlistId: string;
                 type: 'live' | 'movie' | 'series';
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
 
-            return clearXtreamImportCache(db, payload.playlistId, payload.type);
+            return clearXtreamImportCache(
+                db,
+                payload.playlistId,
+                payload.type,
+                capturePhase
+            );
         }
 
         case 'DB_GET_CONTENT_BY_XTREAM_ID': {
@@ -426,15 +586,15 @@ async function executeRequest(message: DbWorkerRequestMessage) {
             );
         }
 
-        case 'DB_SET_CONTENT_BACKDROP_IF_MISSING': {
+        case 'DB_SET_CONTENT_METADATA_IF_MISSING': {
             const payload = message.payload as {
                 contentId: number;
-                backdropUrl?: string;
+                patch?: ContentMetadataPatch;
             };
-            return setContentBackdropIfMissing(
+            return setContentMetadataIfMissing(
                 db,
                 payload.contentId,
-                payload.backdropUrl
+                payload.patch
             );
         }
 
@@ -445,12 +605,15 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 types: string[];
                 excludeHidden?: boolean;
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
             return searchContent(
                 db,
                 payload.playlistId,
                 payload.searchTerm,
                 payload.types,
-                payload.excludeHidden
+                payload.excludeHidden,
+                capturePhase
             );
         }
 
@@ -459,12 +622,19 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 searchTerm: string;
                 types: string[];
                 excludeHidden?: boolean;
+                sources?: Array<'xtream' | 'm3u'>;
+                options?: {
+                    limit?: number;
+                    offset?: number;
+                };
             };
             return globalSearch(
                 db,
                 payload.searchTerm,
                 payload.types,
-                payload.excludeHidden
+                payload.excludeHidden,
+                payload.sources,
+                payload.options
             );
         }
 
@@ -485,10 +655,38 @@ async function executeRequest(message: DbWorkerRequestMessage) {
         }
 
         case 'DB_UPSERT_APP_PLAYLIST': {
+            const capturePhase: AppPlaylistUpsertPhaseCapture | undefined =
+                performanceCapture
+                    ? {
+                          captureAsync: (phase, execute, metadata) =>
+                              captureWorkerPerformancePhaseAsync(
+                                  performanceCapture,
+                                  phase,
+                                  execute,
+                                  metadata
+                              ),
+                          captureSync: (phase, execute, metadata) =>
+                              captureWorkerPerformancePhase(
+                                  performanceCapture,
+                                  phase,
+                                  execute,
+                                  metadata
+                              ),
+                      }
+                    : undefined;
             return upsertAppPlaylist(
                 db,
-                message.payload as Record<string, unknown>
+                message.payload as Record<string, unknown>,
+                capturePhase
             );
+        }
+
+        case 'DB_MIGRATE_APP_PLAYLISTS': {
+            const payload = message.payload as {
+                playlists: Record<string, unknown>[];
+                key?: string;
+            };
+            return migrateAppPlaylists(db, payload.playlists, payload.key);
         }
 
         case 'DB_UPSERT_APP_PLAYLISTS': {
@@ -501,14 +699,59 @@ async function executeRequest(message: DbWorkerRequestMessage) {
         case 'DB_GET_APP_PLAYLISTS':
             return getAppPlaylists(db);
 
+        case 'DB_GET_APP_PLAYLIST_METAS':
+            return getAppPlaylistMetas(db);
+
         case 'DB_GET_APP_PLAYLIST': {
             const payload = message.payload as { playlistId: string };
-            return getAppPlaylist(db, payload.playlistId);
+            const capturePhase: AppPlaylistGetPhaseCapture | undefined =
+                performanceCapture
+                    ? {
+                          captureAsync: (phase, execute, metadata) =>
+                              captureWorkerPerformancePhaseAsync(
+                                  performanceCapture,
+                                  phase,
+                                  execute,
+                                  metadata
+                              ),
+                          captureSync: (phase, execute, metadata) =>
+                              captureWorkerPerformancePhase(
+                                  performanceCapture,
+                                  phase,
+                                  execute,
+                                  metadata
+                              ),
+                      }
+                    : undefined;
+            return getAppPlaylist(db, payload.playlistId, capturePhase);
+        }
+
+        case 'DB_GET_APP_PLAYLIST_FAVORITE_CHANNELS': {
+            const payload = message.payload as { playlistId: string };
+            return getAppPlaylistFavoriteChannels(db, payload.playlistId);
         }
 
         case 'DB_GET_PLAYLIST': {
             const payload = message.payload as { playlistId: string };
             return getPlaylist(db, payload.playlistId);
+        }
+
+        case 'DB_SET_PLAYLIST_SERVER_TIMEZONE': {
+            const payload = message.payload as {
+                playlistId: string;
+                connection: {
+                    serverUrl: string;
+                    username: string;
+                    password: string;
+                };
+                serverTimezone: string;
+            };
+            return setPlaylistServerTimezone(
+                db,
+                payload.playlistId,
+                payload.connection,
+                payload.serverTimezone
+            );
         }
 
         case 'DB_UPDATE_PLAYLIST': {
@@ -532,6 +775,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 playlistId: string;
                 operationId?: string;
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
 
             return executeTrackedOperation(
                 {
@@ -549,7 +794,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     const result = await deletePlaylist(
                         db,
                         payload.playlistId,
-                        controller.control
+                        controller.control,
+                        capturePhase
                     );
 
                     controller.emitCompleted({
@@ -559,7 +805,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     });
 
                     return result;
-                }
+                },
+                preRegisteredState
             );
         }
 
@@ -571,6 +818,91 @@ async function executeRequest(message: DbWorkerRequestMessage) {
         case 'DB_SET_APP_STATE': {
             const payload = message.payload as { key: string; value: string };
             return setAppState(db, payload.key, payload.value);
+        }
+
+        case 'DB_GET_TMDB_METADATA': {
+            const payload = message.payload as {
+                mediaType: 'movie' | 'tv';
+                lookupKey: string;
+                language: string;
+            };
+            return getTmdbMetadata(
+                db,
+                payload.mediaType,
+                payload.lookupKey,
+                payload.language
+            );
+        }
+
+        case 'DB_SET_TMDB_METADATA': {
+            const payload = message.payload as {
+                entry: Parameters<typeof setTmdbMetadata>[1];
+            };
+            return setTmdbMetadata(db, payload.entry);
+        }
+
+        case 'DB_GET_TMDB_CACHE_STATS':
+            return getTmdbCacheStats(db);
+
+        case 'DB_CLEAR_TMDB_METADATA':
+            return clearTmdbMetadata(db);
+
+        case 'DB_MATCH_TITLES': {
+            const payload = message.payload as { titles: string[] };
+            return matchTitles(db, payload.titles);
+        }
+
+        case 'DB_FIND_TITLE_SOURCES': {
+            const payload = message.payload as {
+                request: FindTitleSourcesRequest;
+            };
+            return findTitleSources(db, payload.request);
+        }
+
+        case 'DB_GET_VOD_SOURCE_PIN': {
+            const payload = message.payload as { matchKeys: string[] };
+            return getVodSourcePin(db, payload.matchKeys);
+        }
+
+        case 'DB_CLEAR_VOD_SOURCE_PINS_FOR_PLAYLIST': {
+            const payload = message.payload as { playlistId: string };
+            return clearVodSourcePinsForPlaylist(db, payload.playlistId);
+        }
+
+        case 'DB_LIST_VOD_SOURCE_PINS': {
+            const payload = message.payload as { playlistId: string };
+            return listVodSourcePinsForPlaylist(db, payload.playlistId);
+        }
+
+        case 'DB_SET_VOD_SOURCE_PIN': {
+            const payload = message.payload as {
+                pin: VodSourcePin;
+                retireKeys?: string[];
+                aliasKeys?: string[];
+            };
+            return setVodSourcePin(
+                db,
+                payload.pin,
+                payload.retireKeys ?? [],
+                payload.aliasKeys ?? []
+            );
+        }
+
+        case 'DB_REPLACE_VOD_SOURCE_PINS': {
+            const payload = message.payload as {
+                playlistId: string;
+                pins: VodSourcePin[];
+            };
+            return replaceVodSourcePinsForPlaylist(
+                db,
+                payload.playlistId,
+                payload.pins ?? []
+            );
+        }
+
+        case 'DB_CLEAR_VOD_SOURCE_PIN': {
+            const payload = message.payload as { matchKeys: string[] };
+            return clearVodSourcePin(db, payload.matchKeys);
         }
 
         case 'DB_DELETE_ALL_PLAYLISTS': {
@@ -611,6 +943,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 playlistId: string;
                 operationId?: string;
             };
+            const capturePhase =
+                createWorkerPerformancePhaseAdapter(performanceCapture);
 
             return executeTrackedOperation(
                 {
@@ -628,7 +962,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     const result = await deleteXtreamContent(
                         db,
                         payload.playlistId,
-                        controller.control
+                        controller.control,
+                        capturePhase
                     );
 
                     controller.emitCompleted({
@@ -636,7 +971,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     });
 
                     return result;
-                }
+                },
+                preRegisteredState
             );
         }
 
@@ -680,7 +1016,8 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                     });
 
                     return result;
-                }
+                },
+                preRegisteredState
             );
         }
 
@@ -724,7 +1061,11 @@ async function executeRequest(message: DbWorkerRequestMessage) {
 
         case 'DB_REORDER_GLOBAL_FAVORITES': {
             const payload = message.payload as {
-                updates: { content_id: number; position: number }[];
+                updates: {
+                    content_id: number;
+                    playlist_id: string;
+                    position: number;
+                }[];
             };
             return reorderGlobalFavorites(db, payload.updates);
         }
@@ -854,37 +1195,134 @@ async function executeRequest(message: DbWorkerRequestMessage) {
                 payload.contentType
             );
         }
+
+        case 'DB_SAVE_PLAYBACK_POSITIONS_BATCH': {
+            const payload = message.payload as {
+                playlistId: string;
+                items: {
+                    contentXtreamId: number;
+                    contentType: 'vod' | 'episode';
+                    seriesXtreamId?: number;
+                    seasonNumber?: number;
+                    episodeNumber?: number;
+                    positionSeconds: number;
+                    durationSeconds?: number;
+                    playlistType?:
+                        | 'xtream'
+                        | 'stalker'
+                        | 'm3u-file'
+                        | 'm3u-text'
+                        | 'm3u-url';
+                }[];
+            };
+            return savePlaybackPositionsBatch(
+                db,
+                payload.playlistId,
+                payload.items
+            );
+        }
+
+        case 'DB_CLEAR_PLAYBACK_POSITIONS_BATCH': {
+            const payload = message.payload as {
+                playlistId: string;
+                items: {
+                    contentXtreamId: number;
+                    contentType: 'vod' | 'episode';
+                }[];
+            };
+            return clearPlaybackPositionsBatch(
+                db,
+                payload.playlistId,
+                payload.items
+            );
+        }
     }
 }
 
 parentPort.on('message', async (message: DbWorkerIncomingMessage) => {
+    if (isDatabaseWorkerPostGcHeapRequest(message)) {
+        handleDatabaseWorkerPostGcHeapRequest(
+            message,
+            activePerformanceCaptures.size === 0
+        );
+        return;
+    }
+
     if (message.type === 'cancel') {
         const activeOperation = activeOperations.get(message.operationId);
         if (activeOperation) {
             activeOperation.cancelled = true;
+            if (activeOperation.performanceRequestId !== undefined) {
+                publishDatabaseWorkerCancelReceipt(
+                    message.operationId,
+                    activeOperation.performanceRequestId,
+                    postMessage
+                );
+            }
         }
         return;
     }
 
-    try {
-        const result = await executeRequest(message);
+    const preRegisteredOperation = preRegisterCancellableOperation(message);
+    let performanceCapture: WorkerPerformanceCapture | null = null;
+    const execution = await (async () => {
+        try {
+            performanceCapture = startWorkerPerformanceCapture({
+                requestId: message.requestId,
+            });
+            if (performanceCapture && preRegisteredOperation) {
+                preRegisteredOperation.state.performanceRequestId =
+                    message.requestId;
+            }
+            registerDatabaseWorkerPerformanceCapture(
+                activePerformanceCaptures,
+                performanceCapture
+            );
+            await armWorkerPerformanceCapture(performanceCapture);
+            return await executeWithWorkerPerformanceCapture(
+                performanceCapture,
+                () =>
+                    executeRequest(
+                        message,
+                        preRegisteredOperation?.state,
+                        performanceCapture
+                    )
+            );
+        } finally {
+            releaseDatabaseWorkerPerformanceCapture(
+                activePerformanceCaptures,
+                performanceCapture
+            );
+            releasePreRegisteredOperation(preRegisteredOperation);
+        }
+    })();
+
+    if (execution.success) {
         postMessage({
             type: 'response',
             requestId: message.requestId,
             success: true,
-            result,
+            result: execution.result,
+            performance: stampWorkerPerformanceResponsePostedEpoch(
+                performanceCapture,
+                execution.performance
+            ),
         });
-    } catch (error) {
+    } else {
         console.error(
             loggerLabel,
             `Error handling ${message.operation}:`,
-            error
+            execution.error
         );
         postMessage({
             type: 'response',
             requestId: message.requestId,
             success: false,
-            error: serializeError(error),
+            error: serializeError(execution.error),
+            performance: stampWorkerPerformanceResponsePostedEpoch(
+                performanceCapture,
+                execution.performance
+            ),
         });
     }
 });

@@ -9,6 +9,11 @@ const loadDownloadsComponent: ComponentLoader = () =>
         (c) => c.DownloadsComponent
     );
 
+const loadDownloadOfflineDetailComponent: ComponentLoader = () =>
+    import('@iptvnator/portal/downloads/feature').then(
+        (c) => c.DownloadOfflineDetailComponent
+    );
+
 const loadXtreamContentGateComponent: ComponentLoader = () =>
     import('./xtream-content-gate.component').then(
         (c) => c.XtreamContentGateComponent
@@ -44,14 +49,19 @@ const loadVodDetailsRouteComponent: ComponentLoader = () =>
         (c) => c.VodDetailsRouteComponent
     );
 
-const loadPersonVodResultsComponent: ComponentLoader = () =>
-    import('./person-vod-results/person-vod-results.component').then(
-        (c) => c.PersonVodResultsComponent
-    );
-
 const loadSerialDetailsComponent: ComponentLoader = () =>
     import('./serial-details/serial-details.component').then(
         (c) => c.SerialDetailsComponent
+    );
+
+const loadXtreamActorRouteComponent: ComponentLoader = () =>
+    import('./actor/xtream-actor-route.component').then(
+        (c) => c.XtreamActorRouteComponent
+    );
+
+const loadXtreamDiscoverRouteComponent: ComponentLoader = () =>
+    import('./discover/xtream-discover-route.component').then(
+        (c) => c.XtreamDiscoverRouteComponent
     );
 
 export function createXtreamRoutes(): Route[] {
@@ -85,11 +95,6 @@ export function createXtreamRoutes(): Route[] {
                                     path: '',
                                     loadComponent:
                                         loadCategoryContentViewComponent,
-                                },
-                                {
-                                    path: 'person/:role/:name',
-                                    loadComponent:
-                                        loadPersonVodResultsComponent,
                                 },
                                 {
                                     path: ':categoryId',
@@ -127,6 +132,14 @@ export function createXtreamRoutes(): Route[] {
                             loadComponent: loadSearchResultsComponent,
                         },
                         {
+                            path: 'actor/:personId',
+                            loadComponent: loadXtreamActorRouteComponent,
+                        },
+                        {
+                            path: 'discover',
+                            loadComponent: loadXtreamDiscoverRouteComponent,
+                        },
+                        {
                             path: 'recently-added',
                             loadComponent: loadRecentlyAddedComponent,
                         },
@@ -141,6 +154,10 @@ export function createXtreamRoutes(): Route[] {
                     path: 'recent',
                     loadComponent: loadXtreamCollectionRouteComponent,
                     data: { mode: 'recent', portalType: 'xtream' },
+                },
+                {
+                    path: 'downloads/:downloadId',
+                    loadComponent: loadDownloadOfflineDetailComponent,
                 },
                 {
                     path: 'downloads',

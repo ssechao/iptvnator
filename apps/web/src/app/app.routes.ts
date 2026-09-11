@@ -1,6 +1,10 @@
 import { inject } from '@angular/core';
 import { Router, Routes } from '@angular/router';
+import { RuntimeCapabilitiesService, SettingsStore } from '@iptvnator/services';
 import { WorkspaceStartupPreferencesService } from '@iptvnator/workspace/shell/util';
+import { settingsUnsavedChangesGuard } from './settings/settings-unsaved-changes.guard';
+
+const settingsReadyResolver = () => inject(SettingsStore).loadSettings();
 
 const workspaceEntryRedirect = async () =>
     inject(WorkspaceStartupPreferencesService).resolveInitialWorkspacePath();
@@ -15,6 +19,42 @@ const dashboardAccessGuard = async () => {
         : router.parseUrl(redirectPath);
 };
 
+export function resolveElectronOnlyGlobalSearchRoute(
+    runtime: Pick<RuntimeCapabilitiesService, 'isElectron'>,
+    router: Pick<Router, 'parseUrl'>
+) {
+    return runtime.isElectron ? true : router.parseUrl('/workspace/sources');
+}
+
+const electronOnlyGlobalSearchGuard = () => {
+    return resolveElectronOnlyGlobalSearchRoute(
+        inject(RuntimeCapabilitiesService),
+        inject(Router)
+    );
+};
+
+/**
+ * The focused recording detail depends on `RecordingsService`, whose list
+ * never becomes authoritative without the recordings capability — the PWA
+ * would render a permanently blank workspace instead of the not-found
+ * redirect. Send it to the manager, which owns its own unavailable state.
+ */
+export function resolveRecordingsCapabilityRoute(
+    runtime: Pick<RuntimeCapabilitiesService, 'supportsRecordings'>,
+    router: Pick<Router, 'parseUrl'>
+) {
+    return runtime.supportsRecordings
+        ? true
+        : router.parseUrl('/workspace/downloads');
+}
+
+const recordingsCapabilityGuard = () => {
+    return resolveRecordingsCapabilityRoute(
+        inject(RuntimeCapabilitiesService),
+        inject(Router)
+    );
+};
+
 export const routes: Routes = [
     {
         path: '',
@@ -25,6 +65,9 @@ export const routes: Routes = [
         path: 'workspace',
         data: {
             layout: 'workspace',
+        },
+        resolve: {
+            settingsReady: settingsReadyResolver,
         },
         loadComponent: () =>
             import('@iptvnator/workspace/shell/feature').then(
@@ -81,6 +124,32 @@ export const routes: Routes = [
                     ),
             },
             {
+                path: 'search',
+                canActivate: [electronOnlyGlobalSearchGuard],
+                data: {
+                    isGlobalSearch: true,
+                },
+                loadComponent: () =>
+                    import('@iptvnator/portal/xtream/feature').then(
+                        (c) => c.GlobalSearchResultsComponent
+                    ),
+            },
+            {
+                path: 'downloads/recording/:recordingId',
+                canActivate: [recordingsCapabilityGuard],
+                loadComponent: () =>
+                    import('@iptvnator/portal/downloads/feature').then(
+                        (c) => c.RecordingDetailComponent
+                    ),
+            },
+            {
+                path: 'downloads/:downloadId',
+                loadComponent: () =>
+                    import('@iptvnator/portal/downloads/feature').then(
+                        (c) => c.DownloadOfflineDetailComponent
+                    ),
+            },
+            {
                 path: 'downloads',
                 loadComponent: () =>
                     import('@iptvnator/portal/downloads/feature').then(
@@ -103,10 +172,27 @@ export const routes: Routes = [
             },
             {
                 path: 'settings',
-                loadComponent: () =>
-                    import('./settings/settings.component').then(
-                        (c) => c.SettingsComponent
-                    ),
+                children: [
+                    {
+                        path: '',
+                        pathMatch: 'full',
+                        redirectTo: 'general',
+                    },
+                    {
+                        // One routed component for every section: the same
+                        // instance survives :section param changes (default
+                        // route reuse), so the settings form — and its dirty
+                        // state — persists while the user moves between
+                        // section pages. The guard only intercepts leaving
+                        // the settings area with unsaved edits.
+                        path: ':section',
+                        canDeactivate: [settingsUnsavedChangesGuard],
+                        loadComponent: () =>
+                            import('./settings/settings.component').then(
+                                (c) => c.SettingsComponent
+                            ),
+                    },
+                ],
             },
         ],
     },

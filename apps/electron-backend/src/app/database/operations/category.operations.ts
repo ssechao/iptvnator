@@ -1,6 +1,8 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import * as schema from '@iptvnator/shared/database/schema';
+import { XTREAM_DATABASE_PERFORMANCE_PHASE } from '@iptvnator/shared/interfaces';
 import type { AppDatabase } from '../database.types';
+import type { DatabaseOperationPerformancePhaseCapture } from './performance-phase-capture';
 
 type DbCategoryType = 'live' | 'movies' | 'series';
 
@@ -8,6 +10,8 @@ type XtreamCategoryInput = {
     category_name: string;
     category_id: string | number;
 };
+
+type XtreamCategoryValue = typeof schema.categories.$inferInsert;
 
 type CategoryVisibilityPreference = {
     version: 1;
@@ -22,6 +26,20 @@ export function getCategoryVisibilityStateKey(
 ): string {
     return `${CATEGORY_VISIBILITY_STATE_PREFIX}:${playlistId}:${type}`;
 }
+
+// Category rows cross the DB-worker IPC boundary in the snake_case wire
+// shape declared by XCategoryFromDb/XtreamCategoryFromDb. A bare select()
+// would leak Drizzle's camelCase property names (xtreamId, playlistId)
+// instead, silently breaking consumers such as the playlist backup
+// export/restore (issue #1017).
+const categoryWireShape = {
+    id: schema.categories.id,
+    playlist_id: schema.categories.playlistId,
+    name: schema.categories.name,
+    type: schema.categories.type,
+    xtream_id: schema.categories.xtreamId,
+    hidden: schema.categories.hidden,
+};
 
 function normalizeXtreamCategoryId(
     rawCategoryId: string | number
@@ -111,26 +129,21 @@ export async function storeHiddenCategoryXtreamIds(
     const normalizedHiddenXtreamIds =
         normalizeHiddenCategoryXtreamIds(hiddenXtreamIds);
     const updatedAt = new Date().toISOString();
+    const value = JSON.stringify({
+        version: 1,
+        hiddenXtreamIds: normalizedHiddenXtreamIds,
+    } satisfies CategoryVisibilityPreference);
 
     await db
         .insert(schema.appState)
         .values({
             key: getCategoryVisibilityStateKey(playlistId, type),
-            value: JSON.stringify({
-                version: 1,
-                hiddenXtreamIds: normalizedHiddenXtreamIds,
-            } satisfies CategoryVisibilityPreference),
+            value,
             updatedAt,
         })
         .onConflictDoUpdate({
             target: schema.appState.key,
-            set: {
-                value: JSON.stringify({
-                    version: 1,
-                    hiddenXtreamIds: normalizedHiddenXtreamIds,
-                } satisfies CategoryVisibilityPreference),
-                updatedAt,
-            },
+            set: { value, updatedAt },
         });
 }
 
@@ -158,6 +171,49 @@ export async function persistCurrentCategoryVisibilityPreference(
     );
 }
 
+function normalizeXtreamCategories(
+    playlistId: string,
+    categories: XtreamCategoryInput[],
+    type: DbCategoryType,
+    hiddenCategoryXtreamIds?: number[]
+): XtreamCategoryValue[] {
+    const hiddenSet = new Set(hiddenCategoryXtreamIds || []);
+
+    return categories.flatMap((category) => {
+        const xtreamId = normalizeXtreamCategoryId(category.category_id);
+
+        if (xtreamId === null) {
+            return [];
+        }
+
+        return [
+            {
+                playlistId,
+                name: category.category_name,
+                type,
+                xtreamId,
+                hidden: hiddenSet.has(xtreamId),
+            },
+        ];
+    });
+}
+
+async function insertXtreamCategories(
+    db: AppDatabase,
+    values: XtreamCategoryValue[]
+): Promise<void> {
+    await db
+        .insert(schema.categories)
+        .values(values)
+        .onConflictDoNothing({
+            target: [
+                schema.categories.playlistId,
+                schema.categories.type,
+                schema.categories.xtreamId,
+            ],
+        });
+}
+
 export async function hasCategories(
     db: AppDatabase,
     playlistId: string,
@@ -179,14 +235,15 @@ export async function hasCategories(
 export async function getCategories(
     db: AppDatabase,
     playlistId: string,
-    type: DbCategoryType
+    type: DbCategoryType,
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ) {
     // Xtream categories are inserted once in provider order and existing
     // xtream IDs are preserved, so row id order represents server order.
     // If partial category re-inserts are added later, persist a provider
     // sort index instead of relying on the insertion id.
-    return db
-        .select()
+    const query = db
+        .select(categoryWireShape)
         .from(schema.categories)
         .where(
             and(
@@ -196,6 +253,14 @@ export async function getCategories(
             )
         )
         .orderBy(schema.categories.id);
+
+    return capturePhase
+        ? capturePhase.captureAsync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_CATEGORIES_READ,
+              async () => query,
+              (rows) => ({ itemCount: rows.length })
+          )
+        : query;
 }
 
 export async function saveCategories(
@@ -203,7 +268,8 @@ export async function saveCategories(
     playlistId: string,
     categories: XtreamCategoryInput[],
     type: DbCategoryType,
-    hiddenCategoryXtreamIds?: number[]
+    hiddenCategoryXtreamIds?: number[],
+    capturePhase?: DatabaseOperationPerformancePhaseCapture
 ): Promise<{ success: boolean }> {
     if (!categories || categories.length === 0) {
         return { success: true };
@@ -225,42 +291,45 @@ export async function saveCategories(
 
     const persistedHiddenCategoryXtreamIds =
         await getStoredHiddenCategoryXtreamIds(db, playlistId, type);
-    const hiddenSet = new Set([
-        ...persistedHiddenCategoryXtreamIds,
-        ...(hiddenCategoryXtreamIds || []),
-    ]);
-    const values = categories.flatMap((category) => {
-        const xtreamId = normalizeXtreamCategoryId(category.category_id);
+    const effectiveHiddenCategoryXtreamIds = Array.from(
+        new Set([
+            ...persistedHiddenCategoryXtreamIds,
+            ...(hiddenCategoryXtreamIds ?? []),
+        ])
+    );
 
-        if (xtreamId === null) {
-            return [];
-        }
-
-        return [
-            {
-                playlistId,
-                name: category.category_name,
-                type,
-                xtreamId,
-                hidden: hiddenSet.has(xtreamId),
-            },
-        ];
-    });
+    const values = capturePhase
+        ? capturePhase.captureSync(
+              XTREAM_DATABASE_PERFORMANCE_PHASE.NORMALIZE_CATEGORIES,
+              () =>
+                  normalizeXtreamCategories(
+                      playlistId,
+                      categories,
+                      type,
+                      effectiveHiddenCategoryXtreamIds
+                  ),
+              (result) => ({ itemCount: result.length })
+          )
+        : normalizeXtreamCategories(
+              playlistId,
+              categories,
+              type,
+              effectiveHiddenCategoryXtreamIds
+          );
 
     if (values.length === 0) {
         return { success: true };
     }
 
-    await db
-        .insert(schema.categories)
-        .values(values)
-        .onConflictDoNothing({
-            target: [
-                schema.categories.playlistId,
-                schema.categories.type,
-                schema.categories.xtreamId,
-            ],
-        });
+    if (capturePhase) {
+        await capturePhase.captureAsync(
+            XTREAM_DATABASE_PERFORMANCE_PHASE.SQLITE_CATEGORIES_WRITE_TRANSACTIONS,
+            () => insertXtreamCategories(db, values),
+            () => ({ itemCount: values.length })
+        );
+    } else {
+        await insertXtreamCategories(db, values);
+    }
 
     if (
         hiddenCategoryXtreamIds !== undefined ||
@@ -270,7 +339,7 @@ export async function saveCategories(
             db,
             playlistId,
             type,
-            Array.from(hiddenSet)
+            effectiveHiddenCategoryXtreamIds
         );
     }
 
@@ -283,7 +352,7 @@ export async function getAllCategories(
     type: DbCategoryType
 ) {
     return db
-        .select()
+        .select(categoryWireShape)
         .from(schema.categories)
         .where(
             and(
@@ -320,10 +389,7 @@ export async function updateCategoryVisibility(
         new Map(
             affectedCategories.map((category) => [
                 `${category.playlistId}:${category.type}`,
-                {
-                    playlistId: category.playlistId,
-                    type: category.type,
-                },
+                category,
             ])
         ).values()
     );

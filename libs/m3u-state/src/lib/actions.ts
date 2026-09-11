@@ -1,16 +1,39 @@
 import { createActionGroup, emptyProps, props } from '@ngrx/store';
-import { Channel, EpgProgram, Playlist, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import {
+    Channel,
+    EpgProgram,
+    Playlist,
+    PlaylistMeta,
+    PlaylistMetaUpdate,
+} from '@iptvnator/shared/interfaces';
 
 export const PlaylistActions = createActionGroup({
     source: 'Playlists',
     events: {
         'Load Playlists': emptyProps(),
         'Load Playlists Success': props<{ playlists: PlaylistMeta[] }>(),
+        'Load Playlists Failure': emptyProps(),
         'Add Playlist': props<{ playlist: Playlist }>(),
         'Add Many Playlists': props<{ playlists: Playlist[] }>(),
         'Remove Playlist': props<{ playlistId: string }>(),
-        'Update Playlist Meta': props<{ playlist: PlaylistMeta }>(),
-        'Update Playlist': props<{ playlist: Playlist; playlistId: string }>(),
+        'Update Playlist Meta': props<{
+            playlist: PlaylistMetaUpdate;
+            /**
+             * False when an awaited owner already persisted this exact
+             * update and the action only synchronizes NgRx state.
+             */
+            persist?: boolean;
+        }>(),
+        'Update Playlist': props<{
+            /**
+             * Instrumentation-only; stripped before the DB invoke.
+             * Never enters the DB worker payload or persisted playlist data.
+             */
+            operationId?: string;
+            playlist: Playlist;
+            playlistId: string;
+            refreshEpg?: boolean;
+        }>(),
         'Update Many Playlists': props<{ playlists: Playlist[] }>(),
         'Parse Playlist': props<{
             uploadType: 'FILE' | 'URL' | 'TEXT';
@@ -51,7 +74,10 @@ export const EpgActions = createActionGroup({
     source: 'EPG',
     events: {
         'Set Active Epg Program': props<{ program: EpgProgram }>(),
-        'Set Active Playback Url': props<{ playbackUrl: string }>(),
+        'Set Active Playback Url': props<{
+            playbackUrl: string;
+            program?: EpgProgram;
+        }>(),
         'Set Current Epg Program': props<{ program: EpgProgram }>(),
         'Reset Active Epg Program': emptyProps(),
         'Return To Live Playback': emptyProps(),
@@ -64,6 +90,7 @@ export const FavoritesActions = createActionGroup({
     events: {
         'Update Favorites': props<{ channel: Channel }>(),
         'Set Favorites': props<{ channelIds: string[] }>(),
+        'Hydrate Favorites': props<{ channelIds: string[] }>(),
     },
 });
 

@@ -21,19 +21,57 @@ export type XtreamCategorySortMode =
     | 'date-desc'
     | 'date-asc'
     | 'name-asc'
-    | 'name-desc';
+    | 'name-desc'
+    | 'rating-desc'
+    | 'rating-asc';
 
 /**
- * Selection state for managing UI selection and pagination
+ * First render window of the infinite-scroll catalog grid. Growing the window
+ * is a free in-memory slice, so the initial batch is a generous constant — the
+ * shared scroll directive tops it up by measuring container overflow rather
+ * than by computing card counts from the viewport.
+ */
+export const CATALOG_INITIAL_WINDOW = 50;
+
+/** How many more items each `loadMoreContent()` reveals. */
+export const CATALOG_WINDOW_CHUNK = 50;
+
+/**
+ * Grid scroll position captured when a list view goes away (detail opened,
+ * tab switched), so returning to the same list restores both the render
+ * window and the scroll offset. The selection coordinates identify the
+ * snapshot: only an exact match may restore it.
+ */
+export interface CatalogScrollState {
+    contentType: ContentType;
+    categoryId: number | null;
+    searchTerm: string;
+    sortMode: XtreamCategorySortMode;
+    minRating: number | null;
+    visibleCount: number;
+    scrollTop: number;
+}
+
+/**
+ * Snapshots are kept per selection identity (one slot would let a tab detour
+ * — VOD → Series → VOD — overwrite the first tab's spot with the second's on
+ * destroy). Bounded so a long browsing session cannot accumulate one entry
+ * per category visited.
+ */
+const MAX_SAVED_CATALOG_SCROLLS = 8;
+
+/**
+ * Selection state for managing UI selection and the infinite-scroll window
  */
 export interface SelectionState {
     selectedContentType: ContentType;
     selectedCategoryId: number | null;
     selectedItem: XtreamSelectionItem | null;
-    page: number;
-    limit: number;
+    visibleCount: number;
+    savedCatalogScrolls: CatalogScrollState[];
     contentSortMode: XtreamCategorySortMode;
     categorySearchTerm: string;
+    minRating: number | null;
     isLoadingDetails: boolean;
     detailsError: string | null;
 }
@@ -45,13 +83,24 @@ const initialSelectionState: SelectionState = {
     selectedContentType: 'vod',
     selectedCategoryId: null,
     selectedItem: null,
-    page: 0,
-    limit: Number(localStorage.getItem('xtream-page-size') ?? 25),
+    visibleCount: CATALOG_INITIAL_WINDOW,
+    savedCatalogScrolls: [],
     contentSortMode: 'date-desc',
     categorySearchTerm: '',
+    minRating: null,
     isLoadingDetails: false,
     detailsError: null,
 };
+
+const matchesCurrentSelection = (
+    snapshot: CatalogScrollState,
+    current: Omit<CatalogScrollState, 'visibleCount' | 'scrollTop'>
+): boolean =>
+    snapshot.contentType === current.contentType &&
+    snapshot.categoryId === current.categoryId &&
+    snapshot.searchTerm === current.searchTerm &&
+    snapshot.sortMode === current.sortMode &&
+    snapshot.minRating === current.minRating;
 
 interface XtreamSelectionCategory {
     readonly [key: string]: unknown;
@@ -114,13 +163,68 @@ type ParentSelectionStoreLike = {
     vodStreams?: () => XtreamSelectionItem[];
 };
 
+const parseRatingValue = (value: unknown): number | null => {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseFloat(value.trim());
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+};
+
 /**
- * Selection feature store for managing UI selection and pagination.
- * Handles:
+ * Numeric IMDb-style rating used for sorting/filtering. Mirrors the grid badge
+ * (prefers `rating_imdb`, falls back to the generic `rating`), checking the
+ * stream-list shape first and the nested `info` object as a fallback. Returns
+ * null when no parseable rating exists.
+ */
+export const getNumericRating = (
+    item: XtreamSelectionItem
+): number | null => {
+    const info =
+        item.info && !Array.isArray(item.info)
+            ? (item.info as Record<string, unknown>)
+            : null;
+    const record = item as Record<string, unknown>;
+    for (const field of ['rating_imdb', 'rating'] as const) {
+        const direct = parseRatingValue(record[field]);
+        if (direct !== null) {
+            return direct;
+        }
+        const nested = info ? parseRatingValue(info[field]) : null;
+        if (nested !== null) {
+            return nested;
+        }
+    }
+    return null;
+};
+
+/**
+ * Filter VOD/series items by a minimum IMDb rating. Unrated items are excluded
+ * while a threshold is active.
+ */
+export const filterByMinRating = (
+    items: XtreamSelectionItem[],
+    minRating: number | null
+): XtreamSelectionItem[] => {
+    if (minRating === null || minRating <= 0) {
+        return items;
+    }
+    return items.filter((item) => {
+        const rating = getNumericRating(item);
+        return rating !== null && rating >= minRating;
+    });
+};
+
+/**
+ * Selection feature store for managing UI selection and the infinite-scroll
+ * render window. Handles:
  * - Content type selection (live, vod, series)
  * - Category selection
  * - Item selection
- * - Pagination (page, limit)
+ * - Infinite-scroll window (visibleCount) + detail-round-trip scroll restore
  */
 export function withSelection() {
     return signalStoreFeature(
@@ -155,6 +259,29 @@ export function withSelection() {
                             getItemDate(a, categoryType) -
                             getItemDate(b, categoryType)
                         );
+                    }
+
+                    if (
+                        sortMode === 'rating-desc' ||
+                        sortMode === 'rating-asc'
+                    ) {
+                        const ratingA = getNumericRating(a);
+                        const ratingB = getNumericRating(b);
+                        // Unrated items always sink to the bottom, regardless
+                        // of sort direction.
+                        if (ratingA === null || ratingB === null) {
+                            if (ratingA !== ratingB) {
+                                return ratingA === null ? 1 : -1;
+                            }
+                        } else if (ratingA !== ratingB) {
+                            return sortMode === 'rating-desc'
+                                ? ratingB - ratingA
+                                : ratingA - ratingB;
+                        }
+                        // Equal ratings (or both unrated): alphabetical tiebreak.
+                        const ratingTitleA = a.title ?? a.name ?? '';
+                        const ratingTitleB = b.title ?? b.name ?? '';
+                        return COLLATOR.compare(ratingTitleA, ratingTitleB);
                     }
 
                     const titleA = a.title ?? a.name ?? '';
@@ -269,6 +396,7 @@ export function withSelection() {
                           : storeAny.serialStreams?.() || [];
 
                 if (categoryType === 'vod' || categoryType === 'series') {
+                    const minRating = store.minRating();
                     let filtered = categoryId
                         ? content.filter(
                               (item) => Number(item.category_id) === categoryId
@@ -276,7 +404,8 @@ export function withSelection() {
                         : sortedContent();
 
                     filtered = filterBySearchTerm(filtered, searchTerm);
-                    return categoryId || searchTerm
+                    filtered = filterByMinRating(filtered, minRating);
+                    return categoryId || searchTerm || minRating
                         ? sortByMode(filtered, sortMode, categoryType)
                         : filtered;
                 }
@@ -347,17 +476,13 @@ export function withSelection() {
                 }),
 
                 /**
-                 * Get paginated content for the selected category.
-                 * Slices from the stable `filteredAndSortedContent` intermediate so
-                 * page navigation never triggers a full re-sort of the array.
+                 * The visible slice of the selected category — the first
+                 * `visibleCount` items of the stable `filteredAndSortedContent`
+                 * intermediate, so growing the window never re-sorts the array.
                  */
-                getPaginatedContent: computed(() => {
-                    const start = store.page() * store.limit();
-                    return filteredAndSortedContent().slice(
-                        start,
-                        start + store.limit()
-                    );
-                }),
+                getPaginatedContent: computed(() =>
+                    filteredAndSortedContent().slice(0, store.visibleCount())
+                ),
 
                 /**
                  * Get all items from the selected category (without pagination).
@@ -369,11 +494,12 @@ export function withSelection() {
                 ),
 
                 /**
-                 * Get total pages for the selected category.
-                 * Derives length from the shared `filteredAndSortedContent` intermediate.
+                 * Whether the filtered list extends beyond the current render
+                 * window.
                  */
-                getTotalPages: computed(() =>
-                    Math.ceil(filteredAndSortedContent().length / store.limit())
+                hasMoreContent: computed(
+                    () =>
+                        filteredAndSortedContent().length > store.visibleCount()
                 ),
 
                 /**
@@ -434,26 +560,31 @@ export function withSelection() {
                 patchState(store, {
                     selectedContentType: type,
                     selectedCategoryId: null,
-                    page: 0,
+                    visibleCount: CATALOG_INITIAL_WINDOW,
                     categorySearchTerm: '',
+                    minRating: null,
                 });
             },
 
             /**
              * Set the selected category
-             * Only resets page to 0 when category actually changes
+             * Only resets the render window when the category actually changes
              */
             setSelectedCategory(categoryId: number | null): void {
                 const newCategoryId =
                     categoryId !== null ? Number(categoryId) : null;
                 const currentCategoryId = store.selectedCategoryId();
 
-                // Only reset page if category actually changed
+                // Only reset the window if the category actually changed
                 if (currentCategoryId !== newCategoryId) {
                     patchState(store, {
                         selectedCategoryId: newCategoryId,
-                        page: 0,
+                        visibleCount: CATALOG_INITIAL_WINDOW,
                         categorySearchTerm: '',
+                        // Clear the rating filter on category change too, mirroring
+                        // categorySearchTerm and setSelectedContentType — otherwise a
+                        // stale threshold stays silently applied in the new category.
+                        minRating: null,
                     });
                 }
             },
@@ -480,18 +611,82 @@ export function withSelection() {
             },
 
             /**
-             * Set the current page
+             * Reveal the next chunk of the filtered list. No-op once the
+             * window already covers everything.
              */
-            setPage(page: number): void {
-                patchState(store, { page });
+            loadMoreContent(): void {
+                const total = store.selectItemsFromSelectedCategory().length;
+                if (store.visibleCount() >= total) {
+                    return;
+                }
+
+                patchState(store, {
+                    visibleCount: store.visibleCount() + CATALOG_WINDOW_CHUNK,
+                });
             },
 
             /**
-             * Set the page limit (items per page)
+             * Capture the grid scroll offset together with the selection
+             * coordinates it belongs to. One snapshot per selection identity:
+             * re-saving the same list replaces its entry, saving another list
+             * (a tab detour's destroy hook) leaves it intact, and the oldest
+             * entry falls out past the bound.
              */
-            setLimit(limit: number): void {
-                patchState(store, { limit });
-                localStorage.setItem('xtream-page-size', String(limit));
+            saveCatalogScrollState(scrollTop: number): void {
+                const snapshot: CatalogScrollState = {
+                    contentType: store.selectedContentType(),
+                    categoryId: store.selectedCategoryId(),
+                    searchTerm: store.categorySearchTerm(),
+                    sortMode: store.contentSortMode(),
+                    minRating: store.minRating(),
+                    visibleCount: store.visibleCount(),
+                    scrollTop,
+                };
+
+                patchState(store, {
+                    savedCatalogScrolls: [
+                        ...store
+                            .savedCatalogScrolls()
+                            .filter(
+                                (saved) =>
+                                    !matchesCurrentSelection(saved, snapshot)
+                            ),
+                        snapshot,
+                    ].slice(-MAX_SAVED_CATALOG_SCROLLS),
+                });
+            },
+
+            /**
+             * If a snapshot exists for the current selection, restore its
+             * render window, remove it, and return the scroll offset to
+             * re-apply. Returns null (leaving other snapshots intact)
+             * otherwise, so a detour through another list never destroys a
+             * saved spot.
+             */
+            consumeCatalogScrollState(): number | null {
+                const current = {
+                    contentType: store.selectedContentType(),
+                    categoryId: store.selectedCategoryId(),
+                    searchTerm: store.categorySearchTerm(),
+                    sortMode: store.contentSortMode(),
+                    minRating: store.minRating(),
+                };
+                const saved = store
+                    .savedCatalogScrolls()
+                    .find((snapshot) =>
+                        matchesCurrentSelection(snapshot, current)
+                    );
+                if (!saved) {
+                    return null;
+                }
+
+                patchState(store, {
+                    visibleCount: saved.visibleCount,
+                    savedCatalogScrolls: store
+                        .savedCatalogScrolls()
+                        .filter((snapshot) => snapshot !== saved),
+                });
+                return saved.scrollTop;
             },
 
             /**
@@ -503,7 +698,22 @@ export function withSelection() {
                 }
                 patchState(store, {
                     contentSortMode: mode,
-                    page: 0,
+                    visibleCount: CATALOG_INITIAL_WINDOW,
+                });
+            },
+
+            /**
+             * Set the minimum IMDb rating filter for VOD/series content.
+             * A null or non-positive value clears the filter.
+             */
+            setMinRating(value: number | null): void {
+                const normalized = value && value > 0 ? value : null;
+                if (store.minRating() === normalized) {
+                    return;
+                }
+                patchState(store, {
+                    minRating: normalized,
+                    visibleCount: CATALOG_INITIAL_WINDOW,
                 });
             },
 
@@ -517,7 +727,7 @@ export function withSelection() {
 
                 patchState(store, {
                     categorySearchTerm: term,
-                    page: 0,
+                    visibleCount: CATALOG_INITIAL_WINDOW,
                 });
             },
 
@@ -525,12 +735,7 @@ export function withSelection() {
              * Reset selection state
              */
             resetSelection(): void {
-                patchState(store, {
-                    ...initialSelectionState,
-                    limit: Number(
-                        localStorage.getItem('xtream-page-size') ?? 25
-                    ),
-                });
+                patchState(store, initialSelectionState);
             },
         }))
     );

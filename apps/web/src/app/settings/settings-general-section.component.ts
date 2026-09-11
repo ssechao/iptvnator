@@ -4,13 +4,13 @@ import { FormGroup, ReactiveFormsModule } from '@angular/forms';
 import { MatCheckboxModule } from '@angular/material/checkbox';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
-import { MatInputModule } from '@angular/material/input';
 import { MatSelectModule } from '@angular/material/select';
 import { TranslateModule } from '@ngx-translate/core';
 import { CoverSize, Language, Theme } from '@iptvnator/shared/interfaces';
 import {
     CoverSizeOption,
     StartupBehaviorOption,
+    StartupWindowModeOption,
     ThemeOption,
 } from './settings.models';
 
@@ -21,7 +21,6 @@ import {
         MatCheckboxModule,
         MatFormFieldModule,
         MatIconModule,
-        MatInputModule,
         MatSelectModule,
         ReactiveFormsModule,
         TranslateModule,
@@ -32,11 +31,15 @@ import {
 })
 export class SettingsGeneralSectionComponent {
     readonly form = input.required<FormGroup>();
-    readonly activeSection = input.required<string>();
     readonly languageEnum = input.required<typeof Language>();
     readonly themeOptions = input.required<ThemeOption[]>();
     readonly coverSizeOptions = input.required<CoverSizeOption[]>();
     readonly startupBehaviorOptions = input.required<StartupBehaviorOption[]>();
+    readonly startupWindowModeOptions =
+        input.required<StartupWindowModeOption[]>();
+    /** Desktop only: the window-mode select needs the main-process mirror and F11 */
+    readonly supportsStartupWindowMode = input(false);
+    readonly supportsPortalConnectivityGuard = input(false);
 
     readonly selectTheme = output<Theme>();
     readonly selectCoverSize = output<CoverSize>();

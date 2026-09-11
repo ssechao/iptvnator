@@ -5,7 +5,9 @@ settings screen.
 
 ## Entry Points
 
-- UI: `/Users/4gray/Code/iptvnator/apps/web/src/app/settings/settings.component.ts`
+- UI: `/Users/4gray/Code/iptvnator/apps/web/src/app/settings/settings-backup-section.component.ts`
+  (embedded in `settings.component.html`), with the file read/handoff in
+  `/Users/4gray/Code/iptvnator/apps/web/src/app/settings/settings-backup.facade.ts`
 - Backup service: `/Users/4gray/Code/iptvnator/libs/services/src/lib/playlist-backup.service.ts`
 - Manifest types: `/Users/4gray/Code/iptvnator/libs/shared/interfaces/src/lib/playlist-backup.interface.ts`
 - Xtream pending restore storage:
@@ -90,9 +92,11 @@ state.
     - favorites snapshots
     - recently viewed snapshots
 
-Explicitly excluded:
+Explicitly excluded — session state, as opposed to the connection definition:
 
 - `stalkerToken`
+- `stalkerSessionIdentity` (the fingerprint the token was negotiated for)
+- `stalkerWatchdogTimeout` / `stalkerTimeslot` (the profile-advertised cadence)
 - `stalkerAccountInfo`
 - playback positions in v1
 
@@ -105,7 +109,9 @@ Only EPG source URLs are backed up at the app-settings level.
 
 ## Import Flow
 
-The settings component hands file contents to `PlaylistBackupService`.
+The settings backup facade (`settings-backup.facade.ts`, driven by
+`settings-backup-section.component.ts`) reads the file (`file.text()`) and
+hands its contents to `PlaylistBackupService.importBackup()`.
 
 The service:
 
@@ -149,12 +155,46 @@ Runtime contract:
     - settings backup import
     - Xtream content initialization
 
+Restore state originates from untrusted sources (user-supplied backup files,
+stale localStorage entries), so every read and write goes through
+`normalizeXtreamPendingRestoreState` (`libs/shared/interfaces`). Entries in
+`hiddenCategories`, `favorites`, and `recentlyViewed` without a usable numeric
+`xtreamId` are dropped rather than restored: backups exported by builds
+affected by issue #1017 contain ID-less hidden-category entries, and matching
+them against category rows would otherwise degrade to a type-only comparison
+that hides every category of that type. Category rows themselves cross the DB
+worker IPC boundary in the snake_case wire shape declared by
+`XCategoryFromDb`/`XtreamCategoryFromDb`; the category operations project
+their Drizzle rows explicitly to keep that contract true.
+
+Clearing the playlist's existing pins goes through a dedicated
+delete-by-playlist operation, not the keyed clear: that one caps its key list
+to bound an IN clause, so a playlist with more pinned movies than the cap kept
+the surplus while still reporting success. A failure now fails the entry
+rather than leaving the union of old and archived pins.
+
+`sourcePins` (VOD multi-source) is the one **optional** collection, and the
+normalizer preserves that: an absent field stays absent rather than becoming
+`[]`, because restore treats a PRESENT collection as authoritative and clears
+the playlist's existing pins before applying it. Materializing an empty array
+would turn "this archive predates pins" into "this archive says there are
+none": archives
+written before multi-source existed simply do not have it, so its absence is
+age rather than damage and only a wrong type is rejected. A pin is carried
+under the playlist it points AT — exporting it anywhere else would restore a
+preference for a portal the archive never contained. Its `matchKey` identifies
+the film rather than the portal, so it survives untouched; only the playlist id
+is remapped to the imported copy. Pins whose match key or content id is
+unusable are dropped, since writing one would occupy the unique key of a film
+it does not describe.
+
 Electron restore behavior:
 
 1. Category import reads pending hidden-category state while saving categories.
 2. After content import, favorites/recent state is restored by typed
    `{ contentType, xtreamId }` matching.
 3. Playback positions are cleared and re-applied from backup state.
+4. VOD source pins are re-applied against the IMPORTED playlist id.
 
 For existing Xtream playlists with a fully populated offline cache, backup
 import applies the restore immediately. Otherwise the typed restore payload is

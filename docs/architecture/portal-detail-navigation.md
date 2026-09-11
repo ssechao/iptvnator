@@ -6,10 +6,59 @@ Related:
 
 - [Embedded Inline Playback](./embedded-inline-playback.md)
 
+## Detail Scroll and Focus
+
+`PortalDetailShellComponent` is the single scroll owner for portal, collection,
+M3U movie and offline detail surfaces. It is a named, focusable region with a
+native scrollbar and stable gutter. Scrollbars follow the platform's visibility
+policy; CSS must not hide them. Content that fits the pane needs no thumb.
+
+On its first render, a browse shell takes focus only if it is still on the
+page body or the enclosing workspace `main`; it does not steal focus from a
+button, input, dialog or inert surface. Replacing a loading shell can hand off
+page focus to the loaded shell, but metadata updates and browse/watch changes
+do not refocus it. Initial watch playback keeps its existing focus behavior.
+ArrowUp/Down, PageUp/Down, Home/End and Space on the shell scroll natively and
+do not reach global player shortcuts. Descendant controls retain their native
+keys and Tab order. Entering watch still scrolls to the top; Back and saved
+catalog scroll positions retain the existing navigation contract below.
+
+The shell owns a single sticky Back control, outside the collapsing hero. Its
+zero-height wrapper is a direct child of the scroll owner, so the control stays
+16 px from the top throughout long episode lists without shifting the hero.
+The button has an opaque app-themed surface, visible keyboard focus, an Escape
+shortcut hint via native `title` and Electron `no-drag` hit testing. The hint
+does not create an overlay that could consume the first Escape press.
+
+The sticky control and Escape unwind one level: watch emits
+`closePlayerRequested`, browse emits `backClicked`. Hosts retain their existing
+route/inline/collection return behavior. The now-playing bar's separate route
+Back action still returns directly to the list. Browse Escape requires focus
+inside this shell; watch keeps the existing global close shortcut, including
+M3U playback started from its sidebar. Handled events, key repeats/modifiers,
+editable fields, inert/hidden shells, fullscreen, dialogs and menus are ignored.
+Escape bubbles through the shell before Material's body-level tooltip dispatcher,
+so focused detail actions return with one press even while their tooltip is open.
+The document listener remains the outside-shell watch fallback; `defaultPrevented`
+prevents duplicate actions and preserves descendant handlers' priority.
+After closing a player, lost focus moves to the sticky control (or the shell
+when there is no browse Back), without scrolling or stealing existing focus.
+
+Hosts without browse navigation set `backAvailable=false`: M3U uses its channel
+sidebar, and collection bootstrap placeholders have no return handler. They
+have no browse button or browse Escape action; M3U watch still offers Close
+player. Loading/error shells with a return handler keep Back available.
+
 ## Summary
 
 - Xtream category browsing uses a route-first detail model.
 - Stalker uses an inline/store-state detail model.
+- Detail pages themselves are two-state (browse ↔ watch) inside
+  `PortalDetailShellComponent`; entering/leaving watch is a layout state,
+  not a navigation. Route-level back semantics are unchanged; the
+  sticky watch control closes the inline player, while the now-playing bar
+  retains its separate direct return to the list. See
+  [Embedded Inline Playback](./embedded-inline-playback.md).
 - Favorites and recently viewed collections now use collection-owned inline detail
   for non-live Xtream and Stalker items.
 - Provider-scoped collection routes fall back to the matching global collection
@@ -18,6 +67,69 @@ Related:
 - Dashboard `Global Favorites` and `Recently Watched` widgets hand off Xtream and
   Stalker movies/series into the matching global collection route with detail
   pre-opened.
+- The dashboard hero CTA and the Continue Watching cards' explicit "Resume
+  episode" ⋮ action for Xtream series carry a one-shot season/episode resume
+  target. The collection-owned Xtream detail consumes it after its episode
+  positions load and starts that exact episode; the cards' default click is
+  detail-only (movie-like), as is opening the series from the collection grid
+  itself. If the positions load fails, the target stays unconsumed and the
+  handoff degrades to detail-only rather than starting the episode at offset
+  zero. Continue Watching cards also expose "Mark as Watched" (maxes out the
+  tracked position row) and "Remove from history" in the same ⋮ menu.
+- Ready Download Manager cards open one of the three focused
+  `downloads/:downloadId` routes. These local details hide the workspace
+  context panel, play only finalized local files, and show only locally
+  available episodes for a series.
+- `View in portal` is the explicit bridge from a focused offline detail to the
+  source catalog. Xtream resolves a concrete category/item route; Stalker uses
+  the best stored item shape or an identity/title-derived fallback. Both pass
+  the one-shot `detailPresentation: 'provider-only'` navigation state. The
+  destination keeps provider playback and whatever catalog the normal provider
+  host can resolve, but hides Offline/local/download presentation.
+- Inline collection details (global favorites/recent — which also receive the
+  dashboard hero and Continue Watching handoffs — plus a portal's own
+  favorites/recent tabs) expose the same bridge as a separate-row hero action.
+  The shared `app-view-in-portal-action` (`libs/ui/components`) renders only
+  when a host provides `VIEW_IN_PORTAL_HANDOFF`; the two collection-detail
+  wrappers (`xtream-collection-detail.component.ts`,
+  `stalker-collection-detail.component.ts`) are the only providers, so
+  router-mounted category details never show the button. Targets come from
+  `getUnifiedCollectionDetailNavigation()` (`libs/portal/shared/util`), which
+  never degrades to a category- or section-only route: an Xtream item without a
+  resolvable category and positive item id keeps the button hidden. Unlike the
+  download handoff it does NOT pass `detailPresentation: 'provider-only'` — the
+  item exists in the provider catalog and the full normal detail is desired.
+  The Stalker handoff carries `stalkerReturnTo` so the portal detail's back
+  affordance returns to the originating collection, plus
+  `stalkerReturnByHistory` so that return is a single history step rather than
+  a fresh `navigateByUrl()`. The collection's active tab, scope and open inline
+  detail live only in `window.history.state` (`collectionViewState` /
+  `openCollectionDetailItem`); re-navigating starts a stateless entry, which
+  reopened the collection on its default `live` tab and left the portal page
+  one browser Back away. The marker carries the handed-off item's identity
+  rather than a bare `true`, because `openStalkerItem` is consumed on arrival
+  while the return keys stay on the entry and a Stalker detail opens in place
+  without pushing one: after Back + browser Forward the same entry can host a
+  different title, and that title's back affordance must close it rather than
+  exit to the collection. A marker that does not match the open item is stale
+  and suppresses the whole return contract. Honouring it retires both return
+  keys from the entry, so the handoff is genuinely one-shot: a browser Forward
+  onto the same entry cannot replay it for a title reopened from the catalog.
+  Leaving via the browser's own Back runs no affordance at all, so
+  `CategoryContentViewComponent` retires the contract as well whenever it
+  lands on the entry with no handoff item and no detail open — the handoff is
+  over, and anything opened from the list afterwards is a fresh selection. It
+  is gated on the marker's presence, so a plain `stalkerReturnTo` caller such
+  as the dashboard handoff keeps its existing behaviour untouched.
+  The identity is restricted to the fields `buildStalkerSelectedVodItem()`
+  preserves (`id ?? stream_id`) — it drops `series_id`/`movie_id`, so binding
+  to the wider `extractStalkerItemId()` set would compare against an identity
+  the opened detail can no longer report and silently strand the affordance.
+  A row identified only by those alternate fields would open with an empty
+  identity, so the builder pins the resolved id onto the handoff state item
+  and those rows keep the history return as well. The marker is set only by this
+  builder and only alongside `returnTo`, so the dashboard handoff and every
+  other `stalkerReturnTo` caller keeps its re-navigating behaviour.
 - Do not force both portals into the same browse/detail behavior unless the full
   portal detail architecture is being changed.
 
@@ -28,7 +140,8 @@ Xtream category and search details are represented by canonical routes.
 Examples:
 
 - `/xtreams/:id/vod/:categoryId/:vodId`
-- `/xtreams/:id/vod/person/:role/:name`
+- `/xtreams/:id/actor/:personId`
+- `/xtreams/:id/discover`
 - `/xtreams/:id/series/:categoryId/:serialId`
 
 Implication:
@@ -38,29 +151,25 @@ Implication:
 - This keeps the URL, browser history, and detail rendering model aligned with
   normal Xtream browsing.
 - Xtream VOD detail recommendations also navigate through canonical VOD routes
-  instead of opening inline state. When a TMDb credential is configured in
-  Settings > General, the recommendation rail first enriches the current movie
-  with TMDb cast, crew, production company, and genres, discovers related movies
-  by shared actors, directors, producers, writers, studios, and genres, then
-  maps those results back to movies that already exist in the local Xtream
-  catalog. Recommendation reason chips should include the matching person,
-  studio, or genre name when it is known, for example `Same actor: Name`.
-  Clickable cast, crew, studio, and genre names route to
-  `/workspace/xtreams/:id/vod/person/:role/:name`, which shows the movies for
-  that entity that are available in the current Xtream VOD catalog. That page
-  uses TMDb discover/search for actor, director, producer, writer, studio, and
-  genre roles, then maps the online results back to local streams; when TMDb
-  has no match, it can still fall back to local Xtream metadata for actor,
-  director, and genre.
-  If TMDb is unavailable or no catalog matches are found, the rail falls back to
-  local metadata scoring from already-loaded director, cast, and genre, with
-  latest `added` timestamp ties. Xtream category names must not populate the
-  VOD recommendation rail on their own because provider categories are often
-  broad buckets rather than real film metadata.
+  instead of opening inline state. With TMDB metadata enrichment enabled, the
+  rail maps TMDB's recommendations back to playable movies in the current
+  Xtream catalog, then fills the remaining slots from other imported Xtream
+  portals in Electron. The VOD page caps the result at nine cards and presents
+  them as a three-column grid on desktop rather than a horizontal scroller.
+  Provider category names do not drive these recommendations.
+- Enriched cast and director/creator chips route to
+  `/workspace/xtreams/:id/actor/:personId`. The actor page combines acting and
+  directing/creating credits, then marks and links titles available in the
+  current catalog; its Electron-only all-portals scope matches the filmography
+  against every imported Xtream playlist.
+- Enriched year, genre, and country chips route to
+  `/workspace/xtreams/:id/discover` with structured navigation state. Discover
+  maps TMDB results back to the playable local catalog before falling back to
+  title search where appropriate.
 
 Current code paths:
 
-- `libs/portal/xtream/feature/src/lib/favorites/favorites.component.ts`
+- `libs/portal/xtream/feature/src/lib/xtream-collection-detail.component.ts` (favorites + recent, with shared UI from `libs/portal/shared/ui/src/lib/components/favorites-layout/`)
 - `libs/portal/xtream/feature/src/lib/search-results/search-results.component.ts`
 - `libs/portal/catalog/feature/src/lib/category-content-view/category-content-view.component.ts`
 
@@ -89,6 +198,14 @@ Dashboard behavior to preserve:
   Xtream movie/series items into `/workspace/global-favorites` or
   `/workspace/global-recent` with collection detail pre-opened from navigation
   state.
+- When an Xtream series recent has a saved episode position, the dashboard hero
+  and Continue Watching card should include that exact series/episode target in
+  the navigation state. It is a one-shot playback request and must not leak into
+  normal favorites, search, category, or collection-grid navigation. Only
+  position rows that name their parent `seriesXtreamId` produce a target:
+  episode-keyed recents make `item.xtream_id` an episode id, so legacy rows
+  without the pointer stay detail-only instead of promoting the episode id to a
+  series id.
 - Back from the collection detail should return to the dashboard handoff state,
   not switch the active playlist.
 
@@ -96,6 +213,19 @@ Search behavior to preserve:
 
 - Selecting an Xtream item from search should still navigate to the canonical
   Xtream content type/category/item route when the item is not a live stream.
+
+Download handoff behavior:
+
+- An Xtream movie handoff requires its exact VOD category and item route; a
+  series handoff requires its exact series category and item route. The
+  download snapshot's provider category is preferred, with the typed catalog
+  used to recover it for legacy rows. The action stays unavailable rather than
+  opening a bare collection route when the target cannot be resolved.
+- Provider-only mode is read by the normal VOD/series detail components. It
+  preserves provider Play/Resume and every provider episode, while suppressing
+  the local Offline state and download controls. Reusing the route component
+  for another item must clear the mode unless that navigation explicitly
+  carries the marker.
 
 ## Stalker
 
@@ -115,8 +245,7 @@ Implication:
 
 Current code paths:
 
-- `libs/portal/stalker/feature/src/lib/stalker-favorites/stalker-favorites.component.ts`
-- `libs/portal/stalker/feature/src/lib/recently-viewed/recently-viewed.component.ts`
+- `libs/portal/stalker/feature/src/lib/stalker-collection-route.component.ts` (favorites + recent via `mode` route data) -> `stalker-collection-detail.component.ts`
 - `libs/portal/stalker/feature/src/lib/stalker-search/stalker-search.component.ts`
 - `libs/portal/catalog/feature/src/lib/category-content-view/category-content-view.component.ts` (Stalker branch)
 
@@ -137,6 +266,26 @@ Behavior to preserve:
   switching playlist context or showing the workspace category sidebar.
 - Back from the collection-owned detail should restore the previous collection
   tab and scope instead of resetting the collection screen to its defaults.
+
+Download handoff behavior:
+
+- `View in portal` preserves Stalker's inline/store-state architecture. A
+  type-compatible recently-viewed snapshot is carried as `openStalkerItem`
+  into the normal category host, preserving regular series, embedded VOD
+  `series[]`, or lazy Ministra VOD `is_series=1` shape. Candidate filtering
+  rejects live items and the opposite movie/series namespace even when ids
+  overlap. When the download snapshot carries an exact numeric provider
+  category, that category wins over the recent record's virtual `vod` or
+  `series` marker while the raw mode fields stay intact.
+- When no compatible recent snapshot exists, only a movie download with an
+  exact numeric provider category can form a metadata-only VOD target. A
+  legacy movie without that category and every episode without a recoverable
+  raw series mode leave `View in portal` unavailable instead of fabricating an
+  unverified provider target.
+- The provider-only marker is scoped to the resulting selected item. Its normal
+  provider host supplies the seasons, episodes, and playback it can resolve,
+  while the shared VOD or series UI suppresses local Offline and download
+  controls. A later ordinary item open returns to normal provider presentation.
 
 ## Decision Rule For Future Changes
 

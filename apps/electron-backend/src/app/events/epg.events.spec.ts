@@ -45,6 +45,7 @@ jest.mock('../database/connection', () => ({
 
 describe('EpgEvents', () => {
     let EpgEvents: typeof EpgEventsType;
+    let EpgWorkerService: typeof import('./epg-worker.service').EpgWorkerService;
     let consoleLogSpy: jest.SpyInstance;
     let consoleErrorSpy: jest.SpyInstance;
 
@@ -63,9 +64,11 @@ describe('EpgEvents', () => {
         });
 
         ({ default: EpgEvents } = await import('./epg.events'));
+        ({ EpgWorkerService } = await import('./epg-worker.service'));
     });
 
     afterEach(() => {
+        jest.useRealTimers();
         consoleLogSpy.mockRestore();
         consoleErrorSpy.mockRestore();
         getDatabase.mockReset();
@@ -74,6 +77,37 @@ describe('EpgEvents', () => {
     async function flushPromises(): Promise<void> {
         await new Promise((resolve) => setImmediate(resolve));
     }
+
+    it.each(['missing', 'stale', 'fresh'])(
+        'uses source-owned freshness for %s metadata',
+        async (state) => {
+            const { epgChannelSources } = await import('../database/schema');
+            const { checkEpgFreshness } = await import('./epg-fetch.service');
+            const fresh = [{ updatedAt: new Date().toISOString() }];
+            const snapshots =
+                state === 'missing'
+                    ? []
+                    : state === 'fresh'
+                      ? fresh
+                      : [{ updatedAt: '2000-01-01T00:00:00Z' }];
+            getDatabase.mockResolvedValue({
+                select: () => ({
+                    from: (table: unknown) => ({
+                        where: () => ({
+                            limit: async () =>
+                                table === epgChannelSources ? snapshots : fresh,
+                        }),
+                    }),
+                }),
+            });
+            const result = await checkEpgFreshness(['shared-source'], 12);
+            expect(result).toEqual(
+                state === 'fresh'
+                    ? { freshUrls: ['shared-source'], staleUrls: [] }
+                    : { freshUrls: [], staleUrls: ['shared-source'] }
+            );
+        }
+    );
 
     it('uses the shared worker bootstrap and passes native module search paths to the EPG worker', async () => {
         const fetchPromise = (EpgEvents as unknown as Record<string, any>)[
@@ -106,6 +140,7 @@ describe('EpgEvents', () => {
         expect(worker.postMessage).toHaveBeenCalledWith({
             type: 'FETCH_EPG',
             url: 'https://example.com/guide.xml',
+            options: {},
         });
 
         worker.emit('message', {
@@ -131,48 +166,465 @@ describe('EpgEvents', () => {
         });
     });
 
+    it('rejects when the EPG clear worker exits before completion', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+        const clearPromise = workerService.clearEpgData();
+        const worker = mockWorkerInstances[0];
+
+        worker.emit('exit', 0);
+
+        await expect(clearPromise).rejects.toThrow(
+            'Clear worker exited unexpectedly (code 0)'
+        );
+    });
+
+    it('rejects when the EPG clear worker never responds', async () => {
+        jest.useFakeTimers();
+
+        const workerService = new EpgWorkerService('[Test EPG]', 25);
+        const clearPromise = workerService.clearEpgData();
+        const worker = mockWorkerInstances[0];
+
+        worker.emit('message', { type: 'READY' });
+        jest.advanceTimersByTime(25);
+
+        await expect(clearPromise).rejects.toThrow('EPG clear timed out after');
+        expect(worker.terminate).toHaveBeenCalled();
+    });
+
+    it('reuses the in-flight worker when the same EPG URL is fetched concurrently', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://example.com/guide.xml';
+
+        const firstPromise = workerService.fetchEpgFromUrl(url);
+        const secondPromise = workerService.fetchEpgFromUrl(url);
+
+        expect(mockWorkerInstances).toHaveLength(1);
+
+        const worker = mockWorkerInstances[0];
+        worker.emit('message', { type: 'READY' });
+        await flushPromises();
+        worker.emit('message', {
+            type: 'EPG_COMPLETE',
+            stats: { totalChannels: 1, totalPrograms: 2 },
+        });
+
+        await expect(firstPromise).resolves.toBeUndefined();
+        await expect(secondPromise).resolves.toBeUndefined();
+        expect(mockWorkerInstances).toHaveLength(1);
+    });
+
+    it('starts a fresh worker once a failed fetch for the same URL has settled', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://example.com/guide.xml';
+
+        const firstPromise = workerService.fetchEpgFromUrl(url);
+        mockWorkerInstances[0].emit('message', {
+            type: 'EPG_ERROR',
+            error: 'parse failed',
+        });
+        await expect(firstPromise).rejects.toThrow('parse failed');
+
+        const secondPromise = workerService.fetchEpgFromUrl(url);
+        expect(mockWorkerInstances).toHaveLength(2);
+
+        const retryWorker = mockWorkerInstances[1];
+        retryWorker.emit('message', { type: 'READY' });
+        await flushPromises();
+        retryWorker.emit('message', {
+            type: 'EPG_COMPLETE',
+            stats: { totalChannels: 1, totalPrograms: 2 },
+        });
+
+        await expect(secondPromise).resolves.toBeUndefined();
+    });
+
+    it('shares the in-flight promise while a completed fetch is still terminating', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://example.com/guide.xml';
+
+        const firstPromise = workerService.fetchEpgFromUrl(url);
+        const worker = mockWorkerInstances[0];
+
+        let releaseTerminate!: () => void;
+        worker.terminate.mockReturnValue(
+            new Promise<void>((resolve) => {
+                releaseTerminate = resolve;
+            })
+        );
+
+        worker.emit('message', { type: 'READY' });
+        await flushPromises();
+        worker.emit('message', {
+            type: 'EPG_COMPLETE',
+            stats: { totalChannels: 1, totalPrograms: 2 },
+        });
+        await flushPromises();
+
+        // The URL is already marked as fetched, but the worker is still
+        // terminating: a new request must keep awaiting that window instead
+        // of resolving early via the fetched-URL shortcut.
+        const secondPromise = workerService.fetchEpgFromUrl(url);
+        expect(mockWorkerInstances).toHaveLength(1);
+
+        let secondResolved = false;
+        void secondPromise.then(() => {
+            secondResolved = true;
+        });
+        await flushPromises();
+        expect(secondResolved).toBe(false);
+
+        releaseTerminate();
+        await expect(firstPromise).resolves.toBeUndefined();
+        await flushPromises();
+        expect(secondResolved).toBe(true);
+    });
+
+    it('does not resolve clearEpgData until interrupted fetch workers have terminated', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+
+        void workerService
+            .fetchEpgFromUrl('https://example.com/guide.xml')
+            .catch(() => undefined);
+        const fetchWorker = mockWorkerInstances[0];
+
+        let releaseFetchTerminate!: () => void;
+        fetchWorker.terminate.mockReturnValue(
+            new Promise<void>((resolve) => {
+                releaseFetchTerminate = resolve;
+            })
+        );
+
+        const clearPromise = workerService.clearEpgData();
+        const clearWorker = mockWorkerInstances[1];
+        clearWorker.emit('message', { type: 'READY' });
+        clearWorker.emit('message', { type: 'CLEAR_COMPLETE' });
+
+        let cleared = false;
+        void clearPromise.then(() => {
+            cleared = true;
+        });
+        await flushPromises();
+        expect(fetchWorker.terminate).toHaveBeenCalled();
+        expect(cleared).toBe(false);
+
+        releaseFetchTerminate();
+        await flushPromises();
+        expect(cleared).toBe(true);
+
+        // Settle the interrupted fetch so its 1s timeout cannot fire (and
+        // log) after the suite has finished.
+        fetchWorker.emit('exit', 1);
+        await flushPromises();
+    });
+
+    it.each([
+        ['exit', 1],
+        ['error', new Error('terminated worker')],
+    ] as const)(
+        'cancels a retired source on %s without reviving it from late READY or COMPLETE messages',
+        async (event, payload) => {
+            const service = new EpgWorkerService('[Test EPG]', 1000);
+            const url = 'https://removed.example/guide.xml';
+            const progress = jest.spyOn(service, 'sendProgressToRenderer');
+            const fetch = service.fetchEpgFromUrl(url).then(
+                () => true,
+                () => false
+            );
+            const worker = mockWorkerInstances[0];
+            let finishTermination!: () => void;
+            worker.terminate.mockReturnValue(
+                new Promise<void>((resolve) => {
+                    finishTermination = resolve;
+                })
+            );
+            const clear = service.clearEpgDataForSource(url);
+            worker.emit('message', { type: 'READY' });
+            worker.emit('message', { type: 'EPG_COMPLETE' });
+            expect(worker.postMessage).not.toHaveBeenCalled();
+            expect(service.hasFetchedUrl(url)).toBe(false);
+            expect(mockWorkerInstances).toHaveLength(1);
+            worker.emit(event, payload);
+            finishTermination();
+            await flushPromises();
+            const clearWorker = mockWorkerInstances[1];
+            clearWorker.emit('message', { type: 'READY' });
+            clearWorker.emit('message', { type: 'CLEAR_COMPLETE' });
+            await clear;
+            expect(await fetch).toBe(true);
+            expect(progress.mock.calls.map((call) => call[1])).toEqual([
+                'cancelled',
+            ]);
+        }
+    );
+
+    it('does not start a queued source removed while an earlier source imports', async () => {
+        getDatabase.mockRejectedValue(new Error('force stale for test'));
+        const { handleFetchEpg } = await import('./epg-fetch.service');
+        const { retireEpgSource } = await import('./epg-source-generation');
+        const { epgWorkerService } = await import('./epg-worker.service');
+        const progress = jest.spyOn(epgWorkerService, 'sendProgressToRenderer');
+        let finishFirst!: () => void;
+        const fetch = jest
+            .spyOn(epgWorkerService, 'fetchEpgFromUrl')
+            .mockImplementationOnce(
+                () =>
+                    new Promise<void>((resolve) => {
+                        finishFirst = resolve;
+                    })
+            )
+            .mockResolvedValue(undefined);
+        const request = handleFetchEpg([
+            'https://first.example/guide.xml',
+            'https://queued.example/guide.xml',
+        ]);
+        await flushPromises();
+        retireEpgSource('https://queued.example/guide.xml');
+        finishFirst();
+        await request;
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(progress).toHaveBeenCalledWith(
+            'https://queued.example/guide.xml',
+            'cancelled',
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            expect.any(Number)
+        );
+        progress.mockRestore();
+        fetch.mockRestore();
+    });
+
+    it.each([true, false])(
+        'awaits a failing worker termination before source cleanup (already retired: %s)',
+        async (alreadyRetired) => {
+            const service = new EpgWorkerService('[Test EPG]', 1000);
+            const url = `https://terminating-${alreadyRetired}.example/guide.xml`;
+            const fetch = service.fetchEpgFromUrl(url).catch(() => undefined);
+            const worker = mockWorkerInstances[0];
+            let finishTermination!: () => void;
+            worker.terminate.mockReturnValue(
+                new Promise<void>((resolve) => {
+                    finishTermination = resolve;
+                })
+            );
+            if (alreadyRetired) {
+                const { retireEpgSource } =
+                    await import('./epg-source-generation');
+                retireEpgSource(url);
+            }
+            worker.emit(
+                'error',
+                new Error('worker failed while another source clears')
+            );
+            const clear = service.clearEpgDataForSource(url);
+            const workersBeforeTermination = mockWorkerInstances.length;
+            finishTermination();
+            await fetch;
+            await flushPromises();
+            const clearWorker = mockWorkerInstances[1];
+            clearWorker.emit('message', { type: 'READY' });
+            clearWorker.emit('message', { type: 'CLEAR_COMPLETE' });
+            await clear;
+            expect(workersBeforeTermination).toBe(1);
+        }
+    );
+
+    it('clears one EPG source through a worker and allows it to be fetched again', async () => {
+        const workerService = new EpgWorkerService('[Test EPG]', 1000);
+        const sourceUrl = 'https://playlist.example.com/guide.xml';
+        workerService.markFetchedUrl(sourceUrl);
+
+        const clearPromise = workerService.clearEpgDataForSource(
+            ` ${sourceUrl} `
+        );
+        const worker = mockWorkerInstances[0];
+
+        worker.emit('message', { type: 'READY' });
+        await flushPromises();
+
+        expect(worker.postMessage).toHaveBeenCalledWith({
+            type: 'CLEAR_EPG_SOURCE',
+            sourceUrl,
+        });
+
+        worker.emit('message', { type: 'CLEAR_COMPLETE' });
+
+        await expect(clearPromise).resolves.toBeUndefined();
+        expect(workerService.hasFetchedUrl(sourceUrl)).toBe(false);
+    });
+
+    it('rejects a timed-out fetch with the timeout error after the worker has terminated', async () => {
+        jest.useFakeTimers();
+
+        const workerService = new EpgWorkerService('[Test EPG]', 25);
+        const fetchPromise = workerService.fetchEpgFromUrl(
+            'https://example.com/guide.xml'
+        );
+        const worker = mockWorkerInstances[0];
+
+        let terminated = false;
+        worker.terminate.mockImplementation(() => {
+            terminated = true;
+            // Worker threads emit 'exit' as part of termination; the timeout
+            // rejection must win over the generic exit-handler rejection.
+            worker.emit('exit', 1);
+            return Promise.resolve(0);
+        });
+
+        worker.emit('message', { type: 'READY' });
+        jest.advanceTimersByTime(25);
+
+        await expect(fetchPromise).rejects.toThrow('EPG fetch timed out after');
+        expect(terminated).toBe(true);
+    });
+
+    it('waits for source cleanup before starting a replacement import of the same normalized URL', async () => {
+        const service = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://replacement.example/guide.xml';
+        const clear = service.clearEpgDataForSource(url);
+        const clearWorker = mockWorkerInstances[0];
+        const replacement = service.fetchEpgFromUrl(` ${url} `);
+        const workersBeforeCleanup = mockWorkerInstances.length;
+        clearWorker.emit('message', { type: 'READY' });
+        clearWorker.emit('message', { type: 'CLEAR_COMPLETE' });
+        await clear;
+        await flushPromises();
+        const fetchWorker = mockWorkerInstances[1];
+        fetchWorker.emit('message', { type: 'READY' });
+        fetchWorker.emit('message', { type: 'EPG_COMPLETE' });
+        await replacement;
+        expect(workersBeforeCleanup).toBe(1);
+        expect(service.hasFetchedUrl(url)).toBe(true);
+    });
+
+    it('serializes repeated clears and retires a replacement waiting for the earlier clear', async () => {
+        const service = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://twice-removed.example/guide.xml';
+        const firstClear = service.clearEpgDataForSource(url);
+        const waitingFetch = service.fetchEpgFromUrl(url);
+        const secondClear = service.clearEpgDataForSource(url);
+        expect(mockWorkerInstances).toHaveLength(1);
+        mockWorkerInstances[0].emit('message', { type: 'CLEAR_COMPLETE' });
+        await firstClear;
+        await waitingFetch;
+        await flushPromises();
+        expect(mockWorkerInstances).toHaveLength(2);
+        mockWorkerInstances[1].emit('message', { type: 'READY' });
+        expect(mockWorkerInstances[1].postMessage).toHaveBeenCalledWith({
+            type: 'CLEAR_EPG_SOURCE',
+            sourceUrl: url,
+        });
+        mockWorkerInstances[1].emit('message', { type: 'CLEAR_COMPLETE' });
+        await secondClear;
+        expect(service.hasFetchedUrl(url)).toBe(false);
+    });
+
+    it('allows a replacement import after a failed source cleanup has terminated', async () => {
+        const service = new EpgWorkerService('[Test EPG]', 1000);
+        const url = 'https://retry-clear.example/guide.xml';
+        const clear = service.clearEpgDataForSource(url);
+        const outcome = clear.catch((error: Error) => error.message);
+        const replacement = service.fetchEpgFromUrl(url);
+        mockWorkerInstances[0].emit('message', {
+            type: 'EPG_ERROR',
+            error: 'clear failed',
+        });
+        expect(await outcome).toBe('clear failed');
+        await flushPromises();
+        expect(mockWorkerInstances[0].terminate).toHaveBeenCalled();
+        mockWorkerInstances[1].emit('message', { type: 'READY' });
+        mockWorkerInstances[1].emit('message', { type: 'EPG_COMPLETE' });
+        await replacement;
+        expect(service.hasFetchedUrl(url)).toBe(true);
+    });
+
+    it('keeps an active EPG fetch alive when worker progress keeps moving', async () => {
+        jest.useFakeTimers();
+
+        const workerService = new EpgWorkerService('[Test EPG]', 25);
+        const fetchPromise = workerService.fetchEpgFromUrl(
+            'https://example.com/large-guide.xml'
+        );
+        const fetchOutcome = fetchPromise.then(
+            () => 'resolved' as const,
+            (error) => error
+        );
+        const worker = mockWorkerInstances[0];
+
+        worker.emit('message', { type: 'READY' });
+
+        jest.advanceTimersByTime(20);
+        worker.emit('message', {
+            type: 'EPG_PROGRESS',
+            stats: { totalChannels: 100, totalPrograms: 500000 },
+        });
+
+        jest.advanceTimersByTime(20);
+
+        expect(worker.terminate).not.toHaveBeenCalled();
+
+        worker.emit('message', {
+            type: 'EPG_COMPLETE',
+            stats: { totalChannels: 100, totalPrograms: 510000 },
+        });
+
+        await expect(fetchOutcome).resolves.toBe('resolved');
+    });
+
     it('falls back to case-insensitive channel id lookup for EPG programs', async () => {
         const select = jest.fn();
-        const programLimitExact = jest.fn().mockResolvedValue([]);
-        const channelLimit = jest
-            .fn()
-            .mockResolvedValue([{ id: 'BBC.ONE.UK', displayName: 'BBC One' }]);
-        const programLimitResolved = jest.fn().mockResolvedValue([
-            {
-                id: 1,
-                channelId: 'BBC.ONE.UK',
-                start: '2026-04-14T10:00:00Z',
-                stop: '2026-04-14T11:00:00Z',
-                title: 'News',
-                description: null,
-                category: null,
-                iconUrl: null,
-                rating: null,
-                episodeNum: null,
-            },
-        ]);
 
+        /**
+         * Build a flexible query-chain mock that every db.select().from().<method>() call
+         * resolves to the same chain object. Each method (where, orderBy, limit) returns
+         * the chain itself, and limit() additionally resolves to the given data. This
+         * handles any query shape our service uses (with or without orderBy) without
+         * requiring exact call-count ordering — important because our mapping feature
+         * inserts extra queries that the original test didn't anticipate.
+         */
+        function queryChain<T>(data: T) {
+            const chain: Record<string, jest.Mock> = {} as Record<
+                string,
+                jest.Mock
+            >;
+            chain.where = jest.fn().mockReturnValue(chain);
+            chain.innerJoin = jest.fn().mockReturnValue(chain);
+            chain.groupBy = jest.fn().mockReturnValue(chain);
+            chain.orderBy = jest.fn().mockReturnValue(chain);
+            chain.limit = jest.fn().mockResolvedValue(data);
+            return chain;
+        }
+
+        // getMapping queries (must come first — they return empty)
         const from = jest
             .fn()
-            .mockReturnValueOnce({
-                where: jest.fn().mockReturnValue({
-                    orderBy: jest.fn().mockReturnValue({
-                        limit: programLimitExact,
-                    }),
-                }),
-            })
-            .mockReturnValueOnce({
-                where: jest.fn().mockReturnValue({
-                    limit: channelLimit,
-                }),
-            })
-            .mockReturnValueOnce({
-                where: jest.fn().mockReturnValue({
-                    orderBy: jest.fn().mockReturnValue({
-                        limit: programLimitResolved,
-                    }),
-                }),
-            });
+            .mockReturnValueOnce(queryChain([])) // 1. getMapping: epgChannelMappings
+            .mockReturnValueOnce(queryChain([])) // 2. getMapping: content table
+            // Test expectations below
+            .mockReturnValueOnce(queryChain([])) // 3. selectChannelPrograms (bbc.one.uk → empty)
+            .mockReturnValueOnce(
+                queryChain([{ id: 'BBC.ONE.UK', displayName: 'BBC One' }])
+            ) // 4. selectChannelById → channel found
+            .mockReturnValueOnce(
+                queryChain([
+                    // 5. selectChannelPrograms (BBC.ONE.UK → programs)
+                    {
+                        id: 1,
+                        channelId: 'BBC.ONE.UK',
+                        start: '2026-04-14T10:00:00Z',
+                        stop: '2026-04-14T11:00:00Z',
+                        title: 'News',
+                        description: null,
+                        category: null,
+                        iconUrl: null,
+                        rating: null,
+                        episodeNum: null,
+                    },
+                ])
+            );
 
         select.mockImplementation(() => ({ from }));
 
@@ -232,12 +684,14 @@ describe('EpgEvents', () => {
         const select = jest.fn();
         const from = jest.fn();
         const where = jest.fn();
+        const groupBy = jest.fn();
         const orderBy = jest.fn();
         const limit = jest.fn();
 
         select.mockImplementation(() => ({ from }));
         from.mockReturnValue({ where });
-        where.mockReturnValue({ orderBy });
+        where.mockReturnValue({ groupBy });
+        groupBy.mockReturnValue({ orderBy });
         orderBy.mockReturnValue({ limit });
         limit.mockResolvedValue([
             {

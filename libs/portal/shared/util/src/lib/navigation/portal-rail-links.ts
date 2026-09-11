@@ -25,7 +25,7 @@ export interface PortalRailLink {
 interface BuildPortalRailLinksOptions {
     provider: PortalProvider;
     playlistId: string;
-    isElectron: boolean;
+    supportsDownloads: boolean;
     workspace: boolean;
 }
 
@@ -37,7 +37,7 @@ interface PortalRailLinkGroups {
 export function buildPortalRailLinks(
     options: BuildPortalRailLinksOptions
 ): PortalRailLinkGroups {
-    const { provider, playlistId, isElectron, workspace } = options;
+    const { provider, playlistId, supportsDownloads, workspace } = options;
     const root = workspace
         ? ['/workspace', provider, playlistId]
         : [`/${provider}`, playlistId];
@@ -45,17 +45,6 @@ export function buildPortalRailLinks(
     if (provider === 'xtreams') {
         const primary: PortalRailLink[] = [];
         const secondary: PortalRailLink[] = [];
-
-        if (workspace && !isElectron) {
-            primary.push({
-                icon: 'movie',
-                tooltip: 'Xtream library (this playlist)',
-                path: root,
-                exact: true,
-                section: 'library',
-            });
-            return { primary, secondary };
-        }
 
         primary.push(
             {
@@ -93,7 +82,7 @@ export function buildPortalRailLinks(
             }
         );
 
-        if (isElectron) {
+        if (supportsDownloads) {
             secondary.push({
                 icon: 'download',
                 tooltip: 'Downloads (this playlist)',
@@ -142,7 +131,7 @@ export function buildPortalRailLinks(
             },
         ];
 
-        if (isElectron) {
+        if (supportsDownloads) {
             secondary.push({
                 icon: 'download',
                 tooltip: 'Downloads (this playlist)',

@@ -1,6 +1,15 @@
+<!--
+    Guide mode HIDES this sidebar instead of removing it: destroying it would
+    destroy `app-channel-list-container`, whose `ngOnDestroy` dispatches
+    `resetActiveChannel()` — that clears the active channel the guide itself
+    needs, so the guide would close again the moment it opened. `inert` keeps
+    the hidden rail out of the tab order and away from assistive technology.
+-->
 <div
     class="sidebar"
     [class.sidebar-collapsed]="isSidebarCollapsed()"
+    [class.sidebar--guide-hidden]="guideOpen()"
+    [attr.inert]="guideOpen() ? '' : null"
     appResizable
     [minWidth]="sidebarMinWidth"
     [maxWidth]="sidebarMaxWidth"
@@ -35,16 +44,27 @@
                 onGroupedSidebarWidthRequestEnded($event)
             "
             (sidebarToggleRequested)="toggleSidebar()"
+            (selectedGroupChange)="onSidebarGroupSelected($event)"
         />
     } @loading {
-        <app-channel-list-loading-state [view]="activeView()" />
+        <app-channel-list-loading-state
+            [view]="activeView()"
+            [showEpg]="supportsEpg"
+        />
     } @placeholder {
-        <app-channel-list-loading-state [view]="activeView()" />
+        <app-channel-list-loading-state
+            [view]="activeView()"
+            [showEpg]="supportsEpg"
+        />
     }
 </div>
 
-<div class="content-container">
-    @if (isSidebarCollapsed()) {
+<div
+    class="content-container"
+    [class.is-guide]="guideOpen()"
+    [class.is-guide-collapsed]="guideOpen() && guideDockCollapsed()"
+>
+    @if (isSidebarCollapsed() && !guideOpen()) {
         <button
             mat-icon-button
             type="button"
@@ -58,77 +78,175 @@
         </button>
     }
     @if (activeChannel(); as activeChannel) {
-        @if (
-            activeChannel.radio === 'true' ||
-            shouldShowInlinePlayer(activeChannel)
-        ) {
-            <div class="video-player">
-                @if (activeChannel.radio === 'true') {
-                    <app-audio-player
-                        [url]="activeChannel.url"
-                        [icon]="activeChannel?.tvg?.logo!"
-                        [channelName]="
-                            activeChannel.name || activeChannel?.tvg?.name || ''
-                        "
-                    />
-                } @else {
-                    <app-web-player-view
-                        [streamUrl]="embeddedPlayback()?.streamUrl ?? ''"
-                        [title]="embeddedPlayback()?.title ?? ''"
-                        [playback]="embeddedPlayback()"
-                        [playerOverride]="playerSettings.player ?? null"
-                        [volume]="volume"
-                        [showCaptions]="!!playerSettings.showCaptions"
-                        (externalFallbackRequested)="
-                            handleExternalFallbackRequest($event)
-                        "
-                    />
-                }
-            </div>
-        }
-
-        @if (activeChannel.radio !== 'true') {
-            @let canCollapseEpgPanel = shouldShowInlinePlayer(activeChannel);
-            <div
-                class="epg"
-                [class.epg-collapsed]="
-                    canCollapseEpgPanel && isLiveEpgPanelCollapsed()
+        @if (showMovieDetail()) {
+            <app-m3u-vod-detail
+                [channel]="activeChannel"
+                [playback]="embeddedPlayback()"
+                [playbackSessionKey]="playbackSessionKey()"
+                [inlinePlayerAvailable]="shouldShowInlinePlayer(activeChannel)"
+                [volume]="volume()"
+                [playerOverride]="playerSettings.player ?? null"
+                (playbackStarted)="refreshVolumeFromBus()"
+                (externalFallbackRequested)="
+                    handleExternalFallbackRequest($event)
                 "
-            >
-                @if (canCollapseEpgPanel) {
-                    <app-live-epg-panel
-                        [collapsed]="isLiveEpgPanelCollapsed()"
-                        [summary]="liveEpgPanelSummary()"
-                        [showDateNavigator]="true"
-                        [selectedDate]="selectedLiveEpgDate()"
-                        (collapsedChange)="
-                            onLiveEpgPanelCollapsedChange($event)
-                        "
-                        (dateNavigation)="onLiveEpgDateNavigation($event)"
-                    >
-                        <div class="epg-content">
-                            <app-epg-list
-                                [selectedDate]="selectedLiveEpgDate()"
-                                [showDateNavigator]="false"
+            />
+        } @else {
+            @if (
+                activeChannel.radio === 'true' ||
+                shouldShowInlinePlayer(activeChannel)
+            ) {
+                <div
+                    class="video-player"
+                    [attr.data-player-shortcuts-suspended]="
+                        guideOpen() ? '' : null
+                    "
+                >
+                    @if (activeChannel.radio === 'true') {
+                        <app-audio-player
+                            [url]="activeChannel.url"
+                            [icon]="activeChannel?.tvg?.logo!"
+                            [channelName]="displayChannelName()"
+                            [volume]="volume()"
+                            (volumeChange)="onInlineVolumeChange($event)"
+                        />
+                    } @else {
+                        <app-web-player-view
+                            [playbackSessionKey]="playbackSessionKey()"
+                            [streamUrl]="embeddedPlayback()?.streamUrl ?? ''"
+                            [title]="inlinePlayerTitle()"
+                            [playback]="embeddedPlayback()"
+                            [playerOverride]="
+                                activeChannelIsDash()
+                                    ? dashPlayerOverride()
+                                    : (playerSettings.player ?? null)
+                            "
+                            [volume]="volume()"
+                            [recordingMetadata]="recordingMetadata()"
+                            (externalFallbackRequested)="
+                                handleExternalFallbackRequest($event)
+                            "
+                            (recordingStopped)="onRecordingStopped($event)"
+                        />
+                    }
+                    @if (guideOpen()) {
+                        <app-epg-guide-now-playing
+                            [channelName]="timelineChannelName()"
+                            [program]="guideNowPlayingProgram()"
+                            [offsetMinutes]="epgOffsetMinutes()"
+                            [collapsed]="guideDockCollapsed()"
+                            (closeRequested)="closeGuide()"
+                            (collapsedChange)="setGuideDockCollapsed($event)"
+                        />
+                    }
+                </div>
+            }
+
+            @if (guideOpen() && !shouldShowInlinePlayer(activeChannel)) {
+                <div class="video-player guide-dock--external">
+                    <app-epg-guide-now-playing
+                        [channelName]="timelineChannelName()"
+                        [program]="guideNowPlayingProgram()"
+                        [offsetMinutes]="epgOffsetMinutes()"
+                        [collapsed]="true"
+                        [collapsible]="false"
+                        (closeRequested)="closeGuide()"
+                    />
+                </div>
+            }
+
+            @if (guideOpen()) {
+                <app-epg-guide class="epg-guide-host" (close)="closeGuide()" />
+            } @else if (supportsEpg && activeChannel.radio !== 'true') {
+                @let canCollapseEpgPanel =
+                    shouldShowInlinePlayer(activeChannel);
+                <div
+                    class="epg"
+                    [class.epg--inline]="canCollapseEpgPanel"
+                    [class.epg--list]="epgViewMode() === 'list'"
+                    [class.epg-collapsed]="
+                        canCollapseEpgPanel && isLiveEpgPanelCollapsed()
+                    "
+                >
+                    <div class="epg-content">
+                        @if (epgViewMode() === 'list') {
+                            <app-epg-list-view
+                                [programs]="epgPrograms()"
+                                [offsetMinutes]="epgOffsetMinutes()"
+                                [channelName]="timelineChannelName()"
+                                [channelLogo]="timelineChannelLogo()"
+                                [archiveContextKey]="archiveContextKey()"
                                 [archivePlaybackAvailable]="
                                     archivePlaybackAvailable()
                                 "
+                                [archiveDays]="epgArchiveDays()"
+                                [activeProgram]="activeEpgProgramOrNull()"
+                                [isLivePlayback]="!showReturnToLive()"
+                                [selectedDate]="selectedLiveEpgDate()"
+                                [collapsed]="
+                                    canCollapseEpgPanel &&
+                                    isLiveEpgPanelCollapsed()
+                                "
+                                [summary]="liveEpgPanelSummary()"
+                                [summaryLabelKey]="
+                                    liveEpgPanelSummaryLabelKey()
+                                "
+                                [emptyReason]="liveEpgEmptyReason()"
+                                [guideAvailable]="canOpenGuide()"
+                                (programActivated)="
+                                    onTimelineProgramActivated($event)
+                                "
+                                (returnToLive)="returnToLivePlayback()"
                                 (selectedDateChange)="
                                     onLiveEpgSelectedDateChange($event)
                                 "
+                                (collapsedChange)="
+                                    onLiveEpgPanelCollapsedChange($event)
+                                "
+                                (openEpgSettings)="openEpgSettings()"
+                                (openGuide)="openGuide()"
                             />
-                        </div>
-                    </app-live-epg-panel>
-                } @else {
-                    <div class="epg-content">
-                        <app-epg-list
-                            [archivePlaybackAvailable]="
-                                archivePlaybackAvailable()
-                            "
-                        />
+                        } @else {
+                            <app-epg-timeline
+                                [programs]="epgPrograms()"
+                                [offsetMinutes]="epgOffsetMinutes()"
+                                [channelName]="timelineChannelName()"
+                                [channelLogo]="timelineChannelLogo()"
+                                [archiveContextKey]="archiveContextKey()"
+                                [archivePlaybackAvailable]="
+                                    archivePlaybackAvailable()
+                                "
+                                [archiveDays]="epgArchiveDays()"
+                                [activeProgram]="activeEpgProgramOrNull()"
+                                [isLivePlayback]="!showReturnToLive()"
+                                [selectedDate]="selectedLiveEpgDate()"
+                                [collapsed]="
+                                    canCollapseEpgPanel &&
+                                    isLiveEpgPanelCollapsed()
+                                "
+                                [summary]="liveEpgPanelSummary()"
+                                [summaryLabelKey]="
+                                    liveEpgPanelSummaryLabelKey()
+                                "
+                                [emptyReason]="liveEpgEmptyReason()"
+                                [guideAvailable]="canOpenGuide()"
+                                (programActivated)="
+                                    onTimelineProgramActivated($event)
+                                "
+                                (returnToLive)="returnToLivePlayback()"
+                                (selectedDateChange)="
+                                    onLiveEpgSelectedDateChange($event)
+                                "
+                                (collapsedChange)="
+                                    onLiveEpgPanelCollapsedChange($event)
+                                "
+                                (openEpgSettings)="openEpgSettings()"
+                                (openGuide)="openGuide()"
+                            />
+                        }
                     </div>
-                }
-            </div>
+                </div>
+            }
         }
 
         @if (showChannelNumberOverlay) {
@@ -138,6 +256,8 @@
                 </div>
             </div>
         }
+    } @else if (isSidebarCollapsed()) {
+        <app-channel-list-hidden-state (restore)="toggleSidebar()" />
     } @else {
         <app-portal-empty-state
             icon="live_tv"
@@ -145,3 +265,19 @@
         />
     }
 </div>
+
+<!-- Stamped into the player's fullscreen channel panel (FULLSCREEN_CHANNEL_PANEL). -->
+<ng-template
+    #fullscreenChannelPanel
+    let-searchTerm="searchTerm"
+    let-close="close"
+>
+    <app-m3u-fullscreen-channel-list
+        [channels]="fullscreenPanelChannels()"
+        [channelsLoading]="channelsLoading()"
+        [initialView]="activeView()"
+        [recentItems]="activePlaylistRecentItems()"
+        [searchTerm]="searchTerm()"
+        (closeRequested)="close()"
+    />
+</ng-template>

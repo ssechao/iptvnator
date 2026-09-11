@@ -1,8 +1,31 @@
-import type { PlaylistMeta } from '@iptvnator/shared/interfaces';
+import type { EpgProgram, PlaylistMeta } from '@iptvnator/shared/interfaces';
+import { DEFAULT_DASHBOARD_RAILS_SETTINGS } from '@iptvnator/shared/interfaces';
 import {
+    buildDashboardCollectionViewState,
+    buildDashboardContinueWatchingActions,
+    buildDashboardRailSeeAllState,
     buildDashboardSourceActions,
-    resolveDashboardHeroArtwork,
-} from './workspace-dashboard-rails.component';
+    liveRailTitleKeyForSource,
+    shouldShowLiveFavoritesSkeleton,
+    shouldShowRecentContentSkeleton,
+} from './dashboard-rail.utils';
+import {
+    buildDashboardLiveEpgDetails,
+    buildLiveEpgCardsForEnabledRails,
+    buildLiveEpgLookupKeys,
+    calcEpgProgress,
+    formatEpgTimeRange,
+    getLiveEpgProgramForCard,
+} from './dashboard-live-epg.utils';
+import {
+    buildPlaybackPositionReloadKey,
+    formatRemainingLabel,
+    isContinueWatchingRecentItem,
+    playbackProgressPercent,
+} from './dashboard-playback.utils';
+import { resolveDashboardHeroArtwork } from './dashboard-hero.utils';
+import type { DashboardRailCard } from './dashboard-rail.component';
+import { COLLECTION_VIEW_STATE_KEY } from '@iptvnator/portal/shared/util';
 
 describe('buildDashboardSourceActions', () => {
     const basePlaylist = {
@@ -59,14 +82,63 @@ describe('buildDashboardSourceActions', () => {
         ]);
     });
 
-    it('exposes info and remove for Stalker sources', () => {
+    it('exposes info, account, and remove for Stalker sources', () => {
         const playlist = {
             ...basePlaylist,
             macAddress: '00:1A:79:00:00:01',
             portalUrl: 'https://stalker.example.test',
         } as PlaylistMeta;
 
-        expect(actionIds(playlist, false)).toEqual(['playlist-info', 'remove']);
+        expect(actionIds(playlist, false)).toEqual([
+            'playlist-info',
+            'account-info',
+            'remove',
+        ]);
+    });
+});
+
+describe('buildDashboardContinueWatchingActions', () => {
+    const actionIds = (options: {
+        canResume: boolean;
+        canMarkWatched: boolean;
+    }) =>
+        buildDashboardContinueWatchingActions(options).map(
+            (action) => action.id
+        );
+
+    it('exposes resume, mark-watched, and remove for a resumable series', () => {
+        expect(actionIds({ canResume: true, canMarkWatched: true })).toEqual([
+            'resume',
+            'mark-watched',
+            'remove-from-history',
+        ]);
+    });
+
+    it('keeps only remove when the card has no resumable or markable position', () => {
+        const actions = buildDashboardContinueWatchingActions({
+            canResume: false,
+            canMarkWatched: false,
+        });
+
+        expect(actions.map((action) => action.id)).toEqual([
+            'remove-from-history',
+        ]);
+        // Sole entry → no leading separator above it.
+        expect(actions[0].separatorBefore).toBe(false);
+        expect(actions[0].destructive).toBe(true);
+    });
+
+    it('separates the destructive remove entry from the content actions', () => {
+        const actions = buildDashboardContinueWatchingActions({
+            canResume: false,
+            canMarkWatched: true,
+        });
+
+        expect(actions.map((action) => action.id)).toEqual([
+            'mark-watched',
+            'remove-from-history',
+        ]);
+        expect(actions[1].separatorBefore).toBe(true);
     });
 });
 
@@ -113,5 +185,486 @@ describe('resolveDashboardHeroArtwork', () => {
         });
         expect(artwork.fallbackBackdropBackground).toContain('linear-gradient');
         expect(artwork.fallbackPosterBackground).toContain('linear-gradient');
+    });
+});
+
+describe('EPG enrichment helpers', () => {
+    // `startTimestamp`/`stopTimestamp` are unix SECONDS, as everywhere else
+    // in the app; the helpers scale them to the millisecond clock they get.
+    const START_S = Math.floor(Date.UTC(2026, 4, 19, 12, 0, 0) / 1000);
+    const STOP_S = Math.floor(Date.UTC(2026, 4, 19, 12, 30, 0) / 1000);
+    const baseProgram = (overrides: Partial<EpgProgram> = {}): EpgProgram =>
+        ({
+            title: 'Tagesschau',
+            desc: null,
+            start: '2026-05-19T12:00:00.000Z',
+            stop: '2026-05-19T12:30:00.000Z',
+            startTimestamp: START_S,
+            stopTimestamp: STOP_S,
+            ...overrides,
+        }) as EpgProgram;
+
+    describe('formatEpgTimeRange', () => {
+        it('formats a start–stop window using the locale-independent HH:MM range', () => {
+            const range = formatEpgTimeRange(baseProgram());
+            // Format is HH:MM – HH:MM (en dash), in the test runner's local
+            // timezone — assert structure, not exact hours.
+            expect(range).toMatch(/^\d{2}:\d{2} – \d{2}:\d{2}$/);
+        });
+
+        it('returns null when either timestamp is missing or unparseable', () => {
+            expect(
+                formatEpgTimeRange(
+                    baseProgram({
+                        start: 'not-a-date',
+                        startTimestamp: null,
+                    })
+                )
+            ).toBeNull();
+
+            expect(
+                formatEpgTimeRange(
+                    baseProgram({
+                        stop: '',
+                        stopTimestamp: null,
+                    })
+                )
+            ).toBeNull();
+        });
+    });
+
+    describe('calcEpgProgress', () => {
+        const program = baseProgram();
+        const start = START_S * 1000;
+        const stop = STOP_S * 1000;
+
+        it('returns 0 at the start of the window', () => {
+            expect(calcEpgProgress(program, start)).toBe(0);
+        });
+
+        it('returns 100 at the end of the window', () => {
+            expect(calcEpgProgress(program, stop)).toBe(100);
+        });
+
+        it('clamps below 0 and above 100 for out-of-window times', () => {
+            expect(calcEpgProgress(program, start - 60_000)).toBe(0);
+            expect(calcEpgProgress(program, stop + 60_000)).toBe(100);
+        });
+
+        it('interpolates linearly across the window', () => {
+            const mid = start + (stop - start) / 2;
+            expect(calcEpgProgress(program, mid)).toBeCloseTo(50, 5);
+        });
+
+        it('returns null when the window is zero-length or inverted', () => {
+            expect(
+                calcEpgProgress(
+                    baseProgram({ stopTimestamp: START_S }),
+                    start + 10
+                )
+            ).toBeNull();
+            expect(
+                calcEpgProgress(
+                    baseProgram({ stopTimestamp: START_S - 1 }),
+                    start
+                )
+            ).toBeNull();
+        });
+    });
+
+    describe('buildDashboardLiveEpgDetails', () => {
+        it('builds the current programme details used by the live hero banner', () => {
+            const program = baseProgram({ title: 'Market Open' });
+            const start = START_S * 1000;
+            const stop = STOP_S * 1000;
+            const now = start + (stop - start) / 4;
+
+            expect(buildDashboardLiveEpgDetails(program, now)).toMatchObject({
+                nowPlayingTitle: 'Market Open',
+                nowPlayingTimeRange: expect.stringMatching(
+                    /^\d{2}:\d{2} – \d{2}:\d{2}$/
+                ),
+                nowPlayingProgress: 25,
+            });
+        });
+    });
+});
+
+describe('Continue watching helpers', () => {
+    it('keeps live TV out of the Continue Watching rail', () => {
+        expect(isContinueWatchingRecentItem({ type: 'movie' })).toBe(true);
+        expect(isContinueWatchingRecentItem({ type: 'series' })).toBe(true);
+        expect(isContinueWatchingRecentItem({ type: 'live' })).toBe(false);
+    });
+});
+
+describe('Live rail helpers', () => {
+    const channelCard = (
+        overrides: Partial<DashboardRailCard> = {}
+    ): DashboardRailCard => ({
+        id: 'card-1',
+        title: 'Display Channel',
+        subtitle: 'M3U · Live',
+        icon: 'live_tv',
+        contentType: 'live',
+        link: ['/workspace', 'playlists', 'm3u-1'],
+        ...overrides,
+    });
+
+    it('uses explicit EPG lookup keys before falling back to card titles', () => {
+        expect(
+            buildLiveEpgLookupKeys([
+                channelCard({
+                    title: 'Das Erste HD',
+                    epgLookupKey: 'ard.de',
+                }),
+                channelCard({
+                    id: 'card-2',
+                    title: 'Das Erste HD',
+                    epgLookupKey: 'ard.de',
+                }),
+                channelCard({
+                    id: 'card-3',
+                    title: 'Fallback News',
+                }),
+            ])
+        ).toEqual(['ard.de', 'Fallback News']);
+    });
+
+    it('reads EPG programs by explicit lookup key instead of display title', () => {
+        const program = { title: 'Tagesschau' } as EpgProgram;
+        const wrongProgram = { title: 'Wrong channel' } as EpgProgram;
+        const card = channelCard({
+            title: 'Das Erste HD',
+            epgLookupKey: 'ard.de',
+        });
+
+        expect(
+            getLiveEpgProgramForCard(
+                card,
+                new Map<string, EpgProgram | null>([
+                    ['Das Erste HD', wrongProgram],
+                    ['ard.de', program],
+                ])
+            )
+        ).toBe(program);
+    });
+
+    it('uses honest, semantically named title keys for favorite and recent live rails', () => {
+        expect(liveRailTitleKeyForSource('favorites')).toBe(
+            'WORKSPACE.DASHBOARD.LIVE_FAVORITES'
+        );
+        expect(liveRailTitleKeyForSource('recent')).toBe(
+            'WORKSPACE.DASHBOARD.RECENTLY_WATCHED_LIVE_TV'
+        );
+    });
+
+    it('builds collection view state for dashboard rail see-all links', () => {
+        expect(buildDashboardCollectionViewState('movie')).toEqual({
+            [COLLECTION_VIEW_STATE_KEY]: {
+                selectedContentType: 'movie',
+            },
+        });
+        expect(buildDashboardCollectionViewState('series')).toEqual({
+            [COLLECTION_VIEW_STATE_KEY]: {
+                selectedContentType: 'series',
+            },
+        });
+    });
+
+    it('builds see-all state from the first card content type in mixed rails', () => {
+        expect(
+            buildDashboardRailSeeAllState([
+                channelCard({ contentType: 'live' }),
+                channelCard({
+                    id: 'movie-card',
+                    title: 'Movie',
+                    contentType: 'movie',
+                }),
+            ])
+        ).toEqual({
+            [COLLECTION_VIEW_STATE_KEY]: {
+                selectedContentType: 'live',
+            },
+        });
+        expect(
+            buildDashboardRailSeeAllState([
+                channelCard({
+                    id: 'series-card',
+                    title: 'Series',
+                    contentType: 'series',
+                }),
+            ])
+        ).toEqual({
+            [COLLECTION_VIEW_STATE_KEY]: {
+                selectedContentType: 'series',
+            },
+        });
+    });
+
+    it('builds a stable playback-position reload key from VOD and series items only', () => {
+        const first = buildPlaybackPositionReloadKey([
+            { playlist_id: 'b', xtream_id: 20, type: 'series' },
+            { playlist_id: 'live', xtream_id: 'stream-url', type: 'live' },
+            { playlist_id: 'a', xtream_id: 10, type: 'movie' },
+        ]);
+        const second = buildPlaybackPositionReloadKey([
+            { playlist_id: 'a', xtream_id: 10, type: 'movie' },
+            { playlist_id: 'b', xtream_id: 20, type: 'series' },
+        ]);
+
+        expect(first).toBe(second);
+        expect(first).toBe('a::movie::10|b::series::20');
+    });
+
+    it('omits hero cards from live EPG lookup sources when the hero rail is disabled', () => {
+        const hero = channelCard({ id: 'hero', epgLookupKey: 'hero' });
+        const favorite = channelCard({
+            id: 'favorite',
+            epgLookupKey: 'favorite',
+        });
+        const recent = channelCard({ id: 'recent', epgLookupKey: 'recent' });
+
+        expect(
+            buildLiveEpgCardsForEnabledRails(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    hero: false,
+                },
+                hero,
+                [favorite],
+                [recent]
+            ).map((card) => card.id)
+        ).toEqual(['favorite', 'recent']);
+    });
+
+    it('omits disabled live rails from live EPG lookup sources', () => {
+        const hero = channelCard({ id: 'hero', epgLookupKey: 'hero' });
+        const favorite = channelCard({
+            id: 'favorite',
+            epgLookupKey: 'favorite',
+        });
+        const recent = channelCard({ id: 'recent', epgLookupKey: 'recent' });
+
+        expect(
+            buildLiveEpgCardsForEnabledRails(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    liveFavorites: false,
+                    recentlyWatchedLive: false,
+                },
+                hero,
+                [favorite],
+                [recent]
+            ).map((card) => card.id)
+        ).toEqual(['hero']);
+    });
+});
+
+describe('recent content skeleton helper', () => {
+    it('shows the loading skeleton for Continue Watching when recently watched live is disabled', () => {
+        expect(
+            shouldShowRecentContentSkeleton(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    recentlyWatchedLive: false,
+                },
+                {
+                    continueWatchingCount: 0,
+                    recentLiveCount: 0,
+                    globalRecentLoading: true,
+                }
+            )
+        ).toBe(true);
+    });
+
+    it('shows the loading skeleton for recently watched live when Continue Watching is disabled', () => {
+        expect(
+            shouldShowRecentContentSkeleton(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    continueWatching: false,
+                },
+                {
+                    continueWatchingCount: 0,
+                    recentLiveCount: 0,
+                    globalRecentLoading: true,
+                }
+            )
+        ).toBe(true);
+    });
+
+    it('hides the loading skeleton when no enabled recent rail is waiting for data', () => {
+        expect(
+            shouldShowRecentContentSkeleton(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    continueWatching: false,
+                    recentlyWatchedLive: false,
+                },
+                {
+                    continueWatchingCount: 0,
+                    recentLiveCount: 0,
+                    globalRecentLoading: true,
+                }
+            )
+        ).toBe(false);
+
+        expect(
+            shouldShowRecentContentSkeleton(DEFAULT_DASHBOARD_RAILS_SETTINGS, {
+                continueWatchingCount: 1,
+                recentLiveCount: 1,
+                globalRecentLoading: true,
+            })
+        ).toBe(false);
+    });
+});
+
+describe('live favorites skeleton helper', () => {
+    it('shows the skeleton while initial global favorites are still loading', () => {
+        expect(
+            shouldShowLiveFavoritesSkeleton(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    liveFavorites: true,
+                },
+                { globalFavoritesLoading: true }
+            )
+        ).toBe(true);
+    });
+
+    it('hides the skeleton when live favorites are disabled or loading is complete', () => {
+        expect(
+            shouldShowLiveFavoritesSkeleton(
+                {
+                    ...DEFAULT_DASHBOARD_RAILS_SETTINGS,
+                    liveFavorites: false,
+                },
+                { globalFavoritesLoading: true }
+            )
+        ).toBe(false);
+
+        expect(
+            shouldShowLiveFavoritesSkeleton(DEFAULT_DASHBOARD_RAILS_SETTINGS, {
+                globalFavoritesLoading: false,
+            })
+        ).toBe(false);
+    });
+});
+
+describe('playback-position helpers', () => {
+    describe('playbackProgressPercent', () => {
+        it('returns null when there is no position or no duration', () => {
+            expect(playbackProgressPercent(null)).toBeNull();
+            expect(
+                playbackProgressPercent({ positionSeconds: 300 })
+            ).toBeNull();
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 300,
+                    durationSeconds: 0,
+                })
+            ).toBeNull();
+        });
+
+        it('returns the integer percent watched, clamped to [0, 100]', () => {
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 0,
+                    durationSeconds: 6000,
+                })
+            ).toBe(0);
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 3000,
+                    durationSeconds: 6000,
+                })
+            ).toBe(50);
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 6000,
+                    durationSeconds: 6000,
+                })
+            ).toBe(100);
+            // Past-end resume is clamped, not negative.
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 7000,
+                    durationSeconds: 6000,
+                })
+            ).toBe(100);
+            // Floor rounding — 99.97% stays at 99% to avoid the "watched
+            // completely" optical illusion when 1 second remains.
+            expect(
+                playbackProgressPercent({
+                    positionSeconds: 5998.5,
+                    durationSeconds: 6000,
+                })
+            ).toBe(99);
+        });
+    });
+
+    describe('formatRemainingLabel', () => {
+        it('returns null without a usable position/duration', () => {
+            expect(formatRemainingLabel(null)).toBeNull();
+            expect(formatRemainingLabel({ positionSeconds: 100 })).toBeNull();
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 100,
+                    durationSeconds: -1,
+                })
+            ).toBeNull();
+        });
+
+        it('returns translation keys and params for sub-minute, minute, and hour-spanning remainders', () => {
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 5970,
+                    durationSeconds: 6000,
+                })
+            ).toEqual({
+                key: 'WORKSPACE.DASHBOARD.REMAINING_SECONDS',
+                params: { seconds: 30 },
+            });
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 0,
+                    durationSeconds: 1800,
+                })
+            ).toEqual({
+                key: 'WORKSPACE.DASHBOARD.REMAINING_MINUTES',
+                params: { minutes: 30 },
+            });
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 0,
+                    durationSeconds: 3600,
+                })
+            ).toEqual({
+                key: 'WORKSPACE.DASHBOARD.REMAINING_HOURS',
+                params: { hours: 1 },
+            });
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 600,
+                    durationSeconds: 6840,
+                })
+            ).toEqual({
+                key: 'WORKSPACE.DASHBOARD.REMAINING_HOURS_MINUTES',
+                params: { hours: 1, minutes: 44 },
+            });
+        });
+
+        it('clamps below zero to the translated zero-seconds state', () => {
+            expect(
+                formatRemainingLabel({
+                    positionSeconds: 7000,
+                    durationSeconds: 6000,
+                })
+            ).toEqual({
+                key: 'WORKSPACE.DASHBOARD.REMAINING_SECONDS',
+                params: { seconds: 0 },
+            });
+        });
     });
 });

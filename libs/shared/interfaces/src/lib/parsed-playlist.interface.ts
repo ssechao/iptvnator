@@ -1,8 +1,8 @@
+import { ChannelDrm } from './channel-drm.interface';
+
 export interface ParsedPlaylist {
     header: {
-        attrs: {
-            'x-tvg-url': string;
-        };
+        attrs: Record<string, string | undefined>;
         raw: string;
     };
     items: ParsedPlaylistItem[];
@@ -24,7 +24,8 @@ export interface ParsedPlaylistItem {
         referrer: string;
         'user-agent': string;
     };
-    url: string;
+    /** absent when an #EXTINF entry has no stream URL (e.g. truncated file) */
+    url?: string;
     raw: string;
     catchup?: {
         type?: string;
@@ -33,4 +34,5 @@ export interface ParsedPlaylistItem {
     };
     timeshift?: string;
     radio?: string;
+    drm?: ChannelDrm;
 }

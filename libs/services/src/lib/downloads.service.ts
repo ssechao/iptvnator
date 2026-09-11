@@ -1,54 +1,40 @@
+import type { DownloadRecoveryResult } from '@iptvnator/shared/interfaces';
 import { computed, inject, Injectable, OnDestroy, signal } from '@angular/core';
-import { SettingsStore } from './settings-store.service';
+import type { DownloadMetadataSnapshot } from '@iptvnator/shared/interfaces';
+import type { ElectronBridgeDownloadStartResult } from '@iptvnator/shared/interfaces';
+import { DownloadListLoadState } from './download-list-load-state';
+import { updateDownloadMetadata } from './downloads-metadata-update';
+import type { DownloadItem, DownloadStartInput } from './downloads.models';
+import { formatDownloadBytes } from './downloads.utils';
+import { RuntimeCapabilitiesService } from './runtime-capabilities.service';
 
-export type DownloadStatus =
-    | 'queued'
-    | 'downloading'
-    | 'completed'
-    | 'failed'
-    | 'canceled';
-
-export interface DownloadItem {
-    id: number;
-    playlistId: string;
-    xtreamId: number;
-    contentType: 'vod' | 'episode';
-    seriesXtreamId?: number;
-    seasonNumber?: number;
-    episodeNumber?: number;
-    title: string;
-    url: string;
-    fileName?: string;
-    filePath?: string;
-    posterUrl?: string;
-    status: DownloadStatus;
-    bytesDownloaded?: number;
-    totalBytes?: number;
-    errorMessage?: string;
-    createdAt?: string;
-    updatedAt?: string;
-}
+export type {
+    DownloadItem,
+    DownloadStartInput,
+    DownloadStatus,
+} from './downloads.models';
 
 @Injectable({ providedIn: 'root' })
 export class DownloadsService implements OnDestroy {
-    private readonly settingsStore = inject(SettingsStore);
+    private readonly runtime = inject(RuntimeCapabilitiesService);
     private unsubscribe?: () => void;
-    private loadDownloadsRequestId = 0;
-
-    private readonly _isLoadingDownloads = signal(false);
-    private readonly _hasLoadedDownloads = signal(false);
+    private readonly downloadListLoadState = new DownloadListLoadState();
 
     /** Signal for the list of downloads */
     readonly downloads = signal<DownloadItem[]>([]);
 
     /** Whether the download list is currently being loaded */
-    readonly isLoadingDownloads = this._isLoadingDownloads.asReadonly();
+    readonly isLoadingDownloads = this.downloadListLoadState.isLoading;
 
     /** Whether the first download list request has completed */
-    readonly hasLoadedDownloads = this._hasLoadedDownloads.asReadonly();
+    readonly hasLoadedDownloads = this.downloadListLoadState.hasLoaded;
+
+    /** Whether the latest download list request completed successfully */
+    readonly hasAuthoritativeDownloadList =
+        this.downloadListLoadState.hasAuthoritativeList;
 
     /** Whether the download feature is available (Electron only) */
-    readonly isAvailable = computed(() => !!window.electron?.downloadsGetList);
+    readonly isAvailable = computed(() => this.runtime.supportsDownloads);
 
     /** Whether there are any downloads */
     readonly hasDownloads = computed(() => this.downloads().length > 0);
@@ -86,16 +72,18 @@ export class DownloadsService implements OnDestroy {
             return;
         }
 
+        // Subscribe BEFORE the initial load, so a transition pinged while
+        // that request is pending is coalesced into a trailing refresh
+        // instead of being lost with the pre-transition response.
+        this.unsubscribe = window.electron.onDownloadsUpdate(() => {
+            this.loadDownloads();
+        });
+
         // Load initial download list
         await this.loadDownloads();
 
         // Load download folder
         await this.loadDownloadFolder();
-
-        // Subscribe to download updates
-        this.unsubscribe = window.electron.onDownloadsUpdate(() => {
-            this.loadDownloads();
-        });
     }
 
     ngOnDestroy() {
@@ -103,30 +91,25 @@ export class DownloadsService implements OnDestroy {
     }
 
     /**
-     * Load downloads from the backend
+     * Load downloads from the backend. Overlapping callers coalesce behind one
+     * serialized trailing refresh.
      */
-    async loadDownloads(playlistId?: string): Promise<void> {
+    async loadDownloads(): Promise<void> {
         if (!this.isAvailable()) return;
 
-        const requestId = ++this.loadDownloadsRequestId;
-        this._isLoadingDownloads.set(true);
-
-        try {
-            const list = await window.electron.downloadsGetList(playlistId);
-            if (requestId === this.loadDownloadsRequestId) {
+        return this.downloadListLoadState.run(async () => {
+            try {
+                const list = await window.electron.downloadsGetList();
                 this.downloads.set(list);
-                this._hasLoadedDownloads.set(true);
+                this.downloadListLoadState.markSucceeded();
+            } catch (error) {
+                console.error(
+                    '[DownloadsService] Error loading downloads:',
+                    error
+                );
+                this.downloadListLoadState.markFailed();
             }
-        } catch (error) {
-            console.error('[DownloadsService] Error loading downloads:', error);
-            if (requestId === this.loadDownloadsRequestId) {
-                this._hasLoadedDownloads.set(true);
-            }
-        } finally {
-            if (requestId === this.loadDownloadsRequestId) {
-                this._isLoadingDownloads.set(false);
-            }
-        }
+        });
     }
 
     /**
@@ -135,14 +118,9 @@ export class DownloadsService implements OnDestroy {
     async loadDownloadFolder(): Promise<string> {
         if (!this.isAvailable()) return '';
 
-        // First check settings
-        const storedFolder = this.settingsStore.getDownloadFolder?.();
-        if (storedFolder) {
-            this.downloadFolder.set(storedFolder);
-            return storedFolder;
-        }
-
-        // Fall back to default
+        // The main process owns folder authorization. It returns either the OS
+        // default or a custom folder previously selected through a native
+        // dialog, rather than trusting renderer-managed settings.
         try {
             const defaultFolder =
                 await window.electron.downloadsGetDefaultFolder();
@@ -160,24 +138,9 @@ export class DownloadsService implements OnDestroy {
     /**
      * Start a new download
      */
-    async startDownload(data: {
-        playlistId: string;
-        xtreamId: number;
-        contentType: 'vod' | 'episode';
-        title: string;
-        url: string;
-        posterUrl?: string;
-        headers?: { userAgent?: string; referer?: string; origin?: string };
-        seriesXtreamId?: number;
-        seasonNumber?: number;
-        episodeNumber?: number;
-        // Playlist info for auto-creation if needed (Stalker playlists)
-        playlistName?: string;
-        playlistType?: 'xtream' | 'stalker' | 'm3u-file' | 'm3u-text' | 'm3u-url';
-        serverUrl?: string;
-        portalUrl?: string;
-        macAddress?: string;
-    }): Promise<{ success: boolean; id?: number; error?: string }> {
+    async startDownload(
+        data: DownloadStartInput
+    ): Promise<ElectronBridgeDownloadStartResult> {
         if (!this.isAvailable()) {
             return { success: false, error: 'Downloads not available' };
         }
@@ -227,6 +190,53 @@ export class DownloadsService implements OnDestroy {
     }
 
     /**
+     * Pause a queued or active download
+     */
+    async pauseDownload(
+        downloadId: number
+    ): Promise<{ success: boolean; error?: string }> {
+        if (!this.isAvailable()) {
+            return { success: false, error: 'Downloads not available' };
+        }
+
+        try {
+            return await window.electron.downloadsPause(downloadId);
+        } catch (error) {
+            console.error('[DownloadsService] Error pausing download:', error);
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
+    }
+
+    /**
+     * Resume a paused download
+     */
+    async resumeDownload(
+        downloadId: number
+    ): Promise<{ success: boolean; error?: string }> {
+        if (!this.isAvailable()) {
+            return { success: false, error: 'Downloads not available' };
+        }
+
+        const folder = await this.loadDownloadFolder();
+        if (!folder) {
+            return { success: false, error: 'No download folder configured' };
+        }
+
+        try {
+            return await window.electron.downloadsResume(downloadId, folder);
+        } catch (error) {
+            console.error('[DownloadsService] Error resuming download:', error);
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
+    }
+
+    /**
      * Retry a failed download
      */
     async retryDownload(
@@ -244,8 +254,29 @@ export class DownloadsService implements OnDestroy {
         try {
             return await window.electron.downloadsRetry(downloadId, folder);
         } catch (error) {
+            console.error('[DownloadsService] Error retrying download:', error);
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
+    }
+
+    /**
+     * Re-download a completed item whose finalized file is unavailable.
+     */
+    async redownloadMissing(
+        downloadId: number
+    ): Promise<{ success: boolean; recovered?: boolean; error?: string }> {
+        if (!this.isAvailable()) {
+            return { success: false, error: 'Downloads not available' };
+        }
+
+        try {
+            return await window.electron.downloadsRedownloadMissing(downloadId);
+        } catch (error) {
             console.error(
-                '[DownloadsService] Error retrying download:',
+                '[DownloadsService] Error re-downloading missing file:',
                 error
             );
             return {
@@ -258,9 +289,7 @@ export class DownloadsService implements OnDestroy {
     /**
      * Remove a download from the list
      */
-    async removeDownload(
-        downloadId: number
-    ): Promise<{ success: boolean; error?: string }> {
+    async removeDownload(downloadId: number): Promise<DownloadRecoveryResult> {
         if (!this.isAvailable()) {
             return { success: false, error: 'Downloads not available' };
         }
@@ -268,15 +297,20 @@ export class DownloadsService implements OnDestroy {
         try {
             return await window.electron.downloadsRemove(downloadId);
         } catch (error) {
-            console.error(
-                '[DownloadsService] Error removing download:',
-                error
-            );
+            console.error('[DownloadsService] Error removing download:', error);
             return {
                 success: false,
                 error: error instanceof Error ? error.message : String(error),
             };
         }
+    }
+
+    /** Update the offline metadata snapshot for a managed download. */
+    async updateMetadata(
+        id: number,
+        snapshot: DownloadMetadataSnapshot
+    ): Promise<{ success: boolean; error?: string }> {
+        return updateDownloadMetadata(this, id, snapshot);
     }
 
     /**
@@ -333,15 +367,10 @@ export class DownloadsService implements OnDestroy {
             const folder = await window.electron.downloadsSelectFolder();
             if (folder) {
                 this.downloadFolder.set(folder);
-                // Save to settings
-                await this.settingsStore.updateSettings({ downloadFolder: folder });
             }
             return folder;
         } catch (error) {
-            console.error(
-                '[DownloadsService] Error selecting folder:',
-                error
-            );
+            console.error('[DownloadsService] Error selecting folder:', error);
             return null;
         }
     }
@@ -349,9 +378,7 @@ export class DownloadsService implements OnDestroy {
     /**
      * Clear completed/failed downloads
      */
-    async clearCompleted(
-        playlistId?: string
-    ): Promise<{ success: boolean }> {
+    async clearCompleted(playlistId?: string): Promise<DownloadRecoveryResult> {
         if (!this.isAvailable()) {
             return { success: false };
         }
@@ -380,6 +407,13 @@ export class DownloadsService implements OnDestroy {
     }
 
     /**
+     * Get a download item by managed id
+     */
+    getDownload(downloadId: number): DownloadItem | undefined {
+        return this.downloads().find(({ id }) => id === downloadId);
+    }
+
+    /**
      * Get download item by xtreamId and playlistId
      */
     getDownloadByContent(
@@ -403,20 +437,67 @@ export class DownloadsService implements OnDestroy {
         playlistId: string,
         contentType: 'vod' | 'episode'
     ): boolean {
-        const download = this.getDownloadByContent(xtreamId, playlistId, contentType);
-        return download?.status === 'completed' && !!download.filePath;
+        const download = this.getDownloadByContent(
+            xtreamId,
+            playlistId,
+            contentType
+        );
+        return this.hasAvailableCompletedFile(download);
     }
 
     /**
-     * Check if content is currently downloading or queued
+     * Check if content is currently downloading, queued, or paused
      */
     isDownloading(
         xtreamId: number,
         playlistId: string,
         contentType: 'vod' | 'episode'
     ): boolean {
-        const download = this.getDownloadByContent(xtreamId, playlistId, contentType);
-        return download?.status === 'downloading' || download?.status === 'queued';
+        const download = this.getDownloadByContent(
+            xtreamId,
+            playlistId,
+            contentType
+        );
+        return (
+            download?.status === 'downloading' ||
+            download?.status === 'queued' ||
+            download?.status === 'paused'
+        );
+    }
+
+    /**
+     * Check if content has a paused download
+     */
+    isPaused(
+        xtreamId: number,
+        playlistId: string,
+        contentType: 'vod' | 'episode'
+    ): boolean {
+        const download = this.getDownloadByContent(
+            xtreamId,
+            playlistId,
+            contentType
+        );
+        return download?.status === 'paused';
+    }
+
+    /**
+     * Resume the paused download that belongs to a content item
+     */
+    async resumeDownloadByContent(
+        xtreamId: number,
+        playlistId: string,
+        contentType: 'vod' | 'episode'
+    ): Promise<{ success: boolean; error?: string }> {
+        const download = this.getDownloadByContent(
+            xtreamId,
+            playlistId,
+            contentType
+        );
+        if (!download || download.status !== 'paused') {
+            return { success: false, error: 'No paused download found' };
+        }
+        return this.resumeDownload(download.id);
     }
 
     /**
@@ -427,21 +508,31 @@ export class DownloadsService implements OnDestroy {
         playlistId: string,
         contentType: 'vod' | 'episode'
     ): string | undefined {
-        const download = this.getDownloadByContent(xtreamId, playlistId, contentType);
-        if (download?.status === 'completed') {
+        const download = this.getDownloadByContent(
+            xtreamId,
+            playlistId,
+            contentType
+        );
+        if (this.hasAvailableCompletedFile(download)) {
             return download.filePath;
         }
         return undefined;
+    }
+
+    private hasAvailableCompletedFile(
+        item: DownloadItem | undefined
+    ): item is DownloadItem & { filePath: string } {
+        return (
+            item?.status === 'completed' &&
+            !!item.filePath &&
+            item.fileAvailability !== 'missing'
+        );
     }
 
     /**
      * Format bytes to human readable string
      */
     formatBytes(bytes: number): string {
-        if (bytes === 0) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        return formatDownloadBytes(bytes);
     }
 }
