@@ -290,7 +290,7 @@
             <div class="similar-movies__header">
                 <h3>{{ 'XTREAM.SIMILAR_MOVIES' | translate }}</h3>
             </div>
-            <div class="similar-movies__rail">
+            <div class="similar-movies__grid" data-testid="similar-vod-grid">
                 @for (movie of similarMovies(); track movie.streamId) {
                     <div
                         class="similar-movie"

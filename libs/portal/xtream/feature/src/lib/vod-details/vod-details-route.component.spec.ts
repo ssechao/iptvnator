@@ -446,7 +446,7 @@ describe('VodDetailsRouteComponent', () => {
         );
     });
 
-    it('prefers TMDb-enriched similar movie recommendations when configured', async () => {
+    it('renders at most nine TMDb-enriched recommendations in the grid', async () => {
         settings.set({
             language: 'en',
             tmdbApiKey: 'test-tmdb-key',
@@ -501,6 +501,20 @@ describe('VodDetailsRouteComponent', () => {
                 },
                 score: 5,
             },
+            ...Array.from({ length: 9 }, (_, index) => ({
+                streamId: 650023 + index,
+                categoryId: '236',
+                title: `Related movie ${index + 2}`,
+                posterUrl: `https://image.tmdb.org/t/p/w342/poster-${index}.jpg`,
+                rating: '7.5',
+                year: '2024',
+                addedTimestamp: 1752000000000 - index,
+                reasons: ['actor'],
+                reasonNames: {
+                    actor: ['Kevin Costner'],
+                },
+                score: 4,
+            })),
         ]);
 
         fixture.detectChanges();
@@ -512,8 +526,15 @@ describe('VodDetailsRouteComponent', () => {
             expect.objectContaining({
                 currentVodId: 650020,
                 language: 'en',
+                limit: 9,
             })
         );
+        expect(
+            host.querySelector('[data-testid="similar-vod-grid"]')
+        ).not.toBeNull();
+        expect(
+            host.querySelectorAll('[data-testid="similar-vod-card"]')
+        ).toHaveLength(9);
         expect(host.textContent).toContain('Online Match (2024)');
         expect(host.textContent).toContain('XTREAM.SIMILAR_REASON_ACTOR_NAMED');
 

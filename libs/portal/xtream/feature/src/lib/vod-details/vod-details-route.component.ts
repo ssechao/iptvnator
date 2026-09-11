@@ -52,6 +52,8 @@ import {
     buildSimilarVodRecommendations,
 } from './vod-similar-recommendations.util';
 
+const SIMILAR_VOD_GRID_LIMIT = 9;
+
 @Component({
     templateUrl: './vod-details-route.component.html',
     styleUrls: [
@@ -269,7 +271,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
     readonly similarMovies = computed(() => {
         const enrichedMovies = this.tmdbSimilarMovies();
         if (enrichedMovies.length > 0) {
-            return enrichedMovies;
+            return enrichedMovies.slice(0, SIMILAR_VOD_GRID_LIMIT);
         }
 
         return buildSimilarVodRecommendations({
@@ -280,6 +282,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
             currentCatalogItem: this.selectedCatalogItem(),
             currentCategoryId: this.selectedCategoryId(),
             candidates: this.xtreamStore.vodStreams(),
+            limit: SIMILAR_VOD_GRID_LIMIT,
         });
     });
 
@@ -829,6 +832,7 @@ export class VodDetailsRouteComponent implements OnInit, OnDestroy {
                     currentCatalogItem,
                     candidates,
                     language,
+                    limit: SIMILAR_VOD_GRID_LIMIT,
                 });
 
             if (this.tmdbSimilarMoviesKey() === key) {
