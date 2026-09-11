@@ -38,10 +38,30 @@ const makerOptions = JSON.parse(
         'utf8'
     )
 );
+const localMacosMakerOptions = JSON.parse(
+    fs.readFileSync(
+        join(
+            currentDir,
+            '..',
+            '..',
+            'apps',
+            'electron-backend',
+            'src',
+            'app',
+            'options',
+            'maker.local-macos.options.json'
+        ),
+        'utf8'
+    )
+);
 const generatedMetadataConfigPath =
     'apps/electron-backend/src/app/options/electron-builder.metadata.generated.json';
 const packageLayoutVerifier = fs.readFileSync(
     join(currentDir, 'verify-electron-package-layout.mjs'),
+    'utf8'
+);
+const electronMainSource = fs.readFileSync(
+    join(currentDir, '..', '..', 'apps', 'electron-backend', 'src', 'main.ts'),
     'utf8'
 );
 
@@ -127,6 +147,28 @@ test('nx-electron packaging prepares metadata before make/package', () => {
             'electron-backend:generate-builder-metadata'
         )
     );
+});
+
+test('local macOS app bundle packaging stays unsigned and unpacked', () => {
+    assert.equal(localMacosMakerOptions.extends, generatedMetadataConfigPath);
+    assert.equal(localMacosMakerOptions.mac?.target, 'dir');
+    assert.equal(localMacosMakerOptions.mac?.forceCodeSigning, false);
+    assert.equal(localMacosMakerOptions.mac?.identity, null);
+    assert.equal(localMacosMakerOptions.mac?.notarize, false);
+    assert.match(
+        packageMetadata.scripts?.['package:mac:local'] ?? '',
+        /make-local-macos-app\.mjs/
+    );
+});
+
+test('macOS PATH refresh cannot crash packaged startup before the window opens', () => {
+    assert.equal(packageMetadata.dependencies?.['ansi-regex'], '6.2.2');
+    assert.doesNotMatch(
+        electronMainSource,
+        /import\s+fixPath\s+from\s+['"]fix-path['"]/
+    );
+    assert.match(electronMainSource, /import\(['"]fix-path['"]\)/);
+    assert.match(electronMainSource, /fix-path failed:/);
 });
 
 test('package layout verifier uses canonical helpers and direct dependencies', () => {

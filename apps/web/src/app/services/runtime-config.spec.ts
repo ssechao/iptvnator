@@ -29,11 +29,31 @@ describe('runtime config helpers', () => {
         expect(
             shouldEnableServiceWorker(true, {
                 serviceWorker: {},
-            } as Navigator)
+            } as Navigator, {} as Pick<Window, 'electron'>)
         ).toBe(true);
         expect(
-            shouldEnableServiceWorker(false, { serviceWorker: {} } as Navigator)
+            shouldEnableServiceWorker(
+                false,
+                { serviceWorker: {} } as Navigator,
+                {} as Pick<Window, 'electron'>
+            )
         ).toBe(false);
-        expect(shouldEnableServiceWorker(true, {} as Navigator)).toBe(false);
+        expect(
+            shouldEnableServiceWorker(
+                true,
+                {} as Navigator,
+                {} as Pick<Window, 'electron'>
+            )
+        ).toBe(false);
+    });
+
+    it('disables the service worker in Electron production builds', () => {
+        expect(
+            shouldEnableServiceWorker(
+                true,
+                { serviceWorker: {} } as Navigator,
+                { electron: {} } as Pick<Window, 'electron'>
+            )
+        ).toBe(false);
     });
 });

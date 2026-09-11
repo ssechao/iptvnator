@@ -21,7 +21,13 @@ export function getRuntimeBackendUrl(): string {
 
 export function shouldEnableServiceWorker(
     production = AppConfig.production,
-    navigatorRef: Navigator | undefined = globalThis.navigator
+    navigatorRef: Navigator | undefined = globalThis.navigator,
+    windowRef: Pick<Window, 'electron'> | undefined = globalThis.window
 ): boolean {
-    return production && !!navigatorRef && 'serviceWorker' in navigatorRef;
+    return (
+        production &&
+        !!navigatorRef &&
+        'serviceWorker' in navigatorRef &&
+        !windowRef?.electron
+    );
 }

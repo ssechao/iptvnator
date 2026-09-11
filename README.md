@@ -83,6 +83,18 @@ _Note: First version of the application which was developed as a PWA is availabl
 
 Download the latest version of the application for macOS, Windows, and Linux from the [release page](https://github.com/4gray/iptvnator/releases).
 
+### Local macOS App Bundle
+
+For local development on macOS, build an unsigned `.app` bundle that can be launched like a normal macOS application:
+
+```shell
+corepack pnpm package:mac:local
+```
+
+The script detects the host architecture and writes `IPTVnator.app` to `dist/executables/mac-arm64/` on Apple Silicon or `dist/executables/mac/` on Intel. To force an architecture, pass it after `--`, for example `corepack pnpm package:mac:local -- --arch=x64`.
+
+Packaged Electron builds disable the PWA service worker and remove legacy Chromium service-worker data before opening the main window. This automatically recovers profiles created by older local bundles that could otherwise start with a blank window.
+
 Alternatively, you can install the application using one of the following package managers:
 
 ### Homebrew

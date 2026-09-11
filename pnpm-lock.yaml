@@ -100,6 +100,9 @@ importers:
       angularx-qrcode:
         specifier: 21.0.5
         version: 21.0.5(@angular/common@21.2.13(@angular/core@21.2.13(@angular/compiler@21.2.13)(rxjs@7.8.2)(zone.js@0.15.1))(rxjs@7.8.2))(@angular/core@21.2.13(@angular/compiler@21.2.13)(rxjs@7.8.2)(zone.js@0.15.1))
+      ansi-regex:
+        specifier: 6.2.2
+        version: 6.2.2
       artplayer:
         specifier: 5.4.0
         version: 5.4.0

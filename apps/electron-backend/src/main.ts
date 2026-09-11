@@ -1,6 +1,5 @@
 import { app, BrowserWindow } from 'electron';
 import { getElectronUserDataPath } from '@iptvnator/shared/database';
-import fixPath from 'fix-path';
 import App from './app/app';
 import { initDatabase } from './app/database/connection';
 import DatabaseEvents from './app/events/database.events';
@@ -49,14 +48,16 @@ function scheduleDeferredFixPath(): void {
 
     fixPathScheduled = true;
     setImmediate(() => {
-        try {
-            fixPath();
-            if (isStartupTraceEnabled()) {
-                trace('startup', 'fix-path:done');
-            }
-        } catch (error) {
-            console.warn('fix-path failed:', error);
-        }
+        void import('fix-path')
+            .then(({ default: fixPath }) => {
+                fixPath();
+                if (isStartupTraceEnabled()) {
+                    trace('startup', 'fix-path:done');
+                }
+            })
+            .catch((error) => {
+                console.warn('fix-path failed:', error);
+            });
     });
 }
 

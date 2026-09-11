@@ -1,0 +1,10 @@
+{
+    "$schema": "../../../../../node_modules/nx-electron/src/validation/maker.schema.json",
+    "extends": "apps/electron-backend/src/app/options/electron-builder.metadata.generated.json",
+    "mac": {
+        "target": "dir",
+        "forceCodeSigning": false,
+        "identity": null,
+        "notarize": false
+    }
+}

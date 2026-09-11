@@ -6,6 +6,7 @@ import {
     isWindowTraceEnabled,
     trace,
 } from './services/debug-trace';
+import { removeLegacyServiceWorkerData } from './services/electron-web-cache.service';
 import { store, WINDOW_BOUNDS } from './services/store.service';
 
 function attachWindowTrace(mainWindow: Electron.BrowserWindow): void {
@@ -138,6 +139,22 @@ export default class App {
         // initialization and is ready to create browser windows.
         // Some APIs can only be used after this event occurs.
         if (rendererAppName) {
+            if (!App.isDevelopmentMode()) {
+                try {
+                    removeLegacyServiceWorkerData(
+                        App.application.getPath('userData')
+                    );
+                    if (isWindowTraceEnabled()) {
+                        trace('window', 'legacy-service-worker-data-removed');
+                    }
+                } catch (error) {
+                    console.warn(
+                        'Failed to remove legacy service worker data:',
+                        error
+                    );
+                }
+            }
+
             App.initMainWindow();
             App.loadMainWindow();
         }
